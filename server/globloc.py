@@ -21,6 +21,7 @@ npz 字段：grid（h×w int8，OccupancyGrid 原始值，行 0 在 origin 一�
 """
 import json
 import math
+import os
 import sys
 import time
 
@@ -31,7 +32,8 @@ try:
 except ImportError:  # 容器里没有 scipy：限定最大距离，用平移取最小
     _edt = None
 
-MIN_SCORE = 0.75   # 最优分数下限（平均似然，0..1）
+# 最优分数下限（平均似然，0..1）。GO2W_AUTOLOC_MIN_SCORE 只给本地测试用（假 scan 分数总是很高，调高才能测失败流程）
+MIN_SCORE = float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75'))
 MAX_RATIO = 0.80   # 次优 / 最优 上限：越接近 1 越有歧义
 
 

@@ -5,7 +5,7 @@ import { gridToCanvas, costToCanvas, wallMask, CLOUD } from '../util.js';
 
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
-const OPS = new Set(['initialPose', 'autoLocalize', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
+const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
   'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'loadMap', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
@@ -194,6 +194,7 @@ export function createRosSource(store, bus){
   const real = {
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
     autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
+    autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）
     cancel: () => send('cancel'),
     arm: on => send('arm', { on }),
     estop: () => send('estop'),

@@ -95,6 +95,8 @@ class Sim:
         k = np.argmin((self.ox + (xs+.5)*self.res)**2 + (self.oy + (ys+.5)*self.res)**2)
         self.x, self.y = self.ox + (xs[k]+.5)*self.res, self.oy + (ys[k]+.5)*self.res
         self.th, self.v, self.w_ = 0.0, 0.0, 0.0
+        if os.environ.get('GO2W_FAKE_START'):   # 测试用：指定起点「x,y,朝向弧度」
+            self.x, self.y, self.th = (float(v) for v in os.environ['GO2W_FAKE_START'].split(','))
 
         # 进程：开机时导航已经在跑（和平时 nav.sh start 之后一样）
         self.procs = {'mapping': False, 'localization': False, 'navigation': True, 'patrol': False, 'bag': False, 'bridge': False, 'bag_seg': False}

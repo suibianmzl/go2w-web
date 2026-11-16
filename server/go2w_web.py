@@ -105,6 +105,9 @@ BRIDGE_RETRY = 10.0   # 遥控速度桥退出后，隔这么久再重启
 # 键盘遥控限速（网页按键给的速度再被这里夹一次，cmd_bridge 还会再限一次）
 TELEOP_MAX = (1.0, 0.2, 1.2)
 TELEOP_TIMEOUT = 0.3
+# 网页发送队列：一条消息 TX_TIMEOUT 秒还发不出去（网页不读了 / 网络断了）才断开；FIFO 消息积压超过 TX_QUEUE_MAX 也断开
+TX_TIMEOUT = 10.0
+TX_QUEUE_MAX = 500
 INSPECT_DT = 0.5    # topic 查看器每条 topic 最多 2 Hz 刷新
 ROS_LEVEL = {20: 'INFO', 30: 'WARN', 40: 'ERROR', 50: 'ERROR'}
 BASE_FRAME = 'base_footprint'
@@ -140,6 +143,23 @@ AUTOLOC_ON_START = os.environ.get('GO2W_AUTO_LOCALIZE', '1') != '0'
 # 刚站起来（策略刚接管）机身还在晃，雷达高度也和趴着时不一样：策略 ready 后再稳这么久，只用这之后的 scan
 AUTOLOC_SETTLE = 2.0
 AUTOLOC_SETTLE_WAIT = 15.0   # s：最多等这么久机器人站稳、静止，等不到就报失败
+# 两处一致（11-16）：起点附近分数常在 0.62–0.72，过不了 0.75，但位置每次都一样。挪一下再定：两次结果算出的
+# map→odom 一致（里程计把两处连起来），各自分数 ≥ PAIR_SCORE、次优/最优 ≤ PAIR_RATIO，就接受。
+# 同一个地方反复算不算数（同一批 scan 几乎一样，不独立）：两次之间要挪开 ≥ PAIR_SEP 米或转过 ≥ PAIR_TURN
+AUTOLOC_PAIR_SCORE, AUTOLOC_PAIR_RATIO = 0.60, 0.80
+AUTOLOC_PAIR_SEP, AUTOLOC_PAIR_TURN = 0.20, math.radians(30)
+AUTOLOC_PAIR_TOL, AUTOLOC_PAIR_TOL_TH = 0.20, math.radians(4)
+AUTOLOC_HIST_TTL = 300.0     # s：更早的结果不拿来配对（里程计也会慢慢漂）
+# 自动定位失败后「移动后重试」（网页按钮，用户确认后才动）：优先前进，前面不够空就后退，前后都不行就原地转
+AUTOLOC_MOVE_DIST, AUTOLOC_MOVE_TURN = 0.30, math.radians(45)
+AUTOLOC_MOVE_V, AUTOLOC_MOVE_W = 0.15, 0.35   # 倒车时 cmd_bridge 自己补 reverse_offset
+AUTOLOC_MOVE_TIMEOUT = 8.0   # s：一次移动最长时间，超时就停
+AUTOLOC_MOVE_MAX = 3         # 没定位成功前最多挪几次
+AUTOLOC_FOOT = (0.365, 0.24)  # 足迹半长、半宽（0.73×0.48，中心在旋转中心；和 nav2.yaml footprint 一致）
+AUTOLOC_MOVE_MARGIN = 0.25   # 前进 / 后退：移动距离之外再空出这么多
+AUTOLOC_MOVE_STOP = 0.20     # 移动中：运动方向这么近有点就立刻停
+AUTOLOC_TURN_CLEAR = 0.65    # 原地转：这个半径内不能有点（足迹外接圆 0.44 m + 余量）
+# 注意：scan 只保留 ≥0.45 m 的点（滤掉机身），离旋转中心 0.45 m 以内看不见，空间检查管不到那一圈
 # 运控（go2w_ctrl）站起 / 趴下，见 robot_ctrl.py。GO2W_CTRL=0 关掉（不查站没站起来，也不自动趴下）
 CTRL_ON = os.environ.get('GO2W_CTRL', '1') != '0'
 CTRL_STALE = 2.0       # s：状态 topic 10 Hz，超过这么久没收到就当不知道
@@ -154,6 +174,11 @@ STILL_V, STILL_W = 0.05, 0.1   # 趴下前要求里程计速度低于这些（m/
 RECOVERY_NODES = ('Spin', 'BackUp', 'Wait', 'DriveOnHeading')
 ACTIVE = (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING)
 RESULT = {GoalStatus.STATUS_SUCCEEDED: 'succeeded', GoalStatus.STATUS_CANCELED: 'canceled', GoalStatus.STATUS_ABORTED: 'aborted'}
+
+
+def wrap(a):
+    """角度归到 (-π, π]。"""
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 def yaw_of(q):
@@ -1099,6 +1124,8 @@ class Server:
         # 自动定位：最近一次的结果推给网页（state.autoLoc）；seq 每次结束 +1，网页据此知道「刚定位成功」
         self.autoloc = {'state': 'idle', 'seq': 0}
         self.autoloc_busy = False
+        self.autoloc_hist = []     # 最近几次自动定位的结果和对应的 map→odom，两处一致时接受（autoloc_pair）
+        self.autoloc_moves = 0     # 这一轮已经「移动后重试」了几次
         self.pose_set_t = 0.0   # 最近一次（手动或自动）设置初始位姿的时间；启动后自动定位前用户已经手动给了就不再覆盖
         # 运控：站起 / 趴下（robot_ctrl.py）
         self.ctrl = None
@@ -1179,11 +1206,10 @@ class Server:
         except Exception as e:
             self.node.get_logger().error(f'cmd {d.get("op")}: {e!r}')
             ok, text, data = False, f'后端出错：{e!r}', []
-        if not ws.closed:
-            reply = {'t': 'ack', 'id': d.get('id'), 'ok': ok, 'msg': text}
-            if data:
-                reply['data'] = data[0]
-            await ws.send_str(json.dumps(reply))
+        reply = {'t': 'ack', 'id': d.get('id'), 'ok': ok, 'msg': text}
+        if data:
+            reply['data'] = data[0]
+        self.tx_put(ws, json.dumps(reply))
 
     async def handle_cmd(self, ws, d):
         n, op = self.node, d.get('op')
@@ -1191,9 +1217,9 @@ class Server:
             return False, '地图正在保存或对齐，请稍等'
         if ws.closed or ws not in self.clients:
             return False, '网页已断开'
-        if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize'):
+        if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize', 'autoloc_move'):
             return False, '正在检查路线，请稍等'
-        if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize')
+        if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
         if op in ('goal', 'arm', 'cancel', 'estop'):
@@ -1214,6 +1240,7 @@ class Server:
                 fine = d.get('cov') == 'fine'
                 n.publish_initial_pose(d['x'], d['y'], d['th'], fine)
                 self.pose_set_t = time.monotonic()
+                self.autoloc_reset()
                 n.event('INFO', f"{'重定位微调' if fine else '初始位姿'} ({d['x']:.2f}, {d['y']:.2f}, {math.degrees(d['th']):.1f}°)（{self.remote(ws)}）")
                 # 11-09：定位错误期间（启动时 AMCL 默认在地图原点）雷达标的障碍会落在错误位置，
                 # 机器人脚下的盲区又擦不掉 → 规划报「起点在障碍物里」。改位姿后清一次代价地图
@@ -1221,6 +1248,8 @@ class Server:
                 return True, '位置已修正' if fine else '初始位姿已发布'
             if op == 'auto_localize':
                 return await self.auto_localize(self.remote(ws))
+            if op == 'autoloc_move':
+                return await self.autoloc_move(ws)
             if op == 'stand_up':
                 return await self.stand_up(self.remote(ws))
             if op == 'lie_down':
@@ -1310,7 +1339,7 @@ class Server:
             if op in ('route_save', 'route_delete'):
                 result = self.save_route(d) if op == 'route_save' else self.delete_route(d.get('route_id'))
                 if result[0]:
-                    await self.send_all(self.routes_message())
+                    await self.send_all(self.routes_message(), key='routes')
                 return result
             if op == 'route_check':
                 return await self.check_route(ws, d)
@@ -1429,6 +1458,7 @@ class Server:
                     return self.ctrl_done(False, f'启动策略失败：{err}')
             if lying:
                 self.stood_seq += 1
+                self.autoloc_reset()   # 雷达高度变了，趴着时的结果不算
             return self.ctrl_done(True, '已站起，策略已接管')
         finally:
             self.ctrl_op = None
@@ -1676,7 +1706,7 @@ class Server:
                 self.write_views(views)
             except OSError as e:
                 return False, f'保存显示方向失败：{e}'
-            await self.send_all(self.views_message())
+            await self.send_all(self.views_message(), key='views')
         return True, ''
 
     def routes_message(self):
@@ -1886,6 +1916,7 @@ class Server:
                 await asyncio.sleep(0.2)
             if scans is None:
                 raise RuntimeError(f'{AUTOLOC_SETTLE_WAIT:.0f} s 内没等到机器人站稳静止（{why}）')
+            odom = self.fresh_odom()   # 静止时的里程计位姿：和别处的结果配对用（没有就不配对）
             if n.map_raw is None:
                 raise RuntimeError('地图没有了')
             grid, res, ox, oy = n.map_raw
@@ -1938,15 +1969,26 @@ class Server:
             self.autoloc = {'state': 'idle', 'seq': self.autoloc['seq']}
             n.event('INFO', f'自动定位结果 {where} 没有使用：期间已手动设置了初始位姿')
             return False, '期间已手动设置初始位姿'
-        if not r['ok']:
-            why = '匹配分数太低（不在这张地图上，或环境变化太大）' if r['score'] < 0.75 else '有多个相似位置，分不清'
-            msg = f'自动定位不可信，没有使用：{why}。最佳 {where}，{quality}。请手动给初始位置'
+        entry = self.autoloc_remember(map_name, odom, r)
+        pair = None if r['ok'] else self.autoloc_pair(entry)
+        if not r['ok'] and pair is None:
+            ambiguous = r['score'] >= 0.75 and r['ratio'] > AUTOLOC_PAIR_RATIO
+            why = '有多个相似位置，分不清' if ambiguous else '匹配分数太低（不在这张地图上，或环境变化太大）'
+            left = AUTOLOC_MOVE_MAX - self.autoloc_moves
+            hint = '可以点「移动后重试」，或手动给初始位置' if left > 0 else '请手动给初始位置'
+            msg = f'自动定位不可信，没有使用：{why}。最佳 {where}，{quality}。{hint}'
             self.autoloc = {'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'map': map_name, 'msg': msg, **res_}
             n.event('WARN', msg)
             return False, msg, res_
         n.publish_initial_pose(r['x'], r['y'], r['th'], fine=True)
         self.pose_set_t = time.monotonic()
-        msg = f'自动定位成功 {where}（{quality}）'
+        self.autoloc_reset()
+        if pair is not None:
+            prev, sep, turn, dd, dth = pair
+            quality += (f"；和前一次（分数 {prev['score']:.2f}，次优/最优 {prev['ratio']:.2f}）相隔 {sep:.2f} m / "
+                        f"{math.degrees(turn):.0f}°，两次结果相差 {dd:.2f} m / {math.degrees(dth):.1f}°，一致")
+            res_['pair'] = True
+        msg = f"自动定位成功{'（两处结果一致）' if pair is not None else ''} {where}（{quality}）"
         self.autoloc = {'state': 'ok', 'seq': self.autoloc['seq'] + 1, 'map': map_name, 'msg': msg, **res_}
         n.event('INFO', f'{msg}（{who}）')
         asyncio.ensure_future(self.clear_after_pose())
@@ -1975,6 +2017,175 @@ class Server:
         if len(scans) < 3:
             return None, '机器人在动'
         return scans, ''
+
+    def fresh_odom(self, max_age=0.5):
+        o = self.node.odom_pose
+        return o[:3] if o is not None and time.monotonic() - o[3] < max_age else None
+
+    def autoloc_reset(self):
+        """定位成功 / 手动给了位置 / 换档位 / 从趴着站起来：之前的结果不再拿来配对，移动次数清零。"""
+        self.autoloc_hist, self.autoloc_moves = [], 0
+
+    def autoloc_remember(self, map_name, odom, r):
+        """记下这次结果，以及它对应的 map→odom（map 位姿 ∘ odom 位姿⁻¹）。没有里程计就不记。"""
+        if odom is None:
+            return None
+        ox, oy, oth = odom
+        th = wrap(r['th'] - oth)
+        c, s = math.cos(th), math.sin(th)
+        e = {'map': map_name, 't': time.monotonic(), 'stood': self.stood_seq, 'odom': odom,
+             'tmo': (r['x'] - (c * ox - s * oy), r['y'] - (s * ox + c * oy), th),
+             'score': r['score'], 'ratio': r['ratio']}
+        now = time.monotonic()
+        self.autoloc_hist = [h for h in self.autoloc_hist
+                             if h['map'] == map_name and h['stood'] == self.stood_seq and now - h['t'] < AUTOLOC_HIST_TTL][-5:]
+        self.autoloc_hist.append(e)
+        return e
+
+    def autoloc_pair(self, e):
+        """在之前挪开过的结果里找一个和 e 一致的：返回 (那一次, 相隔米数, 相隔角度, map→odom 位置差, 角度差) 或 None。"""
+        if e is None or e['score'] < AUTOLOC_PAIR_SCORE or e['ratio'] > AUTOLOC_PAIR_RATIO:
+            return None
+        for p in reversed(self.autoloc_hist[:-1]):
+            if p['score'] < AUTOLOC_PAIR_SCORE or p['ratio'] > AUTOLOC_PAIR_RATIO:
+                continue
+            sep = math.hypot(e['odom'][0] - p['odom'][0], e['odom'][1] - p['odom'][1])
+            turn = abs(wrap(e['odom'][2] - p['odom'][2]))
+            if sep < AUTOLOC_PAIR_SEP and turn < AUTOLOC_PAIR_TURN:
+                continue   # 基本没动：同一批 scan，不独立
+            dd = math.hypot(e['tmo'][0] - p['tmo'][0], e['tmo'][1] - p['tmo'][1])
+            dth = abs(wrap(e['tmo'][2] - p['tmo'][2]))
+            if dd <= AUTOLOC_PAIR_TOL and dth <= AUTOLOC_PAIR_TOL_TH:
+                return p, sep, turn, dd, dth
+        return None
+
+    def latest_scan(self, max_age=0.5):
+        s = list(self.node.scans_base)
+        return s[-1][1] if s and time.monotonic() - s[-1][0] < max_age else None
+
+    @staticmethod
+    def autoloc_room(pts, kind, sign, reach):
+        """base_footprint 下的点 pts：往 sign 方向直走 reach 米（kind='line'）/ 原地转（kind='turn'，reach=半径）有没有空间。"""
+        if kind == 'turn':
+            return not bool(np.any(np.hypot(pts[:, 0], pts[:, 1]) < reach))
+        hl, hw = AUTOLOC_FOOT
+        x = pts[:, 0] * sign
+        return not bool(np.any((x > hl - 0.05) & (x < hl + reach) & (np.abs(pts[:, 1]) < hw + 0.10)))
+
+    async def autoloc_move(self, ws):
+        """自动定位失败后：小范围挪一次（用户在网页上确认过），停稳后再自动定位。
+        前进 0.3 m → 前面不够空就后退 0.3 m → 都不行就原地转 45°。没解锁就临时解锁，结束后恢复上锁。"""
+        n, who = self.node, self.remote(ws)
+        a = self.autoloc
+        if self.autoloc_busy:
+            return False, '自动定位正在进行'
+        if a.get('state') != 'fail' or a.get('map') != n.map_current or not n.map_current:
+            return False, '只有这张地图上自动定位失败后才能移动重试'
+        if self.autoloc_moves >= AUTOLOC_MOVE_MAX:
+            return False, f'已经移动重试 {AUTOLOC_MOVE_MAX} 次还没定位上：请手动给初始位置'
+        if self.estop:
+            return False, '急停中：先解除急停'
+        reason = self.ctrl_blocker()
+        if reason:
+            return False, reason
+        if (n.nav_active() or self.route_running() or self.goal_pending or self.teleop is not None
+                or self.checking_route or self.ctrl_op or self.prof('patrol') != 'stop'):
+            return False, '有导航、任务、遥控或巡逻在进行：先停掉再移动重试'
+        if not n.arm_cli.service_is_ready():
+            return False, '速度桥没有运行（刚切换档位时要等几秒）'
+        if self.fresh_odom() is None:
+            return False, '没有里程计：无法控制移动距离'
+        pts = self.latest_scan()
+        if pts is None:
+            return False, '没有最新的激光数据：无法检查周围空间'
+        reach = AUTOLOC_MOVE_DIST + AUTOLOC_MOVE_MARGIN
+        if self.autoloc_room(pts, 'line', 1, reach):
+            kind, sign, what = 'line', 1, f'前进 {AUTOLOC_MOVE_DIST:.1f} m'
+        elif self.autoloc_room(pts, 'line', -1, reach):
+            kind, sign, what = 'line', -1, f'后退 {AUTOLOC_MOVE_DIST:.1f} m'
+        elif self.autoloc_room(pts, 'turn', 1, AUTOLOC_TURN_CLEAR):
+            kind, sign, what = 'turn', 1, f'原地左转 {math.degrees(AUTOLOC_MOVE_TURN):.0f}°'
+        else:
+            return False, '周围空间不够（前后都不到 0.55 m，转身半径 0.65 m 内也有东西）：请手动给初始位置'
+        self.autoloc_busy = True
+        self.owner = ws   # 发起的网页断开 / 心跳丢失 → lose_owner 上锁 → 下面的循环看到没解锁就停
+        self.autoloc = {**a, 'state': 'move', 'msg': f'移动后重试：{what}…'}
+        armed_here, err = False, None
+        try:
+            if not n.is_armed():
+                r = await self.aw(n.call_arm(True), 2.0)
+                if not r.success:
+                    err = f'解锁失败：{r.message}'
+                else:
+                    n.armed, n.armed_t, armed_here = True, time.monotonic(), True
+            if err is None:
+                n.event('WARN', f'自动定位移动重试：{what}（{who}{"，临时解锁" if armed_here else ""}）')
+                err, done = await self.autoloc_drive(ws, kind, sign)
+        except Exception as e:
+            err = f'移动出错：{e!r}'
+        finally:
+            n.publish_cmd(0.0, 0.0, 0.0)
+            self.autoloc_moves += 1
+            if armed_here:
+                t0 = time.monotonic()
+                while self.moving() and time.monotonic() - t0 < 2.0:   # 停稳再上锁
+                    await asyncio.sleep(0.1)
+                try:
+                    r = await self.aw(n.call_arm(False), 2.0)
+                    if r.success:
+                        n.armed, n.armed_t = False, time.monotonic()
+                    else:
+                        n.event('ERROR', f'移动重试后恢复上锁失败：{r.message}')
+                except Exception as e:
+                    n.event('ERROR', f'移动重试后恢复上锁失败：{e!r}')
+            self.autoloc_busy = False
+        if err:
+            msg = f'移动重试没有完成：{err}。可以再试，或手动给初始位置'
+            self.autoloc = {**a, 'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'msg': msg}
+            n.event('WARN', msg)
+            return False, msg
+        n.event('INFO', f'自动定位移动重试：{done}，停稳后重新自动定位')
+        return await self.auto_localize(f'{who}，移动后重试')
+
+    async def autoloc_drive(self, ws, kind, sign):
+        """按里程计闭环：直走 AUTOLOC_MOVE_DIST 或转 AUTOLOC_MOVE_TURN。返回 (错误, 实际做了什么)。"""
+        n = self.node
+        o0 = self.fresh_odom()
+        t0, stops0 = time.monotonic(), self.motion_stops
+        v, w = (sign * AUTOLOC_MOVE_V, 0.0) if kind == 'line' else (0.0, sign * AUTOLOC_MOVE_W)
+        while True:
+            if self.estop:
+                return '急停', None
+            if self.motion_stops > stops0 or n.is_armed() is False:
+                return '底盘被上锁', None
+            if self.owner is not ws:
+                return '发起的网页断开了', None
+            if self.teleop is not None or n.nav_active():
+                return '有遥控或导航指令插进来', None
+            s, ready, _ = self.ctrl_get()
+            if self.ctrl is not None and (s != 'Velocity' or not ready):
+                return f'机器狗不在行走状态（运控状态 {s}）', None
+            o = self.fresh_odom()
+            if o is None:
+                return '里程计中断', None
+            dist = math.hypot(o[0] - o0[0], o[1] - o0[1])
+            turn = abs(wrap(o[2] - o0[2]))
+            if kind == 'line' and dist >= AUTOLOC_MOVE_DIST - 0.02:
+                return None, f"{'前进' if sign > 0 else '后退'} {dist:.2f} m"
+            if kind == 'turn' and turn >= AUTOLOC_MOVE_TURN - math.radians(3):
+                return None, f'原地转 {math.degrees(turn):.0f}°'
+            pts = self.latest_scan()
+            if pts is None:
+                return '激光数据中断', None
+            room = (self.autoloc_room(pts, 'line', sign, AUTOLOC_MOVE_STOP) if kind == 'line'
+                    else self.autoloc_room(pts, 'turn', sign, AUTOLOC_TURN_CLEAR - 0.10))
+            if not room:
+                return (f"运动方向有东西靠近，已停（走了 {dist:.2f} m）" if kind == 'line'
+                        else f'转身范围内有东西靠近，已停（转了 {math.degrees(turn):.0f}°）'), None
+            if time.monotonic() - t0 > AUTOLOC_MOVE_TIMEOUT:
+                return (f'{AUTOLOC_MOVE_TIMEOUT:.0f} s 内没有完成（走了 {dist:.2f} m，转了 {math.degrees(turn):.0f}°）'), None
+            n.publish_cmd(v, 0.0, w)
+            await asyncio.sleep(0.1)
 
     async def auto_localize_on_start(self, mode):
         """定位 / 导航档位刚启动：等地图和 scan 到齐、机器人静止，自动定位一次。"""
@@ -2184,6 +2395,7 @@ class Server:
                     return
             if mode:
                 self.autoloc = {'state': 'idle', 'seq': self.autoloc['seq']}   # 上一轮的自动定位结果作废
+                self.autoloc_reset()   # FAST-LIO 重启，odom 坐标系变了
                 self.transitions[mode] = 'starting'
                 self.starting[mode] = time.monotonic()
                 await self.procs.start_mode(mode, map_name)
@@ -2702,7 +2914,7 @@ class Server:
         if refuse:
             if now - self.clients[ws].get('teleop_warned', 0) > 2:
                 self.clients[ws]['teleop_warned'] = now
-                self.background(ws.send_str(json.dumps({'t': 'toast', 'level': 'err', 'msg': f'遥控没有生效：{refuse}'})))
+                self.tx_put(ws, json.dumps({'t': 'toast', 'level': 'err', 'msg': f'遥控没有生效：{refuse}'}))
             return
         self.owner = ws
         if self.teleop is None and n.nav_active():
@@ -2725,7 +2937,7 @@ class Server:
         watching = self.clients[ws].setdefault('inspect', set())
         if on and topic not in watching:
             if topic not in self.node.inspect and not self.node.inspect_on(topic):
-                self.background(ws.send_str(json.dumps({'t': 'msg', 'topic': topic, 'text': None, 'err': '这个 topic 现在没有发布者'})))
+                self.tx_put(ws, json.dumps({'t': 'msg', 'topic': topic, 'text': None, 'err': '这个 topic 现在没有发布者'}))
                 return
             watching.add(topic)
             self.node.inspect[topic]['sent'] = -1
@@ -2742,15 +2954,17 @@ class Server:
         ws = web.WebSocketResponse(max_msg_size=1 << 20)
         await ws.prepare(req)
         remote = client_ip(req)
-        self.clients[ws] = {'remote': remote, 'last_ping': time.monotonic(), 'layers': set()}
+        c = self.clients[ws] = {'remote': remote, 'last_ping': time.monotonic(), 'layers': set(),
+                                'txq': deque(), 'txlatest': {}, 'txev': asyncio.Event(), 'transport': req.transport}
+        c['tx'] = asyncio.create_task(self.tx_run(ws, c))
         self.node.get_logger().info(f'client connected: {remote} ({len(self.clients)})')
         try:
-            await ws.send_str(self.routes_message())
-            await ws.send_str(self.views_message())
+            self.tx_put(ws, self.routes_message(), 'routes')
+            self.tx_put(ws, self.views_message(), 'views')
             if self.node.map_blob:
-                await ws.send_bytes(self.node.map_blob)
+                self.tx_put(ws, self.node.map_blob, 'map')
             if self.node.plan:
-                await ws.send_str(json.dumps({'t': 'plan', 'pts': self.node.plan}))
+                self.tx_put(ws, json.dumps({'t': 'plan', 'pts': self.node.plan}), 'plan')
             async for msg in ws:
                 if msg.type != WSMsgType.TEXT:
                     continue
@@ -2760,7 +2974,7 @@ class Server:
                     continue
                 if d.get('t') == 'ping':
                     self.clients[ws]['last_ping'] = time.monotonic()
-                    await ws.send_str(json.dumps({'t': 'pong', 'ts': d.get('ts')}))
+                    self.tx_put(ws, json.dumps({'t': 'pong', 'ts': d.get('ts')}), 'pong')
                 elif d.get('t') == 'sub':
                     # 网页打开 / 关闭了哪些重图层；新打开的立刻补发最近一帧（全局代价地图可能很久才变一次）
                     new = {x for x in d.get('layers', []) if x in HEAVY}
@@ -2769,12 +2983,12 @@ class Server:
                     for layer in added:
                         blob = self.node.blobs[HEAVY[layer]]
                         if blob:
-                            await ws.send_bytes(blob)
+                            self.tx_put(ws, blob, layer)
                 elif d.get('t') == 'teleop':
                     self.on_teleop(ws, d)
                 elif d.get('t') == 'cam':
                     r = await self.camera.request(ws, remote, bool(d.get('on')))
-                    await ws.send_str(json.dumps({'t': 'cam', **r}))
+                    self.tx_put(ws, json.dumps({'t': 'cam', **r}))
                 elif d.get('t') == 'inspect' and isinstance(d.get('topic'), str):
                     self.set_inspect(ws, d['topic'], bool(d.get('on')))
                 elif d.get('t') == 'cmd':
@@ -2783,6 +2997,7 @@ class Server:
                     self.pending.add(t)                    # asyncio 只弱引用任务，要自己持有
                     t.add_done_callback(self.pending.discard)
         finally:
+            c['tx'].cancel()
             for topic in list(self.clients.get(ws, {}).get('inspect', ())):
                 self.set_inspect(ws, topic, False)
             await self.camera.release(ws)
@@ -2801,20 +3016,66 @@ class Server:
     def wants(self, layer):
         return any(layer in c['layers'] for c in list(self.clients.values()))
 
-    async def send_all(self, data, layer=None):
-        """发给所有网页；layer 不为空时只发给打开了这个图层的网页。"""
-        async def one(ws):
-            try:
-                if isinstance(data, bytes):
-                    await asyncio.wait_for(ws.send_bytes(data), 0.5)
-                else:
-                    await asyncio.wait_for(ws.send_str(data), 0.5)
-            except Exception:
-                self.clients.pop(ws, None)
-                await ws.close()
-        targets = [ws for ws, c in list(self.clients.items()) if layer is None or layer in c['layers']]
-        if targets:
-            await asyncio.gather(*(one(ws) for ws in targets))
+    async def send_all(self, data, layer=None, key=None):
+        """发给所有网页；layer 不为空时只发给打开了这个图层的网页。
+        只放进每个网页自己的发送队列，不等网络：一个网页慢 / 卡住不会拖住推送循环和其他网页。
+        key 不为空时同一个 key 只保留最新一条（位姿、地图这类，网慢时丢旧帧，不排队）。"""
+        for ws, c in list(self.clients.items()):
+            if layer is None or layer in c['layers']:
+                self.tx_put(ws, data, key)
+
+    def tx_put(self, ws, data, key=None):
+        c = self.clients.get(ws)
+        if c is None or c.get('txdead'):
+            return
+        if key is None:
+            if len(c['txq']) >= TX_QUEUE_MAX:
+                self.tx_fail(ws, c, f'发送积压超过 {TX_QUEUE_MAX} 条')
+                return
+            c['txq'].append(data)
+        else:
+            c['txlatest'][key] = data       # 还没发出去的旧帧直接换成新的
+        c['txev'].set()
+
+    async def tx_run(self, ws, c):
+        """每个网页一个发送任务：先发排队的消息（指令回复、日志），再发最新帧，小的 JSON 先于大的二进制。"""
+        try:
+            while True:
+                await c['txev'].wait()
+                c['txev'].clear()
+                while c['txq'] or c['txlatest']:
+                    if c['txq']:
+                        data = c['txq'].popleft()
+                    else:
+                        latest = c['txlatest']
+                        data = latest.pop(min(latest, key=lambda k: isinstance(latest[k], bytes)))
+                    if isinstance(data, bytes):
+                        await asyncio.wait_for(ws.send_bytes(data), TX_TIMEOUT)
+                    else:
+                        await asyncio.wait_for(ws.send_str(data), TX_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self.tx_fail(ws, c, f'一条消息 {TX_TIMEOUT:.0f} s 没发出去')
+        except Exception as e:
+            self.tx_fail(ws, c, f'发送出错 {e!r}'[:200])
+
+    def tx_fail(self, ws, c, why):
+        if c.get('txdead'):
+            return
+        c['txdead'] = True
+        if not ws.closed:
+            self.node.get_logger().warn(f"网页 {c['remote']}：{why}，断开（网页会自动重连）")
+        self.background(self.tx_close(ws, c))
+
+    async def tx_close(self, ws, c):
+        try:
+            await asyncio.wait_for(ws.close(), 2.0)
+        except Exception:
+            pass
+        tr = c.get('transport')
+        if tr is not None and not tr.is_closing():   # 关闭握手没完成（对面不读了）：直接断 TCP，让 ws() 收尾
+            tr.abort()
 
     async def safety(self):
         """心跳和急停的周期检查，和推送分开，不受网络慢的客户端影响。"""
@@ -2866,21 +3127,21 @@ class Server:
                 n.events.clear()
                 continue
             try:
-                await self.send_all(json.dumps(n.pose()))
+                await self.send_all(json.dumps(n.pose()), key='pose')
                 if k % 2 == 0 and n.scan_ver != scan_ver:  # scan 最多 10 Hz
                     scan_ver = n.scan_ver
-                    await self.send_all(n.scan_blob)
+                    await self.send_all(n.scan_blob, key='scan')
                 if new_map:
-                    await self.send_all(n.map_blob)
+                    await self.send_all(n.map_blob, key='map')
                 if k % 4 == 0:  # 任务 5 Hz
-                    await self.send_all(json.dumps({'t': 'task', 'task': self.task()}))
+                    await self.send_all(json.dumps({'t': 'task', 'task': self.task()}), key='task')
                 if n.plan_ver != plan_ver:
                     plan_ver = n.plan_ver
-                    await self.send_all(json.dumps({'t': 'plan', 'pts': n.plan}))
+                    await self.send_all(json.dumps({'t': 'plan', 'pts': n.plan}), key='plan')
                 for layer, kind in HEAVY.items():
                     if n.vers[kind] != vers[kind]:
                         vers[kind] = n.vers[kind]
-                        await self.send_all(n.blobs[kind], layer)
+                        await self.send_all(n.blobs[kind], layer, key=layer)
                 if n.events:  # 日志攒一批一起发（/rosout 可能一秒几十条）
                     items = []
                     while n.events:
@@ -2892,10 +3153,11 @@ class Server:
                     st.update(mapCurrent=self.shown_map(), mapLive=n.map_file is None and n.map_current is not None)
                     st.update(estop=self.estop, busy=self.busy, mapBusy=self.map_busy, maps=self.maps, bags=self.bags, uploads=self.uploads, mapChoice=self.map_choice,
                               rollback={'on': self.rollback_on, 'run': bool((self.procs_status or {}).get('rollback')), 'saving': self.rollback_saving, 'seconds': ROLLBACK_SECONDS},
-                              procsKnown=self.procs_status is not None, teleop=self.teleop is not None, autoLoc=self.autoloc, ctrl=self.ctrl_view(),
+                              procsKnown=self.procs_status is not None, teleop=self.teleop is not None,
+                              autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None)
-                    await self.send_all(json.dumps(st))
+                    await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
                     if rec['text'] is not None and rec['ver'] != rec.get('sent'):
@@ -2903,10 +3165,7 @@ class Server:
                         msg = json.dumps({'t': 'msg', 'topic': topic, 'type': rec['type'], 'hz': rec['rate'].hz(), 'text': rec['text']})
                         for ws, c in list(self.clients.items()):
                             if topic in c.get('inspect', ()):
-                                try:
-                                    await asyncio.wait_for(ws.send_str(msg), 0.5)
-                                except Exception:
-                                    pass
+                                self.tx_put(ws, msg, ('msg', topic))
             except Exception as e:  # 别让一次异常停掉推送
                 n.get_logger().warn(f'broadcast: {e!r}')
 

@@ -79,6 +79,15 @@ export function createActions(store, src){
       toast('自动定位中：机器人保持静止，约需 5–10 秒', 'warn');
       return exec(src.cmd.autoLocalize(), null);
     },
+    // 自动定位失败后：机器狗自己小范围挪一次再定位（后端检查空间、按里程计控制距离，没解锁会临时解锁、结束后恢复上锁）
+    autolocMove(){
+      if (!ready('autolocMove')) return;
+      if (store.estop) return toast('急停中：先解除急停', 'err');
+      confirmBox({ title: '移动后重试自动定位', ok: '开始移动',
+        body: '机器狗会自己小范围移动一次：优先前进约 0.3 m；前面不够空就后退 0.3 m；前后都不够就原地左转 45°。' +
+          '移动前会用激光检查空间，移动中有东西靠近会立刻停；底盘没解锁会临时解锁，结束后恢复上锁。确认周围没人。',
+        onOk: () => { toast('正在移动，停稳后重新自动定位…', 'warn'); exec(src.cmd.autolocMove(), null); } });
+    },
     routePoint(p){
       // 导航没开时地图是后端直接读的文件，点的坐标同样是地图坐标，可以照常选点
       const draft = store.routeDraft, map = store.mapCurrent;

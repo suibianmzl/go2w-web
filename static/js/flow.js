@@ -100,6 +100,8 @@ export function setupFlow(store, src, actions, setTool, reloc){
   $('#relocInit').onclick = () => setTool('init');
   // 自动定位：按钮手动触发；导航 / 定位启动后后端也会自动跑一次。成功（state.autoLoc.seq 变了且 ok）就算定位完成
   $('#navAutoBtn').onclick = $('#relocAuto').onclick = () => actions.autoLocalize();
+  // 自动定位失败后：机器狗小范围挪一次再定位（要确认）
+  $('#navMoveBtn').onclick = $('#relocMove').onclick = () => actions.autolocMove();
   let autoSeq = null;
   function autoLocRender(){
     const a = store.autoLoc;
@@ -108,15 +110,20 @@ export function setupFlow(store, src, actions, setTool, reloc){
       store.initPose = { auto: true, map: store.mapCurrent };
     }
     if (a) autoSeq = a.seq;
-    const busy = a?.state === 'run';
-    const text = busy ? '自动定位中…（机器人保持静止）' : a && a.map === store.mapCurrent && ['ok', 'fail'].includes(a.state) ? a.msg : '';
+    const busy = a?.state === 'run' || a?.state === 'move';
+    const text = a?.state === 'move' ? a.msg || '移动后重试…' : busy ? '自动定位中…（机器人保持静止）'
+      : a && a.map === store.mapCurrent && ['ok', 'fail'].includes(a.state) ? a.msg : '';
     for (const id of ['navAutoNote', 'relocAutoNote']){
       const el = $('#' + id);
       el.hidden = !text; el.textContent = text;
       el.classList.toggle('warn', busy || a?.state === 'fail');
     }
     $('#navAutoBtn').disabled = $('#relocAuto').disabled = busy;
-    $('#navAutoBtn').textContent = $('#relocAuto').textContent = busy ? '定位中…' : '自动定位';
+    $('#navAutoBtn').textContent = $('#relocAuto').textContent = busy ? (a.state === 'move' ? '移动中…' : '定位中…') : '自动定位';
+    // 「移动后重试」：这张地图上刚失败、还有次数、定位在跑
+    const canMove = a?.state === 'fail' && a.map === store.mapCurrent && (a.movesLeft ?? 0) > 0 && (run('navigation') || run('localization'));
+    $('#navMoveBtn').hidden = $('#relocMove').hidden = !canMove;
+    $('#navMoveBtn').textContent = $('#relocMove').textContent = `移动后重试（还可 ${a?.movesLeft ?? 0} 次）`;
   }
 
   // ---------- 出发流程 ----------
@@ -254,11 +261,15 @@ export function setupFlow(store, src, actions, setTool, reloc){
         : C.state === 'Passive' ? '趴着，站起来' : C.state === 'FixStand' ? '站着，启动策略' : C.state || '收不到运控状态',
       nav: navHere ? `运行中 · ${store.mapCurrent}` : prep.loadT ? `切换到地图 ${prep.map}…` : run('navigation') ? '等待地图…' : '启动中…（机器人保持静止）',
       loc: store.initPose && navHere ? `(${R.x.toFixed(2)}, ${R.y.toFixed(2)}) · ${Math.round(deg(R.th)) || 0}°${m != null ? ` · 匹配率 ${m.toFixed(0)}%` : ''}`
+        : store.autoLoc?.state === 'move' ? store.autoLoc.msg || '移动后重试…'
         : store.autoLoc?.state === 'run' ? '定位中…（机器人保持静止）' : '等待自动定位…',
       go: prep.goT ? '解锁底盘，下发任务…' : '定位好后自动出发',
     };
     for (const li of $$('#prepList li')){
-      const k = li.dataset.k, s = st(k), t = F?.k === k ? F.msg : s === 'todo' ? '' : text[k];
+      const k = li.dataset.k;
+      // 定位失败后正在移动重试 / 重新定位：显示进度，不显示上一次的失败原因
+      const retrying = k === 'loc' && ['run', 'move'].includes(store.autoLoc?.state);
+      const s = st(k), t = F?.k === k && !retrying ? F.msg : s === 'todo' ? '' : text[k];
       if (li.dataset.s !== s) li.dataset.s = s;
       const sm = li.querySelector('small'); if (sm.textContent !== t) sm.textContent = t;
     }

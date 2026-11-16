@@ -320,6 +320,7 @@ export function createMockSource(store, bus){
     lieDown: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     standHold: () => ({ ok: true }),
     prepHold: () => ({ ok: true }),
+    autolocMove: () => ({ ok: false, msg: '纯前端模拟：定位没有误差，不需要移动重试' }),
     initialPose(p){ cancelTask('Goal canceled: initial pose reset'); Object.assign(R, { x:p.x, y:p.y, th:p.th, v:0, w:0, vy:0 }); store.trail = [];
       Object.assign(store.loc, { std: .4, yaw: 14, match: 38 }); amclViz(); log('INFO','amcl',`Setting pose: ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${p.th.toFixed(3)}`); },
     goal(g){

@@ -34,11 +34,11 @@ class _Logger:
             raise ValueError('Logger severity cannot be changed between calls.')
         print(f'[{lv}] [{time.strftime("%H:%M:%S")}] [{self.name}]: {msg}', flush=True)
 
-    def info(self, msg): self._p('INFO', msg)
-    def warn(self, msg): self._p('WARN', msg)
-    def error(self, msg): self._p('ERROR', msg)
+    def info(self, msg, **_kw): self._p('INFO', msg)   # once= / throttle 等参数不模拟
+    def warn(self, msg, **_kw): self._p('WARN', msg)   # once= / throttle 等参数不模拟
+    def error(self, msg, **_kw): self._p('ERROR', msg)   # once= / throttle 等参数不模拟
 
-    def warning(self, msg): self._p('WARN', msg)
+    def warning(self, msg, **_kw): self._p('WARN', msg)   # once= / throttle 等参数不模拟
 
 
 class _Clock:
@@ -60,7 +60,7 @@ class Node:
     def get_clock(self):
         return _Clock()
 
-    def create_subscription(self, _type, topic, cb, _qos):
+    def create_subscription(self, _type, topic, cb, _qos, raw=False):   # raw：假模拟器不发这些 topic
         h = N(topic=topic, cb=cb)
         self._subs.setdefault(topic, []).append(h)
         return h
