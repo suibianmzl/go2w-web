@@ -1,7 +1,7 @@
 // 自动定位失败后「移动后重试」+「两处结果一致」：
-//   GO2W_AUTOLOC_MIN_SCORE=1.01 GO2W_FAKE_START=2,-0.5,0 web/dev/run.sh
+//   GO2W_AUTOLOC_MIN_SCORE=1.01 GO2W_FAKE_START=2,-0.5,0 dev/run.sh
 //   （单次定位永远不可信，只能靠两处一致；lab_20261021 原点附近只有 0.47 m 空间，换个空旷的起点）
-//   node web/dev/test_autoloc_move.mjs [ws://127.0.0.1:8080/ws]
+//   node dev/test_autoloc_move.mjs [ws://127.0.0.1:8080/ws]
 // 只能对本地假 ROS 运行（会让假机器人动）
 const URL_ = process.argv[2] || 'ws://127.0.0.1:8080/ws';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
