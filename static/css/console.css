@@ -291,7 +291,27 @@ body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
 #vRotNeedle{transform-origin:12px 12px;transform-box:view-box;transition:transform .12s}
 .alignment-preview{position:absolute;z-index:3;top:56px;right:72px;max-width:calc(100% - 88px);padding:7px 12px;border:1px solid #ffe08a66;border-radius:8px;background:rgba(12,18,28,.92);color:#ffe08a;font-size:12px;pointer-events:none}
 .bag-row{align-items:flex-start}
-.bag-row textarea{flex:1;min-width:0;resize:vertical;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:6px 9px;font:11.5px/1.5 var(--f-mono)}
+.tsel{flex:1;min-width:0}
+.tsel-btn{display:flex;align-items:center;gap:8px;width:100%;height:28px;padding:0 8px 0 10px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font:12px var(--f-body);cursor:pointer;text-align:left}
+.tsel-btn:hover:not(:disabled){border-color:var(--fg-2)}
+.tsel-btn:disabled{opacity:.5;cursor:not-allowed}
+.tsel-k{color:var(--muted);flex:none}
+.tsel-v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tsel-v.none{color:var(--crit)}
+.tsel-btn svg{width:14px;height:14px;flex:none;color:var(--muted);transition:transform .12s}
+.tsel-btn[aria-expanded="true"] svg{transform:rotate(180deg)}
+.tsel-pop{margin-top:4px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+.tsel-head{display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--line)}
+.tsel-head label{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--fg-2);white-space:nowrap;cursor:pointer}
+.tsel-head input[type=search]{flex:1;min-width:0;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;color:var(--fg);padding:0 7px;font:11.5px var(--f-mono)}
+.tsel-list{max-height:200px;overflow:auto;padding:3px 0}
+.tsel-it{display:flex;align-items:center;gap:7px;padding:3px 8px;font:11.5px/1.5 var(--f-mono);color:var(--fg);cursor:pointer}
+.tsel-it:hover{background:rgba(255,255,255,.04)}
+.tsel-it input{margin:0;flex:none}
+.tsel-it .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tsel-it .hz{flex:none;color:var(--muted);font-size:10.5px}
+.tsel-it.off .n{color:var(--muted)}
+.tsel-empty{padding:8px;font-size:11.5px;color:var(--muted)}
 .bag-tip{font-size:11px;color:var(--muted);margin:-2px 0 6px}
 .bag-livox{display:flex;gap:6px;align-items:flex-start;cursor:pointer;margin-top:4px}
 .bag-livox input{margin:1px 0 0;flex:none}
@@ -300,6 +320,8 @@ body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
 .rb-row input{flex:none;height:auto;width:auto}
 .rb-row .rb-state{flex:1;min-width:0;font:11px var(--f-mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .inrow input{flex:1;min-width:0;height:28px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:0 9px;font:12px var(--f-mono)}
+.inrow .tsel input[type=checkbox]{flex:none;width:auto;height:auto;margin:0;padding:0;accent-color:var(--accent)}
+.inrow .tsel input[type=search]{flex:1;height:24px;border-radius:5px;background:transparent;padding:0 7px;font-size:11.5px}
 
 /* ---------- right rail ---------- */
 .btn{height:32px;padding:0 12px;border-radius:7px;border:1px solid var(--line-2);background:var(--raise);font-size:12px;display:inline-flex;align-items:center;justify-content:center;gap:6px}

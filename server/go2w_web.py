@@ -44,7 +44,7 @@ import rclpy
 import rclpy.time
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav2_msgs.msg import BehaviorTreeLog, ParticleCloud
@@ -80,7 +80,7 @@ ROSOUT_PER_S = 30   # /rosout 转发限流（条 / 秒）
 # 已挂载的持久数据；离线测试可以显式指定临时目录。
 DATA = os.environ.get('GO2W_DATA') or '/go2w/data'
 # 录包上传到常驻服务器 166:~/go2w_bags。密钥在 data/ssh（不随 sync.sh 同步）；166 上这把钥匙被 rrsync 限制成只能往 go2w_bags 写
-UPLOAD_DEST = os.environ.get('GO2W_UPLOAD_DEST', 'evoengine@192.168.1.166:')
+UPLOAD_DEST = os.environ.get('GO2W_UPLOAD_DEST', 'evoengine@192.168.1.22:')
 UPLOAD_LABEL = os.environ.get('GO2W_UPLOAD_LABEL', '166:~/go2w_bags')
 # 录包容量上限：data/bags 总量超过 BAG_LIMIT_GB，或磁盘剩余不到 BAG_MIN_FREE_GB，就从最旧的开始删「已上传到 166」的包；
 # 没上传的不自动删，只报警并拒绝开始新的录包；正在录的包自己就超过上限（或磁盘快满）时自动停止录包
@@ -109,6 +109,11 @@ INSPECT_DT = 0.5    # topic 查看器每条 topic 最多 2 Hz 刷新
 ROS_LEVEL = {20: 'INFO', 30: 'WARN', 40: 'ERROR', 50: 'ERROR'}
 BASE_FRAME = 'base_footprint'
 STALE = 3.0  # 秒；超过这么久没收到就当没有
+BAT_TOPIC = '/go2w/robot_lowstate'
+BAT_PERIOD = 20.0   # 秒；多久读一次电量
+BAT_STALE = 70.0    # 秒；超过这么久没读到电量，网页显示 --
+# LowState 里 bms_state.soc 的位置：4 字节 CDR 头 + 1039（定长数组、按 CDR 对齐算出；11-16 录包验证 = 73%、29.9 V）
+BAT_SOC_OFFSET = 4 + 1039
 # 路线启动时离第 1 站不到这么远，就当已在第 1 站、直接去第 2 站：这么短的路径 RotationShim 不会先转正
 # （forward_sampling_distance 0.5），MPPI 只给出很小的速度，Go2W 不执行，会一直卡住
 ROUTE_NEAR_START = 0.5
@@ -335,6 +340,12 @@ class Bridge(Node):
         self.inspect = {}        # topic → {'sub', 'text', 't', 'ver', 'rate'}；只在有网页查看时订阅
         self.ros_ops = deque()   # 要在 rclpy 线程里做的事（建 / 删订阅），由定时器执行
         self.create_timer(0.1, self.run_ros_ops)
+        # 电量：/go2w/robot_lowstate（unitree_go/LowState，约 230 Hz、每帧 1.2 KB）里的 bms_state.soc。
+        # 一直订阅太费 CPU（planar_odom 订同类消息吃 50%+），所以每 BAT_PERIOD 秒临时订一次，收到一帧就退订，
+        # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
+        self.battery, self.battery_t, self.bat_sub = None, 0.0, None
+        self.create_timer(BAT_PERIOD, self.poll_battery)
+        self.poll_battery()
 
         self.map_blob, self.map_ver = None, 0
         self.map_file = None     # 网页上显示的是 data/maps 里直接读的哪张图（导航没开时）；None = 来自 /map
@@ -708,6 +719,25 @@ class Bridge(Node):
         self.rates['/odom_healthy'].tick()
         self.healthy, self.healthy_t = m.data, time.monotonic()
 
+    def poll_battery(self):
+        if self.bat_sub is not None:
+            self.destroy_subscription(self.bat_sub)   # 上一轮没收到（话题不在），这轮重订
+            self.bat_sub = None
+        try:
+            self.bat_sub = self.create_subscription(get_message('unitree_go/msg/LowState'), BAT_TOPIC,
+                                                    self.on_lowstate_raw, qos_profile_sensor_data, raw=True)
+        except Exception as e:
+            self.get_logger().warn(f'订阅 {BAT_TOPIC} 失败，网页不显示电量：{e}', once=True)
+
+    def on_lowstate_raw(self, data):
+        if len(data) > BAT_SOC_OFFSET and data[1] == 1:   # 只认小端 CDR（00 01 ..）
+            soc = data[BAT_SOC_OFFSET]
+            if 0 < soc <= 100:   # 0 = BMS 还没报
+                self.battery, self.battery_t = soc, time.monotonic()
+        if self.bat_sub is not None:
+            self.destroy_subscription(self.bat_sub)
+            self.bat_sub = None
+
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
         self.armed, self.armed_t = m.data, time.monotonic()
@@ -942,6 +972,7 @@ class Bridge(Node):
             'fixed': self.fixed,
             'odomOk': bool(self.healthy) and now - self.healthy_t < STALE,
             'armed': self.is_armed() if 'go2w_cmd_bridge' in names else None,
+            'battery': self.battery if now - self.battery_t < BAT_STALE else None,
             'navReady': self.nav.server_is_ready(),
             'nodes': nodes, 'profiles': profiles, 'topics': topics,
             'hasMap': self.map_blob is not None,
@@ -2910,14 +2941,23 @@ class Server:
             if self.ctrl is not None:
                 self.ctrl.close()
 
+        async def close_clients(_a):
+            # 停服时先主动关掉网页连接：aiohttp 优雅退出要等所有请求处理完（默认最多 60 s），
+            # 而 WebSocket 有心跳、永远不会自己结束，不关的话 supervisor 等 10 s 就判定停止失败。
+            # 页面收到 1001 会显示离线并自动重连；安全收尾（解除使能、取消路线）仍在 on_cleanup 的 stop 里
+            async def bye(ws):
+                await asyncio.wait_for(ws.close(code=WSCloseCode.GOING_AWAY, message=b'server shutdown'), 2.0)
+            await asyncio.gather(*(bye(ws) for ws in list(self.clients)), return_exceptions=True)
+
         app.on_startup.append(start)
+        app.on_shutdown.append(close_clients)
         app.on_cleanup.append(stop)
         return app
 
 
-# 经常驻服务器（192.168.1.166，nginx）转发的连接，req.remote 都是服务器的地址；
+# 经常驻服务器（192.168.1.22，nginx）转发的连接，req.remote 都是服务器的地址；
 # 只有来自这些代理的请求才信任 X-Forwarded-For，别人发这个头伪造不了 IP
-TRUSTED_PROXIES = set(filter(None, os.environ.get('GO2W_TRUSTED_PROXIES', '192.168.1.166').split(',')))
+TRUSTED_PROXIES = set(filter(None, os.environ.get('GO2W_TRUSTED_PROXIES', '192.168.1.22').split(',')))
 
 
 def client_ip(req):
@@ -2951,7 +2991,7 @@ def main():
     node.get_logger().info(f'go2w_web on http://0.0.0.0:{args.port}，心跳超时 {args.heartbeat:.1f} s')
     try:
         web.run_app(Server(node, os.path.abspath(args.static), args.heartbeat).app(), host='0.0.0.0', port=args.port,
-                    print=None, handle_signals=True)
+                    print=None, handle_signals=True, shutdown_timeout=3.0)
     finally:
         executor.shutdown()
         ros_thread.join(timeout=3.0)

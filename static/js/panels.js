@@ -293,7 +293,13 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       : `<div class="empty">data/bags 里没有录包</div>`);
     $('#bagBtn').textContent = bs==='run' ? '停止录包' : bs==='stop' ? '开始录包' : bs==='starting' ? '启动中…' : '停止中…';
     $('#bagBtn').title = bs==='run' && store.bagSegment ? `正在录：每 ${store.bagSegment} 秒存一个包，包名按开始时间` : `开始后每 30 秒存一个包，包名按开始时间`;
-    $('#bagBtn').disabled = bs==='starting' || bs==='stopping';
+    bagSync(); bagListRender();
+    const noneSel = store.bagTopics === '';
+    $('#bagSelBtn').disabled = bs !== 'stop';
+    if (bs !== 'stop' && !$('#bagSelPop').hidden) bagOpen(false);
+    $('#bagSelBtn').title = bs !== 'stop' ? '录包中不能改，先停止录包' : '';
+    $('#bagBtn').disabled = bs==='starting' || bs==='stopping' || (bs==='stop' && noneSel);
+    if (bs==='stop' && noneSel) $('#bagBtn').title = '先在左边至少勾选一个 topic';
   }
   $('#saveMap').onclick = () => actions.saveMap($('#mapName').value.trim() || 'map');
   $('#alignSelect').onclick = () => setTool('align');
@@ -321,9 +327,46 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#saveMap').disabled = busy;
     $('#mapName').disabled = busy;
   }
-  // 录包的 topic 列表来自输入框；运行档位里的「录包」行也用它
-  store.bagTopics = $('#bagTopics').value;
-  $('#bagTopics').oninput = () => { store.bagTopics = $('#bagTopics').value; };
+  // 录包 topic 下拉多选：记「取消勾选的」，默认一个都没取消 = 全选 = *（之后新冒出来的 topic 也录）；
+  // 取消了任何一个就发具体勾选的列表。刷新页面恢复全选。
+  const bagOff = new Set(), esc = x => String(x).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+  const bagNames = () => [...new Set(store.topics.map(t => t.name))].sort();
+  const bagSync = () => {
+    const names = bagNames(), on = names.filter(n => !bagOff.has(n));
+    store.bagTopics = !bagOff.size ? '*' : on.join(' ');
+    const sum = $('#bagSelSum');
+    sum.textContent = !bagOff.size ? `全部${names.length ? `（${names.length}）` : ''}` : on.length ? `已选 ${on.length} / ${names.length}` : '未选择';
+    sum.classList.toggle('none', !!bagOff.size && !on.length);
+    sum.title = bagOff.size ? on.join('\n') : '录所有 topic（含之后新出现的）';
+  };
+  const bagListRender = force => {
+    if ($('#bagSelPop').hidden) return;
+    const q = $('#bagSelQ').value.trim().toLowerCase(), hz = new Map(store.topics.map(t => [t.name, t.hz]));
+    const names = bagNames().filter(n => !q || n.toLowerCase().includes(q));
+    // 1 Hz 刷新时只在 topic 列表 / 勾选 / 筛选变了才重画（频率每秒都在变，重画会打断点击）
+    const key = q + '|' + names.join(',') + '|' + [...bagOff].join(',');
+    if (!force && key === bagListRender.key) return; bagListRender.key = key;
+    setHTML('#bagSelList', names.length ? names.map(n => { const on = !bagOff.has(n), h = hz.get(n);
+      return `<label class="tsel-it ${on ? '' : 'off'}" role="option" aria-selected="${on}"><input type="checkbox" data-bt="${esc(n)}" ${on ? 'checked' : ''}><span class="n" title="${esc(n)}">${esc(n)}</span><span class="hz">${h > 0 ? (h >= 10 ? h.toFixed(0) : h.toFixed(1)) + ' Hz' : ''}</span></label>`; }).join('')
+      : `<div class="tsel-empty">${store.topics.length ? '没有匹配的 topic' : '还没拿到 topic 列表（后端连上后自动出现）'}</div>`);
+    const all = $('#bagSelAll'), vis = names.filter(n => !bagOff.has(n)).length;
+    all.checked = names.length > 0 && vis === names.length; all.indeterminate = vis > 0 && vis < names.length;
+  };
+  const bagOpen = open => {
+    $('#bagSelPop').hidden = !open; $('#bagSelBtn').setAttribute('aria-expanded', open);
+    if (open) bagListRender(true);
+  };
+  $('#bagSelBtn').onclick = () => bagOpen($('#bagSelPop').hidden);
+  $('#bagSelList').onchange = e => { const n = e.target.dataset.bt; if (n == null) return;
+    e.target.checked ? bagOff.delete(n) : bagOff.add(n); bagSync(); bagListRender(); };
+  $('#bagSelAll').onchange = e => {   // 只作用于当前筛出来的那些
+    const q = $('#bagSelQ').value.trim().toLowerCase();
+    bagNames().filter(n => !q || n.toLowerCase().includes(q)).forEach(n => e.target.checked ? bagOff.delete(n) : bagOff.add(n));
+    bagSync(); bagListRender(); };
+  $('#bagSelQ').oninput = () => bagListRender();
+  document.addEventListener('pointerdown', e => { if (!$('#bagSelPop').hidden && !e.target.closest('#bagSel')) bagOpen(false); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#bagSelPop').hidden) bagOpen(false); });
+  bagSync();
   $('#bagBtn').onclick = () => actions.toggle('bag');
   $('#rbOn').onchange = e => actions.setRollback(e.target.checked);
   $('#rbSave').onclick = () => actions.saveRollback();

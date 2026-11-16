@@ -118,7 +118,7 @@ export function createRosSource(store, bus){
           store.routeDraft = { id: null, map: null, points: [], confirmed: false };
           store.routeCheck = null;
         }
-        store.odomOk = m.odomOk; store.armed = m.armed; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
+        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
         Object.assign(store.params, m.params || {});
         for (const [k, st] of Object.entries(m.profiles)){   // stop / starting / run / stopping
           if (st === 'run' && store.profiles[k] !== 'run') store.since[k] = now();

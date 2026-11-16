@@ -177,9 +177,18 @@
               <div class="logs" id="logBox"></div>
               <div>
                 <h4>录包 <span class="mono" style="color:var(--muted);font-size:11px">data/bags</span></h4>
-                <!-- 11-12 起默认录所有 topic（* = 全部，含 FAST-LIO 点云）；也可以改成具体 topic，空格或换行分隔，刷新页面恢复默认 -->
-                <div class="inrow bag-row"><textarea id="bagTopics" rows="5" spellcheck="false" autocomplete="off" aria-label="录包 topic，空格或换行分隔">*</textarea><button class="btn sm" id="bagBtn">开始录包</button></div>
-                <div class="bag-tip">录包时每 30 秒存成一个包，包名按这一段的开始时间（go2w_月日_时分秒；手动保存的回溯包和卡住自动存的包也是这个名字）。默认 <b>*</b> = 录所有 topic，包括 FAST-LIO 点云，数据量大（每个包可能几百 MB），注意磁盘空间；只想录一部分就把 * 换成具体 topic，空格或换行分隔</div>
+                <!-- 录哪些 topic：下拉多选，默认全选（= *，之后新出现的 topic 也会录）；取消勾选后只录勾着的；刷新页面恢复全选 -->
+                <div class="inrow bag-row">
+                  <div class="tsel" id="bagSel">
+                    <button class="tsel-btn" id="bagSelBtn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="bagSelPop"><span class="tsel-k">录制 topic</span><span class="tsel-v" id="bagSelSum">全部</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+                    <div class="tsel-pop" id="bagSelPop" hidden>
+                      <div class="tsel-head"><label><input type="checkbox" id="bagSelAll"> 全选</label><input id="bagSelQ" type="search" placeholder="筛选 topic" spellcheck="false" autocomplete="off" aria-label="筛选 topic"></div>
+                      <div class="tsel-list" id="bagSelList" role="listbox" aria-multiselectable="true"></div>
+                    </div>
+                  </div>
+                  <button class="btn sm" id="bagBtn">开始录包</button>
+                </div>
+                <div class="bag-tip">每 30 秒存一个包，包名按开始时间。全选会录包括点云在内的所有 topic，每个包可能几百 MB。</div>
                 <div class="inrow rb-row"><label class="bag-livox"><input type="checkbox" id="rbOn"> 回溯录制</label><span class="meta rb-state" id="rbState"></span><button class="btn sm pri" id="rbSave">保存刚才 20 秒</button></div>
                 <div id="bagList"></div>
               </div>

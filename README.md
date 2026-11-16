@@ -176,17 +176,17 @@ dev/run.sh
 
 ## 部署到扩展坞
 
-网页打包在运行镜像里，改了代码要重新打 release 镜像并在扩展坞上切换（`/opt/go2w/current` 指向的 release，配置在 `/opt/go2w/config/runtime.env` 的 `GO2W_IMAGE`）。原来的 `sync.sh dock` + `docker compose up web` 是给 `go2w_humble` / `go2w_web` 用的，现在不能再用，会找不到容器。
+V1.0.0.1（11-13）起网页不再打包在运行镜像里，而是扩展坞上的独立网页包：`/opt/go2w/web/releases/<名字>/{server,static,tools}`，`/opt/go2w/web/current` 指向正在用的那个（运行容器只读挂载这个目录）。更新时把新包放进 `releases/`，改 `current` 链接，再 `sudo /opt/go2w/go2w web stop` / `web start` 只重启网页后端。只改前端时刷新页面就生效。后端的上传目标、信任的代理等环境变量以 `/opt/go2w/config/runtime.env` 为准（`web start` 时传进去，会覆盖代码里的默认值）。原来的 `sync.sh dock` + `docker compose up web` 是给 `go2w_humble` / `go2w_web` 用的，现在不能再用。
 
-打开网页 · 在 Mac 浏览器里：http://192.168.1.142:8080
+打开网页 · 在 Mac 浏览器里：http://192.168.1.21:8080
 
-## 常驻服务器入口（192.168.1.166）
+## 常驻服务器入口（192.168.1.22）
 
-大家平时打开 **http://192.168.1.166**。166 上的 nginx 提供前端页面，并把 `/ws` 转发到扩展坞的 `192.168.1.142:8080`。后端、心跳上锁和进程管理仍在扩展坞上，166 只做转发。机器人关机时页面仍能打开，但只显示「机器人未连接」，开机后自动重连。直接打开 `http://192.168.1.142:8080` 也照常能用。
+大家平时打开 **http://192.168.1.22**。22 上的 nginx 提供前端页面，并把 `/ws` 转发到扩展坞的 `192.168.1.21:8080`。后端、心跳上锁和进程管理仍在扩展坞上，22 只做转发。机器人关机时页面仍能打开，但只显示「机器人未连接」，开机后自动重连。直接打开 `http://192.168.1.21:8080` 也照常能用。
 
-- 第一次安装（已完成 11-05）· 在 166 上运行：`sudo bash ~/go2w-web-setup/install.sh evoengine`（文件来自主仓库 `scripts/server/`）。安装 nginx 并设为开机自启，放行局域网访问 80 端口，禁止系统休眠。
+- 第一次安装（已完成 11-05）· 在 22 上运行：`sudo bash ~/go2w-web-setup/install.sh evoengine`（文件来自主仓库 `scripts/server/`）。安装 nginx 并设为开机自启，放行局域网访问 80 端口，禁止系统休眠。
 - 改了前端 · 在 Mac 上运行主仓库的 `scripts/sync.sh server`。前端在扩展坞上也有一份，要保持一致。
-- 后端只信任来自 166 的 `X-Forwarded-For`，日志显示为「真实 IP 经 192.168.1.166」。代理地址可以用环境变量 `GO2W_TRUSTED_PROXIES` 修改，多个地址用逗号分隔。
+- 后端只信任来自 22 的 `X-Forwarded-For`，日志显示为「真实 IP 经 192.168.1.22」。代理地址可以用环境变量 `GO2W_TRUSTED_PROXIES` 修改，多个地址用逗号分隔。
 
 看后端日志 · 在扩展坞上运行：
 
