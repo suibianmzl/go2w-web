@@ -55,6 +55,10 @@ export function createMockSource(store, bus){
   store.wallAt = wallMask(grid, GW, GH, RES, 0, 0);
   store.link = { ok: true, ms: 23 };
   store.armed = true; store.battery = 76; store.odo = 1284;
+  // 电机温度：取 11-16 真机录包的典型值（髋关节明显比别的热）；?mock&hot 让左前髋 / 右后髋过热，测提醒
+  const mtBase = /[?&]hot\b/.test(location.search) ? [52, 88, 33, 58, 32, 33, 74, 29, 32, 55, 29, 32, 23, 23, 24, 23]
+    : [49, 61, 31, 55, 32, 33, 63, 29, 32, 53, 29, 32, 23, 23, 24, 23];
+  store.motorTemp = mtBase.slice();
   store.ctrl = { on: false };   // 纯前端模拟没有运控：自检跳过「站立」
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';
@@ -196,6 +200,7 @@ export function createMockSource(store, bus){
     if (costAt(nx, ny) < 253){ R.x = nx; R.y = ny; } else { R.v = 0; R.vy = 0; }
     R.th = wrap(R.th + R.w*dt);
     store.odo += Math.hypot(R.v, R.vy)*dt;
+    if (Math.random() < dt/5) store.motorTemp = mtBase.map(v => v + Math.round(Math.random()*2 - 1));
     store.imu = { pitch: .9 + (tv - R.v)*3 + Math.sin(S.t*7)*.08, roll: -.4 + R.w*.6 + Math.sin(S.t*5.3)*.06 };
     const tr = store.trail, last = tr[tr.length-1];
     if (!last || Math.hypot(last[0]-R.x, last[1]-R.y) > .08){ tr.push([R.x, R.y]); if (tr.length > 900) tr.shift(); }
@@ -319,6 +324,7 @@ export function createMockSource(store, bus){
     standUp: () => ({ ok: true, msg: '纯前端模拟：没有运控' }),
     lieDown: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     standHold: () => ({ ok: true }),
+    setPolicy: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     prepHold: () => ({ ok: true }),
     autolocMove: () => ({ ok: false, msg: '纯前端模拟：定位没有误差，不需要移动重试' }),
     initialPose(p){ cancelTask('Goal canceled: initial pose reset'); Object.assign(R, { x:p.x, y:p.y, th:p.th, v:0, w:0, vy:0 }); store.trail = [];

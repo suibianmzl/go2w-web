@@ -45,6 +45,6 @@ export function createStore(){
     rollback: { on: true, run: false, saving: false, seconds: 20 },
     bagLive: [], bagSegment: null,  // 正在写的包（列表里的名字）；分段录包的段长（秒）
     maps: [], bags: [], uploads: {},   // uploads：包名 → { state: run/done/fail, pct, msg }
-    odo: null, battery: null,
+    odo: null, battery: null, motorTemp: null,
   };
 }

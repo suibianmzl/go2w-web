@@ -3,7 +3,7 @@
 //   - 地图上方的横幅：一直显示最严重的一条，写清楚影响和怎么处理；多条时可以展开看全部
 //   - 刚出现 / 刚恢复时弹一次提示，并写进网页日志（运控的离线 / 恢复后端也会记一条）
 //   - store.alerts：给右上角状态牌（status.js）和「出发」按钮（actions.routeGoBlocker）用
-import { $ } from './util.js';
+import { $, MOTOR_WARN, MOTOR_CRIT, motorName } from './util.js';
 import { toast } from './ui.js';
 import { MODES } from './actions.js';
 
@@ -39,7 +39,7 @@ export function setupAlerts(store, bus){
       return out;
     }
     const C = store.ctrl;
-    if (C?.on && C.state == null){
+    if (C?.on && C.state == null && C.op !== 'policy'){   // 切策略时运控本来就要重启一下
       add('ctrl', 'crit', '运控离线',
         C.age == null ? '后端启动以来没有收到运控状态（/go2w_ctrl/state）。' : `已经 ${Math.round(C.age)} 秒没有收到运控状态（/go2w_ctrl/state）。`,
         '不能站起、不能出发。在扩展坞上检查：sudo systemctl status go2w-ctrl', 2, true);
@@ -67,6 +67,17 @@ export function setupAlerts(store, bus){
     }
     if (anyMode && !stackBad && !store.odomOk){
       add('odom', 'crit', '里程计不可用', 'FAST-LIO 没有输出，或 /odom_healthy 报告不健康。', '机器人保持静止等一会儿；不行就停止后重新启动这个档位。', 4, true);
+    }
+    // 电机过热（11-17）：只提醒，不拦出发（阈值是保守估计，见 util.js）
+    const MT = store.motorTemp;
+    if (MT){
+      const hot = MT.map((v, i) => [v, i]).filter(([v]) => v >= MOTOR_WARN).sort((a, b) => b[0] - a[0]);
+      if (hot.length){
+        const crit = hot[0][0] >= MOTOR_CRIT;
+        add('motor_temp', crit ? 'crit' : 'warn', crit ? '电机过热' : '电机温度偏高',
+          `${hot.slice(0, 4).map(([v, i]) => `${motorName(i)} ${v} ℃`).join('、')}${hot.length > 4 ? ` 等 ${hot.length} 个` : ''}。（≥${MOTOR_WARN} ℃ 算偏高，≥${MOTOR_CRIT} ℃ 算过热）`,
+          crit ? '尽快停下让机器人趴下降温；左侧机器人卡片里点「电机温度」看全部。' : '注意别长时间连续跑；左侧机器人卡片里点「电机温度」看全部。', 10);
+      }
     }
     const rb = store.rollback;
     if (anyMode && rb?.on && rb.run === false){

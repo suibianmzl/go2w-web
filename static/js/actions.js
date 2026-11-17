@@ -63,6 +63,16 @@ export function createActions(store, src){
         onOk: () => exec(src.cmd.lieDown(), null) });
     },
     standHold(on){ if (ready('standHold')) exec(src.cmd.standHold(on), null); },
+    // 切运控策略：后端只在趴着时执行（停掉运控、换策略重启，几秒钟）。onDone 用来把下拉框恢复成实际值
+    setPolicy(name, onDone){
+      const C = store.ctrl;
+      if (!ready('setPolicy')) return onDone?.();
+      if (!(C?.state === 'Passive' && C.ready) || C.op) return (toast('只能趴着时切换策略', 'err'), onDone?.());
+      confirmBox({ title: '切换运控策略', ok: '切换',
+        body: `从 ${C.policy || '（未知）'} 切到 ${name}。运控会重启几秒钟，期间机器狗保持趴着。不同策略站高不同：站起来后要重新定位，建图 / 续建请用同一个策略。重启扩展坞后会恢复为默认策略。`,
+        onOk: () => exec(src.cmd.setPolicy(name), null).finally(() => onDone?.()),
+        onCancel: () => onDone?.() });
+    },
     // fine = 重定位的微调：后端用小协方差，AMCL 不会把粒子撒开
     initialPose(p, fine = false){
       const no = msg => (toast(msg, 'err'), { ok: false, msg });
@@ -214,7 +224,18 @@ export function createActions(store, src){
         body: `新图叫 ${name}。${manual ? '起点位姿用你手动给的那个（这一级没有自动校验，开后要看自检）。' : '起点位姿按「停车点 → 自动定位 → 手动」依次定。'}`
           + '机器人的位置必须在基准图覆盖范围内。slam_toolbox 加载旧图时不校验位姿，给错了也不会报错，只会建出双线墙——所以开始后要点「自检」。',
         ok: '开始续建', danger: manual,
-        onOk: () => exec(src.cmd.contStart(base, name, pose, source), null) });
+        // 要等静止激光 + 自动定位 + 加载基准图，5–15 s：期间按钮显示进行中，失败原因留在状态栏
+        // （提示框只停 2.6 s，长的原因一闪就没了，看起来像「点了没反应」）
+        onOk: () => {
+          store.contStarting = true; store.contErr = null;
+          return exec(src.cmd.contStart(base, name, pose, source), null).then(r => {
+            store.contStarting = false;
+            store.contErr = r && r.ok === false ? (r.msg || '没开始，原因未知') : null;
+            // 成功后到下一次状态推送（≤0.5 s）之间 store.cont 还是空的：这段时间继续显示进行中
+            store.contStartOkAt = r && r.ok !== false ? Date.now() : 0;
+            return r;
+          });
+        } });
     },
     contCheck(){
       if (!ready('contCheck')) return;

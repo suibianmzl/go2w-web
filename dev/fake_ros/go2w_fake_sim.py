@@ -82,6 +82,20 @@ def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+# 假 LowState（unitree_go/LowState 的 CDR 原始字节，1180 字节）：只填后端读的 soc 和 16 个电机温度。
+# GO2W_FAKE_MOTOR_TEMP="52,88,..."（16 个 ℃）可以指定温度，测过热提醒
+FAKE_MOTOR_TEMP = [int(v) for v in os.environ.get('GO2W_FAKE_MOTOR_TEMP', '49,61,31,55,32,33,63,29,32,53,29,32,23,23,24,23').split(',')]
+
+
+def fake_lowstate():
+    b = bytearray(1180)
+    b[1] = 1                       # 小端 CDR 头 00 01 00 00
+    b[4 + 1039] = 76               # bms_state.soc
+    for i, t in enumerate(FAKE_MOTOR_TEMP[:16]):
+        b[4 + 108 + 48*i] = t & 0xFF   # motor_state[i].temperature（int8）
+    return bytes(b)
+
+
 class Sim:
     def __init__(self, node):
         self.node = node
@@ -115,6 +129,8 @@ class Sim:
         self.ctrl = {'state': os.environ.get('GO2W_FAKE_CTRL', 'Velocity'), 'seq': 1, 't': -1e9}
         self.ctrl_req = None   # (api_id, 收到时间)：和真的一样只留最新一条，0.2 s 后作废
         self.ctrl_sent = None  # 上次发出的 (state, ready, seq)
+        self.policy = os.environ.get('GO2W_CONTROL_POLICY') or 'mjlab_go2w_dgv2_m22_scratch_w02_7999'
+        self.ctrl_off_until = 0.0   # 假运控重启（切策略）期间不发状态
 
     # ---------- 假运控 ----------
     CTRL_INTERP = 2.0   # FixStand 插值时间
@@ -823,7 +839,7 @@ def run(node):
         k += 1
         cm = sim.ctrl_msg(now, k % 2 == 0)   # /go2w_ctrl/state：10 Hz，变化时立刻补发；和导航档位无关（运控一直在跑）
         # 测试网页的报错提醒：这两个文件存在时模拟运控停了 / 雷达没数据
-        if cm is not None and not os.path.exists(FAKE_CTRL_OFF):
+        if cm is not None and not os.path.exists(FAKE_CTRL_OFF) and now >= sim.ctrl_off_until:
             node.deliver('/go2w_ctrl/state', cm)
         alive, nav = sim.any_ready(), sim.ready('navigation')
         # /map 是 latched：定位 / 建图起来时补发一次
@@ -866,6 +882,8 @@ def run(node):
             node.deliver('/particle_cloud', sim.particles_msg())
         if nav and k % 20 == 0:   # 全局代价地图 1 Hz（内容不变，后端会去重）
             node.deliver('/global_costmap/costmap', sim.costmap_msg(local=False))
+        if k % 20 == 10:   # /go2w/robot_lowstate：后端只按 CDR 偏移读 soc 和电机温度，这里只拼这几个字节
+            node.deliver('/go2w/robot_lowstate', fake_lowstate())
         if sim.loc_ready() and k % 20 == 0:  # /amcl_pose：假定位误差很小，走起来略大
             a = PoseWithCovarianceStamped()
             a.pose.pose.position.x, a.pose.pose.position.y = sim.x, sim.y

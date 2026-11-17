@@ -86,6 +86,18 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 
 测试：`dev/test_map_overlap_check.py`、`dev/test_mapmeta.py`、`dev/test_mapcontinue.py`（不用起 run.sh）。
 
+## 运控策略切换（11-17）
+
+机器人卡片「姿态」下面的「策略」下拉框：**只有趴着（Passive）时能切**。后端（`set_policy`）经 supervisor 停掉 control 进程组，只换 `GO2W_CONTROL_POLICY` 再用同样的环境变量启动，然后最多等 20 s 收到新运控的 Passive（新进程先报一下 `Init`，不算异常）；收不到就自动切回原来的策略。`GO2W_CONTROL_CONFIG` 有值时拒绝切换。切换只在本次开机有效，重启扩展坞后回到 `runtime.env` 里的策略。当前策略（supervisor 里的实际值，拿不到再读 `runtime.env`）也用于地图续建的基准检查。
+
+测试：`dev/test_procs.py`；`dev/test_policy.mjs`（先 `GO2W_FAKE_CTRL=Passive GO2W_FAKE_POLICY_FAIL=mjlab_go2w_cmd_m22 dev/run.sh`）。
+
+## 电机温度（11-17）
+
+后端每 5 s 临时订阅一帧 `/go2w/robot_lowstate`，不反序列化，按 CDR 偏移读电量和 16 个 `motor_state[i].temperature`（int8，℃，字节 `4 + 108 + 48·i`；0–11 是 右前 / 左前 / 右后 / 左后 × 髋 / 大腿 / 小腿，12–15 是轮子），状态里发 `motorTemp`，20 s 没读到就是 `null`。偏移用真机录包核对过：髋关节平时 46–67 ℃（低电量跑久了到过 81 ℃），大腿 / 小腿约 30 ℃，轮子约 23 ℃。
+
+机器人卡片里「电机温度」一行显示最热的电机，点开是 4×4 的表。≥70 ℃ 黄、≥85 ℃ 红，并在地图上方提醒（只提醒，不拦出发）；阈值在 `static/js/util.js` 的 `MOTOR_WARN` / `MOTOR_CRIT`，是按实测定的保守值，不是宇树的保护温度。本地：`?mock&hot` 或 `GO2W_FAKE_MOTOR_TEMP=52,88,…（16 个）dev/run.sh` 看过热效果。
+
 ## 地图显示方向
 
 建图时地图的 x 轴取机器人开始建图那一刻的朝向，所以有的图是斜的、有的是竖的。这不影响定位和导航（Theta* 能走任意角度的直线），只是看着别扭。网页可以按地图单独保存一个**显示方向**：只转画面，不改地图坐标，所以路线、巡逻点、初始位姿都不用重做。

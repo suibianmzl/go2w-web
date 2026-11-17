@@ -12,6 +12,14 @@ export const fmtDur = s => { s = Math.max(0, s|0); const h = s/3600|0, m = (s%36
 export const tstr = (d = new Date()) => d.toTimeString().slice(0,8) + '.' + String(d.getMilliseconds()).padStart(3,'0');
 
 export const ACC = '#38e1dc', TRAJ = '#b28cff';
+// 电机温度（11-17）：后端 motorTemp 是 16 个 ℃，顺序 = LowState.motor_state：FR/FL/RR/RL 的髋、大腿、小腿，再 4 个轮子。
+// 阈值是先定的保守值（实测髋关节平时 50–65 ℃，11-13 低电量跑久了到过 81 ℃），不是宇树的保护温度
+export const MOTOR_WARN = 70, MOTOR_CRIT = 85;
+export const MOTOR_LEGS = ['FR', 'FL', 'RR', 'RL'], MOTOR_LEG_CN = { FR: '右前', FL: '左前', RR: '右后', RL: '左后' };
+export const MOTOR_JOINTS = ['髋', '大腿', '小腿', '轮'];
+export const motorIdx = (leg, j) => j < 3 ? leg*3 + j : 12 + leg;
+export const motorName = i => i < 12 ? `${MOTOR_LEG_CN[MOTOR_LEGS[i/3|0]]}${MOTOR_JOINTS[i%3]}` : `${MOTOR_LEG_CN[MOTOR_LEGS[i-12]]}轮`;
+export const motorLevel = t => t >= MOTOR_CRIT ? 'crit' : t >= MOTOR_WARN ? 'warn' : 'ok';
 export const CLOUD = ['#ff4fa3','#e95ab9','#c964d6','#a86bff','#8a8fff','#6fb6ff'];
 
 // 极简事件总线：log / toast
