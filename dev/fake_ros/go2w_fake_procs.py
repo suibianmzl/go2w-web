@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 import time
 
+FAKE_STOP_FAIL = os.environ.get('GO2W_FAKE_STOP_FAIL', '/tmp/go2w_fake_stop_fail')   # 有这个文件 → stop_modes 抛错
+
 
 class FakeProcs:
     def __init__(self, node):
@@ -31,6 +33,10 @@ class FakeProcs:
     async def stop_modes(self):
         self.sim.later(self.sim.stop_modes)
         await asyncio.sleep(1.0)   # 真机上 launch 正常退出也要一会儿
+        if os.path.exists(FAKE_STOP_FAIL):
+            # 模拟真机 11-17：FAST-LIO 15 s 才被 SIGKILL，supervisor 10 s 等不到就抛错（进程其实随后退了）
+            raise RuntimeError('navigation did not stop after SIGINT; process group is still running. '
+                               'No forced kill was sent; runtime remains available.')
         return True
 
     async def start_patrol(self, loops):

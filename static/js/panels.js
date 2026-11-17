@@ -286,22 +286,23 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     else off.hidden = true;
   }
   // 电机温度：一行显示最热的电机（超过阈值变黄 / 红），点开是 4 条腿 × 髋 / 大腿 / 小腿 / 轮 的表，展开状态记在本机浏览器。
-  // 表上面的下拉切换看 温度 / 错误标志（选的哪个也记在本机）
+  // 表上面的下拉切换看 温度 / 错误标志 / 力矩（选的哪个也记在本机）；表开着且看力矩时让后端读得勤一点
   const mtRow = $('#mtRow'), mtGrid = $('#mtGrid'), mtBox = $('#mtBox'), mtSel = $('#mtView'), mtCells = [];
   let mtView = 'temp';
   {
     mtSel.innerHTML = MOTOR_VIEWS.map(([k, cn]) => `<option value="${k}">${cn}</option>`).join('');
     try { const v = localStorage.getItem('go2w.mtView'); if (MOTOR_VIEWS.some(([k]) => k === v)) mtView = v; } catch {}
     mtSel.value = mtView;
-    mtSel.onchange = () => { mtView = mtSel.value; try { localStorage.setItem('go2w.mtView', mtView); } catch {} renderMotorTemp(); };
+    mtSel.onchange = () => { mtView = mtSel.value; try { localStorage.setItem('go2w.mtView', mtView); } catch {} syncFast(); renderMotorTemp(); };
     mtGrid.innerHTML = '<span></span>' + MOTOR_JOINTS.map(j => `<span>${j}</span>`).join('')
       + MOTOR_LEGS.map((l, li) => `<span class="lg">${MOTOR_LEG_CN[l]}</span>` + MOTOR_JOINTS.map((_, j) => `<b data-i="${motorIdx(li, j)}">--</b>`).join('')).join('');
     mtGrid.querySelectorAll('b').forEach(b => { mtCells[+b.dataset.i] = b; b.title = motorName(+b.dataset.i); });
     let open = false; try { open = localStorage.getItem('go2w.mtOpen') === '1'; } catch {}
-    const setOpen = v => { open = v; mtBox.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} };
+    const syncFast = () => src.motorFast?.(open && mtView === 'tau');
+    const setOpen = v => { open = v; mtBox.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} syncFast(); };
     setOpen(open);
     mtRow.onclick = () => setOpen(!open);
-    mtRow.title = `点开看全部电机温度和错误标志（温度 ≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
+    mtRow.title = `点开看全部电机温度、错误标志和力矩（温度 ≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
   }
   const hex = v => '0x' + v.toString(16).toUpperCase();
   // 每种视图：单元格文字、颜色等级、鼠标悬停说明
@@ -313,13 +314,19 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const e = I.err[i];
       return [e ? hex(e) : '0', e ? 'crit' : 'dim', `${name} 错误标志 ${e}（${hex(e)}）${e ? '' : '：正常'}`];
     }
+    if (view === 'tau'){
+      const v = I.tau?.[i];
+      if (v == null) return ['--', '', name];
+      const s = Math.abs(v) < 0.05 ? '0.0' : (v > 0 ? '+' : '') + v.toFixed(1);   // 别显示 -0.0
+      return [s, Math.abs(v) < 0.5 ? 'dim' : '', `${name} 估计力矩 ${v.toFixed(2)} N·m（正负 = 方向）`];
+    }
     return ['--', '', name];
   }
   // 只在内容变了才写 DOM：这里 4 Hz 重绘，下拉框展开时改它的选项（哪怕文字一样）Chrome 会重建弹出列表 → 闪、点不中
   const setTxt = (el, v) => { v = String(v); if (el.textContent !== v) el.textContent = v; };
   const setAttr = (el, k, v) => { if (el.getAttribute(k) !== v) el.setAttribute(k, v); };
   let mtSumHtml = null;
-  const MT_NOTE = { temp: '℃', err: '0 = 正常' };
+  const MT_NOTE = { temp: '℃', err: '0 = 正常', tau: 'N·m · 估计值' };
   function renderMotorTemp(){
     const T = store.motorTemp, I = store.motorInfo, nErr = motorErrCount(I);
     setTxt($('#mtNote'), MT_NOTE[mtView]);

@@ -147,6 +147,11 @@ MOTOR_TEMP_OFFSET, MOTOR_STRIDE, MOTOR_N = 4 + 108, 48, 16
 # motor_state[i].reserve[0]（uint32）当错误标志（同 app「狗腿信息 → 错误标志」），在元素内 +39 = temperature 后 8 字节。
 # 11-17 用 go2w-01_1116_172503 录包核对（14772 帧）：16 个电机全程 0（= 正常）；reserve[1] 一直 507/508，不是错误码
 MOTOR_ERR_OFFSET = MOTOR_TEMP_OFFSET + 8
+# motor_state[i].tau_est（float32，N·m，估计力矩）：元素内 q +0 / dq +4 / ddq +8 / tau_est +12 → temperature 前 16 字节。
+# 11-17 用 go2w-01_1116_172503 核对：站着时小腿约 +7、左右髋符号相反（±4~7），轮子 ±2 以内
+MOTOR_TAU_OFFSET = MOTOR_TEMP_OFFSET - 16
+# 网页打开「力矩」视图时 lowstate 改成每 MOTOR_FAST_PERIOD 秒读一次（= 状态推送 2 Hz），关掉后回到 BAT_PERIOD
+MOTOR_FAST_PERIOD = 0.5
 # 建图自动保存（11-17，用户：「报错自动保存地图」「两分钟太长，三十秒」）：建图时每 AUTOSAVE_PERIOD 秒、
 # 停止建图前、雷达 / FAST-LIO / 里程计出问题时，把当前地图存成 data/maps/autosave_<建图开始时间>，
 # 同一次建图覆盖同一份。只在地图有变化时存；单次存图耗时超过周期的 1/10 就自动拉长间隔，免得拖慢 slam。
@@ -409,8 +414,10 @@ class Bridge(Node):
         # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
         self.battery, self.battery_t, self.bat_sub = None, 0.0, None
         self.motor_temp, self.motor_temp_t = None, 0.0   # 16 个电机温度 ℃（顺序见 MOTOR_TEMP_OFFSET）
-        self.motor_info = None   # 同一帧的错误标志，和 motor_temp 一起更新、一起过期
-        self.create_timer(BAT_PERIOD, self.poll_battery)
+        self.motor_info = None   # 同一帧的错误标志 / 力矩，和 motor_temp 一起更新、一起过期
+        self.motor_fast = False  # 有网页在看力矩：读得勤一点（WebApp 维护）
+        self.bat_poll_t = 0.0
+        self.create_timer(MOTOR_FAST_PERIOD, self.poll_tick)
         self.poll_battery()
 
         self.map_blob, self.map_ver = None, 0
@@ -823,7 +830,14 @@ class Bridge(Node):
         self.rates['/odom_healthy'].tick()
         self.healthy, self.healthy_t = m.data, time.monotonic()
 
+    def poll_tick(self):
+        # 上一个临时订阅还在等第一帧（DDS 发现可能要几百 ms）就别重建，等满 BAT_PERIOD 还没收到才重订
+        due = time.monotonic() - self.bat_poll_t >= BAT_PERIOD - 0.01
+        if due or (self.motor_fast and self.bat_sub is None):
+            self.poll_battery()
+
     def poll_battery(self):
+        self.bat_poll_t = time.monotonic()
         if self.bat_sub is not None:
             self.destroy_subscription(self.bat_sub)   # 上一轮没收到（话题不在），这轮重订
             self.bat_sub = None
@@ -851,7 +865,9 @@ class Bridge(Node):
     def _parse_motor_info(self, data, now):
         if len(data) < MOTOR_ERR_OFFSET + 4 + MOTOR_STRIDE * (MOTOR_N - 1):
             return None
-        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]}
+        tau = [struct.unpack_from('<f', data, MOTOR_TAU_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]
+        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)],
+                'tau': [round(v, 2) if math.isfinite(v) else None for v in tau]}
 
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
@@ -2615,8 +2631,12 @@ class Server:
                 if mode != 'mapping':
                     self.map_choice = None
         except Exception as e:
-            self.transitions.pop(mode, None)
-            self.starting.pop(mode, None)
+            # 停档位时出错（例如 supervisor 10 s 内没等到导航组退出）也要清掉这些档位的「停止中」，
+            # 否则界面一直卡在停止中、按钮全灰；之后档位状态按真实进程状态显示
+            for m in {mode, *cur} - {None}:
+                self.transitions.pop(m, None)
+                self.starting.pop(m, None)
+            await self.refresh_procs()
             n.event('ERROR', f'启停失败：{e!r}')
         finally:
             self.busy = False
@@ -3844,6 +3864,9 @@ class Server:
                     self.tx_put(ws, json.dumps({'t': 'cam', **r}))
                 elif d.get('t') == 'inspect' and isinstance(d.get('topic'), str):
                     self.set_inspect(ws, d['topic'], bool(d.get('on')))
+                elif d.get('t') == 'motor_fast':   # 网页在看电机力矩：lowstate 读得勤一点
+                    self.clients[ws]['mfast'] = bool(d.get('on'))
+                    self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
                 elif d.get('t') == 'cmd':
                     # 指令可能要等几秒（Nav2 接受目标、服务回复），单独跑，不耽误这条连接上的心跳
                     t = asyncio.create_task(self.run_cmd(ws, d))
@@ -3855,6 +3878,7 @@ class Server:
                 self.set_inspect(ws, topic, False)
             await self.camera.release(ws)
             self.clients.pop(ws, None)
+            self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
             if ws is self.owner:
                 self.owner = None
