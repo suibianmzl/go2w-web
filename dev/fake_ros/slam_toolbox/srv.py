@@ -10,9 +10,10 @@
 
 
 class DeserializePoseGraph:
-    UNSET, START_AT_FIRST_NODE, START_AT_GIVEN_POSE, LOCALIZE_AT_POSE = 0, 1, 2, 3
-
+    # 和 rosidl 生成的代码一样：常量只在 Request 上，服务类本身没有（写错地方真机会 AttributeError）
     class Request:
+        UNSET, START_AT_FIRST_NODE, START_AT_GIVEN_POSE, LOCALIZE_AT_POSE = 0, 1, 2, 3
+
         def __init__(self, filename='', match_type=0, initial_pose=None):
             self.filename = filename
             self.match_type = match_type

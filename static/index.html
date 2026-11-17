@@ -62,7 +62,11 @@
         <button class="mt-row" id="mtRow" aria-expanded="false" title="点开看全部电机温度">
           <span class="mt-k">电机温度</span><span class="mt-v" id="mtSum">--</span><span class="mt-car" aria-hidden="true">▾</span>
         </button>
-        <div class="mt-grid" id="mtGrid" hidden></div>
+        <div class="mt-box" id="mtBox" hidden>
+          <!-- 下拉切换看什么（同 app「狗腿信息」）：温度 / 错误标志 -->
+          <div class="mt-bar"><select id="mtView" aria-label="电机信息"></select><span class="mt-note" id="mtNote"></span></div>
+          <div class="mt-grid" id="mtGrid"></div>
+        </div>
         <!-- 运控姿态：站起 / 趴下；网页站起来（或跑完任务）后空闲 30 s 原地趴下，倒计时时可以「保持站立」 -->
         <div class="pose-row" id="poseRow" hidden>
           <span class="pose-txt" id="poseTxt">--</span>
@@ -362,6 +366,7 @@
             <div class="step-h"><div class="step-n"><span>4</span></div><div class="step-t">保存地图<span class="step-s" id="mpSaveSub"></span></div></div>
             <div class="step-b">
               <p class="hint">不会覆盖同名地图；可以多次保存，每次存成一个新名字（保存后自动换成下一个名字）。</p>
+              <p class="hint" id="mpAuto" hidden></p>
               <div class="inrow"><input id="mapName" aria-label="地图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="saveMap">保存</button></div>
             </div>
           </div>

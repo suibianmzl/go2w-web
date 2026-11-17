@@ -164,21 +164,20 @@ def check_start(base, pose):
     return True, ''
 
 
-# 自检必须停在起点做：它拿「现在扫到的墙」和「基准图在起点位姿下预测的墙」比。
-# 机器人已经开走的话，用来变换 scan 的起点位姿就不成立了，量出来的偏差是假的。
-CHECK_DRIFT_XY = 0.50    # m
-CHECK_DRIFT_YAW = math.radians(15)
-
-
-def check_drift(start, now):
-    """自检时机器人还在不在起点。返回 (ok, reason)。
-
-    留着这条是为了把「你开走了」和「图对不上」分开：不分开的话，开走之后自检会以
-    「环境和图对不上」报错，让人去怀疑地图，白折腾一轮。
-    """
-    if now is None:
-        # 拿不到当前位姿时不能拦：趴着 / 没有 TF 也允许量一次，由贴合率自己说话
-        return True, ''
+# 自检的修正量 (dx, dy, dyaw°) 是绕「量的那个位置」(pivot) 算的：把 slam 坐标系里的点绕 pivot 转 dyaw
+# 再平移 (dx, dy) 就落到基准图上。起点也在同一个 slam 坐标系里，套同一个变换就是它在基准图里该有的位姿。
+def start_fix(start, pivot, correction):
+    """自检没过时，把修正量换算成「起点位姿应该给多少」。缺数据返回 None。"""
+    try:
+        dx, dy, dyaw = (float(v) for v in correction)
+        sx, sy, sth = (float(v) for v in start)
+        px, py = float(pivot[0]), float(pivot[1])
+    except (TypeError, ValueError):
+        return None
+    a = math.radians(dyaw)
+    ca, sa = math.cos(a), math.sin(a)
+    x, y = sx - px, sy - py
+    return (ca * x - sa * y + px + dx, sa * x + ca * y + py + dy, yaw_diff(sth + a, 0.0))
     dx, dy = now[0] - start[0], now[1] - start[1]
     off, dth = math.hypot(dx, dy), abs(yaw_diff(now[2], start[2]))
     if off > CHECK_DRIFT_XY or dth > CHECK_DRIFT_YAW:
