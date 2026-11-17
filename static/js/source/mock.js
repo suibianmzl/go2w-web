@@ -55,6 +55,10 @@ export function createMockSource(store, bus){
   store.wallAt = wallMask(grid, GW, GH, RES, 0, 0);
   store.link = { ok: true, ms: 23 };
   store.armed = true; store.battery = 76; store.odo = 1284;
+  // 电机温度：取 11-16 真机录包的典型值（髋关节明显比别的热）；?mock&hot 让左前髋 / 右后髋过热，测提醒
+  const mtBase = /[?&]hot\b/.test(location.search) ? [52, 88, 33, 58, 32, 33, 74, 29, 32, 55, 29, 32, 23, 23, 24, 23]
+    : [49, 61, 31, 55, 32, 33, 63, 29, 32, 53, 29, 32, 23, 23, 24, 23];
+  store.motorTemp = mtBase.slice();
   store.ctrl = { on: false };   // 纯前端模拟没有运控：自检跳过「站立」
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';
@@ -196,6 +200,7 @@ export function createMockSource(store, bus){
     if (costAt(nx, ny) < 253){ R.x = nx; R.y = ny; } else { R.v = 0; R.vy = 0; }
     R.th = wrap(R.th + R.w*dt);
     store.odo += Math.hypot(R.v, R.vy)*dt;
+    if (Math.random() < dt/5) store.motorTemp = mtBase.map(v => v + Math.round(Math.random()*2 - 1));
     store.imu = { pitch: .9 + (tv - R.v)*3 + Math.sin(S.t*7)*.08, roll: -.4 + R.w*.6 + Math.sin(S.t*5.3)*.06 };
     const tr = store.trail, last = tr[tr.length-1];
     if (!last || Math.hypot(last[0]-R.x, last[1]-R.y) > .08){ tr.push([R.x, R.y]); if (tr.length > 900) tr.shift(); }
@@ -319,6 +324,7 @@ export function createMockSource(store, bus){
     standUp: () => ({ ok: true, msg: '纯前端模拟：没有运控' }),
     lieDown: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     standHold: () => ({ ok: true }),
+    setPolicy: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     prepHold: () => ({ ok: true }),
     autolocMove: () => ({ ok: false, msg: '纯前端模拟：定位没有误差，不需要移动重试' }),
     initialPose(p){ cancelTask('Goal canceled: initial pose reset'); Object.assign(R, { x:p.x, y:p.y, th:p.th, v:0, w:0, vy:0 }); store.trail = [];
@@ -435,6 +441,33 @@ export function createMockSource(store, bus){
       return { ok: true, msg: `模拟保存 ${name}，实际文件请在本地后端模式中验证` };
     },
     loadMap(name){ store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
+    // 续建：模拟模式只走流程，不碰真文件（基准检查、起点位姿、自检的门限在 test_mapmeta / test_mapcontinue 里测）
+    contPreflight(base){
+      const has = store.maps.some(m => m.name === base);
+      return { ok: has, msg: has ? '可以续建（模拟）' : `没有基准图 ${base}`, preflight: { base, chain: [base], warns: [] } };
+    },
+    contStart(base, name, pose, source){
+      if (name === base) return { ok: false, msg: '续建必须另存新名字' };
+      store.cont = { active: true, base, name, source: source || 'parking', pose: pose || [0, 0, 0],
+        note: '模拟起点位姿', warn: '', check: null, elapsed: 0 };
+      log('INFO','slam_toolbox',`续建（模拟）：${base} → ${name}`);
+      return { ok: true, msg: `续建已开始（模拟）：${base} → ${name}` };
+    },
+    contCheck(){
+      if (!store.cont) return { ok: false, msg: '没有正在进行的续建' };
+      store.cont = { ...store.cont, check: { ok: true, fit: 0.93, fit_best: 0.97, correction: [0.02, -0.01, 0.3], reason: '模拟自检通过' } };
+      return { ok: true, msg: '自检通过（模拟）' };
+    },
+    contFinish(reason){
+      const c = store.cont;
+      if (!c) return { ok: false, msg: '没有正在进行的续建' };
+      if (!c.check?.ok) return { ok: false, msg: '先跑自检并通过' };
+      store.maps.unshift({ name: c.name, meta:`${GW}×${GH} · 0.05 m` });
+      store.cont = null;
+      log('INFO','slam_toolbox',`续建完成（模拟）：${c.name}`);
+      return { ok: true, msg: `已保存 ${c.name}（模拟）` };
+    },
+    contAbort(){ store.cont = null; return { ok: true, msg: '已放弃（模拟）' }; },
     simulateDrop(){ if (!S.link) return; S.link = false; log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
       setTimeout(() => {
         if (routeActive()) cancelTask('网页断开，已取消路线任务');

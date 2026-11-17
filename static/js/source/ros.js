@@ -6,7 +6,8 @@ import { gridToCanvas, costToCanvas, wallMask, CLOUD } from '../util.js';
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'loadMap', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback']);
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'loadMap', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
+  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
 };
@@ -140,7 +141,7 @@ export function createRosSource(store, bus){
           store.routeDraft = { id: null, map: null, points: [], confirmed: false };
           store.routeCheck = null;
         }
-        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
+        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
         Object.assign(store.params, m.params || {});
         for (const [k, st] of Object.entries(m.profiles)){   // stop / starting / run / stopping
           if (st === 'run' && store.profiles[k] !== 'run') store.since[k] = now();
@@ -158,6 +159,7 @@ export function createRosSource(store, bus){
         store.procsKnown = m.procsKnown; store.busy = m.busy;
         Object.assign(store.loc, { std: null, yaw: null, match: null }, m.loc || {});
         store.autoLoc = m.autoLoc || null;
+        store.cont = m.cont || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
@@ -234,6 +236,7 @@ export function createRosSource(store, bus){
     standUp: () => send('stand_up', {}, 15000),
     lieDown: () => send('lie_down', {}, 15000),
     standHold: on => send('stand_hold', { on }),
+    setPolicy: name => send('set_policy', { name }, 60000),   // 停运控 + 重启 + 等状态，失败还要退回
     prepHold: () => send('prep_hold'),
     deleteRoute: route_id => send('route_delete', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
@@ -246,6 +249,14 @@ export function createRosSource(store, bus){
     saveMap: name => send('save_map', { name }, 45000),
     alignMap: (source, name, angle) => send('align_map', { source, name, angle }, 125000),
     loadMap: name => send('load_map', { name }),
+    // 续建：检查基准 → 开始（定起点 + 反序列化基准 posegraph）→ 自检 → 收工另存
+    contPreflight: base => send('cont_preflight', { base }, 15000),
+    contStart: (base, name, pose, source) =>
+      send('cont_start', { base, name, ...(pose ? { pose } : {}), ...(source ? { source } : {}) }, 95000),
+    contCheck: () => send('cont_check', {}, 100000),
+    contFinish: reason => send('cont_finish', { reason }, 45000),
+    contAbort: () => send('cont_abort', {}),
+    contParking: (base, clear) => send('cont_parking', clear ? { base, clear: true } : { base }),
     // 键盘遥控：按住时每 0.1 s 发一次（后端 0.3 s 收不到就发零速）；松手立即发零
     teleop: k => {
       teleCmd = k;

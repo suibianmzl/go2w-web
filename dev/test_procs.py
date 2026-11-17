@@ -75,6 +75,39 @@ async def main():
     groups['stuck'] = {'running': True}
     check('组没停掉时如实报告失败', await d._stop('stuck') is False)
 
+    # 切策略：停 control，只换策略名、其余启动参数原样带回去
+    groups['control'] = {'running': True, 'environment': {
+        'GO2W_CONTROL_INTERFACE': 'eth0', 'GO2W_CONTROL_POLICY': 'old_p', 'GO2W_CONTROL_CONFIG': '',
+        'GO2W_CONTROL_TAKEOVER': 'passive'}}
+    n0 = len(requests); old = await d.switch_policy('new_p')
+    ops = [(r['operation'], r.get('name')) for r in requests[n0:]]
+    check('切策略：status → stop control → start control', ops == [('status', None), ('stop', 'control'), ('start', 'control')], ops)
+    check('切策略返回原策略', old == 'old_p', old)
+    check('切策略保留 takeover 和网卡', requests[-1]['environment'] == {'GO2W_CONTROL_INTERFACE': 'eth0',
+          'GO2W_CONTROL_POLICY': 'new_p', 'GO2W_CONTROL_CONFIG': '', 'GO2W_CONTROL_TAKEOVER': 'passive'}, requests[-1])
+    check('control_env 读到新策略', (await d.status()) is not None and d.control_env()[1].get('GO2W_CONTROL_POLICY') == 'new_p')
+    groups['control']['environment']['GO2W_CONTROL_CONFIG'] = 'fixed.yaml'
+    n0 = len(requests)
+    try:
+        await d.switch_policy('x'); check('固定 config 时拒绝切策略', False)
+    except RuntimeError:
+        check('固定 config 时拒绝切策略且没停运控', all(r['operation'] == 'status' for r in requests[n0:]))
+    groups['control']['environment']['GO2W_CONTROL_CONFIG'] = ''
+    groups['control']['running'] = False
+    try:
+        await d.switch_policy('x'); check('control 没在跑时拒绝', False)
+    except RuntimeError:
+        check('control 没在跑时拒绝', True)
+    n0 = len(requests)
+    try:
+        await d.switch_policy('a;rm'); check('拒绝非法策略名', False)
+    except ValueError:
+        check('拒绝非法策略名', len(requests) == n0)
+    pd = os.path.join(tmp, 'policies'); os.makedirs(os.path.join(pd, 'p1')); os.makedirs(os.path.join(pd, 'p2'))
+    open(os.path.join(pd, 'README'), 'w').close()
+    P.POLICY_DIR = pd
+    check('列出策略目录（只要子目录）', d.list_policies() == ['p1', 'p2'], d.list_policies())
+
     bad_calls = (
         ('名字 a;b', lambda: d.start_bag('a;b', ['/odom'])),
         ('地图 $(id)', lambda: d.start_mode('navigation', '$(id)')),

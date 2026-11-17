@@ -19,6 +19,9 @@ SAFE_PREFIX = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,29}$')
 MODES = ('mapping', 'localization', 'navigation')
 BAG_SEGMENT = 30
 ALL_TOPICS = '*'
+SAFE_POLICY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.\-]{0,95}$')
+# 运行镜像里的策略目录（go2w_ctrl 读 <这里>/<GO2W_CONTROL_POLICY>）。网页和运控在同一个容器里，直接列目录
+POLICY_DIR = os.environ.get('GO2W_POLICY_DIR', '/opt/go2w/control/policies')
 
 
 def _name(value):
@@ -40,11 +43,25 @@ def _seconds(value):
 
 
 class RuntimeProcs:
-    def __init__(self, sock=None, data_dir=None, tools_dir='/opt/go2w/console/tools'):
+    def __init__(self, sock=None, data_dir=None, tools_dir=None):
         self.sock = str(sock or os.environ.get('GO2W_SUPERVISOR_SOCKET', '/run/go2w/supervisor.sock'))
         self.data_dir = Path(data_dir or os.environ.get('GO2W_DATA', '/go2w/data'))
-        self.tools_dir = Path(tools_dir)
+        self.tools_dir = Path(tools_dir or os.environ.get('GO2W_TOOLS_DIR')
+                              or self.default_tools_dir())
         self._helpers = set()
+        self.groups = {}          # 最近一次 supervisor status 的原始结果（读 control 组的启动参数）
+
+    @staticmethod
+    def default_tools_dir():
+        """工具脚本目录。扩展坞上网页 release 里是 /opt/go2w/web/current/tools（tools 和 server 同级），
+        旧文档写的 /opt/go2w/console/tools 是镜像内打包的布局。两处都试，按存在顺序取。"""
+        here = Path(__file__).resolve().parent          # …/server
+        for cand in (here.parent/'tools',            # web/current/tools：和 server 同级
+                     Path('/opt/go2w/console/tools'),  # 镜像内打包
+                     Path('/go2w/web/tools')):         # 仓库挂载（.q 本地调试）
+            if cand.is_dir():
+                return str(cand)
+        return str(here.parent/'tools')
 
     def available(self):
         try:
@@ -80,6 +97,7 @@ class RuntimeProcs:
         groups = await self._request('status', timeout=5.0)
         if not isinstance(groups, dict):
             raise RuntimeError('Runtime supervisor returned invalid process status')
+        self.groups = groups
         navigation = groups.get('navigation', {})
         running = bool(navigation.get('running'))
         mode = navigation.get('environment', {}).get('GO2W_NAVIGATION_MODE') or 'navigation'
@@ -90,6 +108,47 @@ class RuntimeProcs:
                        for name in ('patrol', 'bag', 'rollback', 'bridge')})
         result['bag_seg'] = result['bag']
         return result
+
+    def control_env(self):
+        """最近一次 status 里 control 组：(是否在跑, 启动参数)。"""
+        g = self.groups.get('control') if isinstance(self.groups, dict) else None
+        if not isinstance(g, dict):
+            return False, {}
+        env = g.get('environment')
+        return bool(g.get('running')), dict(env) if isinstance(env, dict) else {}
+
+    @staticmethod
+    def list_policies():
+        try:
+            return sorted(p for p in os.listdir(POLICY_DIR)
+                          if SAFE_POLICY.fullmatch(p) and os.path.isdir(os.path.join(POLICY_DIR, p)))
+        except OSError:
+            return []
+
+    async def switch_policy(self, policy):
+        """停掉 control 组，只换 GO2W_CONTROL_POLICY 重新启动（接口、takeover 模式等照旧）。返回原来的策略名。
+        调用方负责保证机器狗趴着：停运控期间没有 lowcmd。"""
+        if not isinstance(policy, str) or not SAFE_POLICY.fullmatch(policy):
+            raise ValueError('策略名不合法')
+        groups = await self._request('status', timeout=5.0)
+        if isinstance(groups, dict):
+            self.groups = groups
+        running, env = self.control_env()
+        if not running:
+            raise RuntimeError('control 组没在运行')
+        env = {k: v for k, v in env.items() if k.startswith('GO2W_CONTROL_')}
+        if env.get('GO2W_CONTROL_CONFIG'):
+            # 固定的 config 里写死了 FixStand 站姿，换策略后站姿对不上，站起来会出事
+            raise RuntimeError(f"control 组指定了固定配置 GO2W_CONTROL_CONFIG={env['GO2W_CONTROL_CONFIG']}，不能只换策略")
+        old = env.get('GO2W_CONTROL_POLICY')
+        if not await self._stop('control'):
+            raise RuntimeError('control 组没有停下来')
+        try:
+            await self._start('control', dict(env, GO2W_CONTROL_POLICY=policy))
+        except Exception:
+            await self._start('control', env)   # 新参数被拒：按原参数拉回去
+            raise
+        return old
 
     async def _start(self, name, environment=None):
         return await self._request('start', name=name, environment=environment or {})

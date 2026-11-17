@@ -6,8 +6,14 @@
 server/go2w_web.py   后端：rclpy 节点（域 43）+ aiohttp，HTTP 和 WebSocket 同一端口
 server/procs.py      运行档位的进程管理（经运行容器 supervisor 的 socket 启停进程组）
 server/camera.py     前置摄像头 RTP 组播接收、拼帧
+<<<<<<< HEAD
 server/cloud_gateway.py  云端无 ROS WebSocket 网关（浏览器与机器狗消息路由）
 server/rtc_token.py      火山 RTC 短期 Token 生成
+=======
+server/mapmeta.py    地图续建：<name>.meta.json 读写、血缘、续建前置检查
+server/mapcontinue.py 地图续建：起点位姿三级降级、图外检查、自检时的「还在起点吗」
+tools/              随网页包部署的工具脚本（map_overlap_check.py 续建自检等；源在主仓库 scripts/calib）
+>>>>>>> upstream/main
 static/              前端：原生 JS 模块，不需要构建
   js/source/mock.js  模拟数据源（示例地图 + 机器人仿真）
   js/source/ros.js   ROS 数据源（连后端 /ws）
@@ -82,6 +88,31 @@ static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行�
 - 后端的接收地址和网口可以用环境变量 `GO2W_CAM_ADDR`（默认 `230.1.1.1:1720`）和 `GO2W_CAM_IF`（默认 `GO2W_WIRED_IF`）修改。
 
 本地调试：`dev/run.sh` 会启动 `dev/fake_camera.py`，循环回放真机录的 10 s 样本 `dev/camera_sample.rtp`。测试：`dev/test_camera.py`（拆帧，装了 ffprobe 会独立解码核对），`dev/test_camera_ws.py`（协议，要先运行 run.sh）。
+
+## 地图续建（11-17）
+
+建图流程里的「续建已有地图」：在已有地图上继续采集，把新区域并进同一张图。只能加不能删——挪走的家具留下的旧墙线擦不掉，要刷新只能重建。完整方案在主仓库 `docs/地图续建.md`。
+
+流程：选基准 → 检查基准（`cont_preflight`）→ 开始续建（`cont_start`）→ 自检（`cont_check`）→ 收工（`cont_finish`）。
+
+- 基准图必须有 `.posegraph` + `.data`。续建永远另存新名字，基准图不动；收工时写 `<name>.meta.json`，`routes.json` 里指向基准的任务改指新图（坐标系不变，站点不用重标）。
+- 开始续建：起点位姿按 停车点（`data/parkings.json`）→ 自动定位（在磁盘上的基准图上做）→ 手动 的顺序取，起点必须在基准图范围内；然后暂停收 scan、调 `/slam_toolbox/deserialize_map`（`START_AT_GIVEN_POSE`）、再恢复。
+- 这个服务读文件失败也返回成功，所以**自检是唯一判据**，没通过不许存图。自检要停在起点做；角度修正绕起点转（`--pivot`），超出 0.40 m / 8° 报「起点位姿偏了」并给出修正量，贴合率 < 85% 报「环境和图对不上」。
+- 检查基准时核对运控策略（环境变量或 `runtime.env` 的 `GO2W_CONTROL_POLICY`）和切片高度（`pcl2scan_slam.yaml`，运行镜像里在 `/opt/go2w/base/go2w_bringup/share/go2w_bringup/config`），和基准 `meta.json` 不一致就拦下。
+
+测试：`dev/test_map_overlap_check.py`、`dev/test_mapmeta.py`、`dev/test_mapcontinue.py`（不用起 run.sh）。
+
+## 运控策略切换（11-17）
+
+机器人卡片「姿态」下面的「策略」下拉框：**只有趴着（Passive）时能切**。后端（`set_policy`）经 supervisor 停掉 control 进程组，只换 `GO2W_CONTROL_POLICY` 再用同样的环境变量启动，然后最多等 20 s 收到新运控的 Passive（新进程先报一下 `Init`，不算异常）；收不到就自动切回原来的策略。`GO2W_CONTROL_CONFIG` 有值时拒绝切换。切换只在本次开机有效，重启扩展坞后回到 `runtime.env` 里的策略。当前策略（supervisor 里的实际值，拿不到再读 `runtime.env`）也用于地图续建的基准检查。
+
+测试：`dev/test_procs.py`；`dev/test_policy.mjs`（先 `GO2W_FAKE_CTRL=Passive GO2W_FAKE_POLICY_FAIL=mjlab_go2w_cmd_m22 dev/run.sh`）。
+
+## 电机温度（11-17）
+
+后端每 5 s 临时订阅一帧 `/go2w/robot_lowstate`，不反序列化，按 CDR 偏移读电量和 16 个 `motor_state[i].temperature`（int8，℃，字节 `4 + 108 + 48·i`；0–11 是 右前 / 左前 / 右后 / 左后 × 髋 / 大腿 / 小腿，12–15 是轮子），状态里发 `motorTemp`，20 s 没读到就是 `null`。偏移用真机录包核对过：髋关节平时 46–67 ℃（低电量跑久了到过 81 ℃），大腿 / 小腿约 30 ℃，轮子约 23 ℃。
+
+机器人卡片里「电机温度」一行显示最热的电机，点开是 4×4 的表。≥70 ℃ 黄、≥85 ℃ 红，并在地图上方提醒（只提醒，不拦出发）；阈值在 `static/js/util.js` 的 `MOTOR_WARN` / `MOTOR_CRIT`，是按实测定的保守值，不是宇树的保护温度。本地：`?mock&hot` 或 `GO2W_FAKE_MOTOR_TEMP=52,88,…（16 个）dev/run.sh` 看过热效果。
 
 ## 地图显示方向
 

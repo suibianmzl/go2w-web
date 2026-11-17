@@ -63,6 +63,16 @@ export function createActions(store, src){
         onOk: () => exec(src.cmd.lieDown(), null) });
     },
     standHold(on){ if (ready('standHold')) exec(src.cmd.standHold(on), null); },
+    // 切运控策略：后端只在趴着时执行（停掉运控、换策略重启，几秒钟）。onDone 用来把下拉框恢复成实际值
+    setPolicy(name, onDone){
+      const C = store.ctrl;
+      if (!ready('setPolicy')) return onDone?.();
+      if (!(C?.state === 'Passive' && C.ready) || C.op) return (toast('只能趴着时切换策略', 'err'), onDone?.());
+      confirmBox({ title: '切换运控策略', ok: '切换',
+        body: `从 ${C.policy || '（未知）'} 切到 ${name}。运控会重启几秒钟，期间机器狗保持趴着。不同策略站高不同：站起来后要重新定位，建图 / 续建请用同一个策略。重启扩展坞后会恢复为默认策略。`,
+        onOk: () => exec(src.cmd.setPolicy(name), null).finally(() => onDone?.()),
+        onCancel: () => onDone?.() });
+    },
     // fine = 重定位的微调：后端用小协方差，AMCL 不会把粒子撒开
     initialPose(p, fine = false){
       const no = msg => (toast(msg, 'err'), { ok: false, msg });
@@ -191,6 +201,68 @@ export function createActions(store, src){
         if (!result || result.ok !== false){ store.mapSavedAt = Date.now(); store.mapSavedName = name; }
         return result;
       } finally { store.mapSaving = false; }
+    },
+    // ---------- 续建（docs/地图续建.md） ----------
+    // 四步都是显式动作，不串成大流程：起点位姿给错不会报错，只能靠人在中间看一眼自检结果。
+    contPreflight(base){
+      if (!ready('contPreflight')) return;
+      if (!base) return toast('先选一张基准图', 'warn');
+      return exec(src.cmd.contPreflight(base), null).then(r => {
+        store.contPre = r?.detail || r?.preflight || null;
+        return r;
+      });
+    },
+    contStart(base, name, pose, source){
+      if (!ready('contStart')) return;
+      if (!run('mapping')) return toast('续建要先让「建图」跑起来', 'err');
+      if (!base) return toast('先选一张基准图', 'warn');
+      if (!/^[A-Za-z0-9_-]{1,40}$/.test(name || '')) return toast('新图名限 1–40 个字母、数字、下划线或减号', 'err');
+      if (name === base) return toast('续建必须另存新名字，不能覆盖基准图', 'err');
+      // 手动位姿是唯一没有自动校验的一级，所以要显式确认
+      const manual = source === 'manual';
+      return confirmBox({ title: `在 ${base} 上续建`,
+        body: `新图叫 ${name}。${manual ? '起点位姿用你手动给的那个（这一级没有自动校验，开后要看自检）。' : '起点位姿按「停车点 → 自动定位 → 手动」依次定。'}`
+          + '机器人的位置必须在基准图覆盖范围内。slam_toolbox 加载旧图时不校验位姿，给错了也不会报错，只会建出双线墙——所以开始后要点「自检」。',
+        ok: '开始续建', danger: manual,
+        // 要等静止激光 + 自动定位 + 加载基准图，5–15 s：期间按钮显示进行中，失败原因留在状态栏
+        // （提示框只停 2.6 s，长的原因一闪就没了，看起来像「点了没反应」）
+        onOk: () => {
+          store.contStarting = true; store.contErr = null;
+          return exec(src.cmd.contStart(base, name, pose, source), null).then(r => {
+            store.contStarting = false;
+            store.contErr = r && r.ok === false ? (r.msg || '没开始，原因未知') : null;
+            // 成功后到下一次状态推送（≤0.5 s）之间 store.cont 还是空的：这段时间继续显示进行中
+            store.contStartOkAt = r && r.ok !== false ? Date.now() : 0;
+            return r;
+          });
+        } });
+    },
+    contCheck(){
+      if (!ready('contCheck')) return;
+      return exec(src.cmd.contCheck(), null);
+    },
+    contFinish(reason){
+      if (!ready('contFinish')) return;
+      const c = store.cont;
+      if (!c) return toast('没有正在进行的续建', 'warn');
+      if (!c.check?.ok) return toast('先跑自检并通过', 'err');
+      return exec(src.cmd.contFinish(reason), null).then(r => {
+        if (r && r.ok !== false){ store.mapSavedAt = Date.now(); store.mapSavedName = c.name; }
+        return r;
+      });
+    },
+    contAbort(){
+      if (!ready('contAbort')) return;
+      confirmBox({ title: '放弃这次续建', body: '已经建进档位里的节点不会消失——这是 slam_toolbox 的硬限制。想要干净的地图只能停掉建图再重开。',
+        danger: true, ok: '放弃', onOk: () => exec(src.cmd.contAbort(), null) });
+    },
+    contParking(base, clear){
+      if (!ready('contParking')) return;
+      if (!base) return toast('先选一张基准图', 'warn');
+      if (clear) return exec(src.cmd.contParking(base, true), null);
+      // 停车点要用机器人现在的定位；没有 map 定位时后端会拒绝，这里先说明原因
+      if (!store.initPose) return toast('还没有定位：先自动定位或手动给位置，再记停车点', 'err');
+      return exec(src.cmd.contParking(base, false), null);
     },
     // 地图显示方向：存到后端（按地图名），失败才提示
     setMapView(map, angle){

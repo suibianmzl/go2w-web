@@ -58,12 +58,22 @@
           <div><span>今日里程</span><b id="sOdo">--</b></div>
           <div><span>坐标系</span><b id="sFrame">--</b></div>
         </div>
+        <!-- 电机温度：平时一行显示最热的电机，点开看 16 个（4 条腿 × 髋 / 大腿 / 小腿 / 轮） -->
+        <button class="mt-row" id="mtRow" aria-expanded="false" title="点开看全部电机温度">
+          <span class="mt-k">电机温度</span><span class="mt-v" id="mtSum">--</span><span class="mt-car" aria-hidden="true">▾</span>
+        </button>
+        <div class="mt-grid" id="mtGrid" hidden></div>
         <!-- 运控姿态：站起 / 趴下；网页站起来（或跑完任务）后空闲 30 s 原地趴下，倒计时时可以「保持站立」 -->
         <div class="pose-row" id="poseRow" hidden>
           <span class="pose-txt" id="poseTxt">--</span>
           <button class="btn sm" id="poseHold" hidden title="不自动趴下，直到下次出发或手动趴下">保持站立</button>
           <button class="btn sm" id="poseUp">站起</button>
           <button class="btn sm danger" id="poseDown">趴下</button>
+        </div>
+        <!-- 运控策略：只能趴着时切换（后端停掉运控、换策略重启） -->
+        <div class="pose-row" id="policyRow" hidden>
+          <span class="pose-txt">策略</span>
+          <select class="policy-sel" id="policySel" aria-label="运控策略" title="只能趴着时切换"></select>
         </div>
       </section>
 
@@ -353,6 +363,19 @@
             <div class="step-b">
               <p class="hint">不会覆盖同名地图；可以多次保存，每次存成一个新名字（保存后自动换成下一个名字）。</p>
               <div class="inrow"><input id="mapName" aria-label="地图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="saveMap">保存</button></div>
+            </div>
+          </div>
+          <div class="step" id="mpCont" data-s="todo">
+            <div class="step-h"><div class="step-n"><span>C</span></div><div class="step-t">续建已有地图<span class="step-s" id="mpContSub"></span></div></div>
+            <div class="step-b">
+              <p class="hint">在已有地图上继续采集，把新区域并进同一张图（扩范围、补盲区、补新开的门洞）。<b>只能加不能删</b>：挪走的家具在旧图里仍然占着位置。续建永远另存新名字，基准图不动。</p>
+              <div class="inrow"><select id="contBase" aria-label="续建基准图"></select><button class="btn sm" id="contPre" title="只查文件，不动机器人">检查基准</button></div>
+              <div class="inrow"><input id="contName" aria-label="续建后的新图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="contStart" disabled>开始续建</button></div>
+              <p class="hint">自动定位不行时，手动给起点：x、y 是基准图坐标（可以先在导航 / 定位里加载这张图，鼠标停在机器人位置看左下角读数），朝向是相对地图 x 轴逆时针的角度。手动起点没有自动校验，开始后一定要自检。</p>
+              <div class="inrow cont-manual"><input id="contMx" type="number" step="0.01" placeholder="x" aria-label="手动起点 x"><input id="contMy" type="number" step="0.01" placeholder="y" aria-label="手动起点 y"><input id="contMyaw" type="number" step="1" placeholder="朝向°" aria-label="手动起点朝向（度）"><button class="btn sm" id="contStartManual" disabled title="用左边填的 x、y、朝向作为起点开始续建">手动开始</button></div>
+              <div class="inrow"><button class="btn sm ghost" id="contPark" title="把机器人现在的位置记成这张图的续建停车点：下次停在这儿就直接用，不用重新定位">把当前位置记成停车点</button><button class="btn sm ghost" id="contParkClear" title="删掉这张图的续建停车点">删除停车点</button></div>
+              <div class="meta" id="contStatus"></div>
+              <div class="inrow" id="contRow" hidden><button class="btn sm" id="contCheck">自检</button><button class="btn sm pri" id="contFinish" disabled>收工保存</button><button class="btn sm ghost" id="contAbort">放弃</button></div>
             </div>
           </div>
           <div class="step" id="mpEnd" data-s="todo">

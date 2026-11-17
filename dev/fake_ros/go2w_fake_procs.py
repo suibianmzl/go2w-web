@@ -6,6 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
+import time
 
 
 class FakeProcs:
@@ -92,6 +93,32 @@ class FakeProcs:
                 sys.executable, str(script), str(data / 'maps'), source, target, str(angle),
                 stdout=log, stderr=log)
             return await process.wait() == 0
+
+    # 假运控策略：重启时 1.5 s 不发状态，回来时趴着（Passive）
+    POLICIES = ['mjlab_go2w_climb_v6b_8500', 'mjlab_go2w_cmd_m22',
+                'mjlab_go2w_dgv2_m22_scratch_w02_7999', 'mjlab_go2w_fb_low_m22']
+
+    def control_env(self):
+        pol = getattr(self.sim, 'policy', None) if hasattr(self.node, 'fake_sim') else None
+        return True, ({'GO2W_CONTROL_POLICY': pol} if pol else {})
+
+    def list_policies(self):
+        return list(self.POLICIES)
+
+    async def switch_policy(self, policy):
+        sim, old = self.sim, getattr(self.sim, 'policy', None)
+        if os.environ.get('GO2W_FAKE_POLICY_FAIL') == policy:
+            sim.ctrl_off_until = time.monotonic() + 1e9    # 新策略起不来：一直没有状态
+        else:
+            sim.ctrl_off_until = time.monotonic() + 1.5
+        # 和真机一样：新进程先报 Init（seq 0），过一会儿才 Passive
+        sim.ctrl.update(state='Init', seq=0, t=time.monotonic())
+        sim.ctrl_sent = None
+        asyncio.get_running_loop().call_later(2.8, lambda: (sim.ctrl.update(state='Passive', seq=1, t=time.monotonic()),
+                                                          setattr(sim, 'ctrl_sent', None)))
+        sim.policy = policy
+        await asyncio.sleep(0.5)
+        return old
 
     async def close(self):
         pass

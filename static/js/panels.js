@@ -1,6 +1,6 @@
 import { setupRouteEditor } from './routes.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
-import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ } from './util.js';
+import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, motorIdx, motorName, motorLevel } from './util.js';
 import { LAYERS, L } from './layers.js';
 import { MODES, MODE_PKG } from './actions.js';
 
@@ -203,17 +203,23 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   $('#poseUp').onclick = () => actions.standUp();
   $('#poseDown').onclick = () => actions.lieDown();
   $('#poseHold').onclick = () => actions.standHold(!store.ctrl?.hold);
+  let policyPicking = false;   // 确认框开着时不让渲染把下拉框改回去
+  $('#policySel').onchange = e => { policyPicking = true; actions.setPolicy(e.target.value, () => { policyPicking = false; renderPose(); }); };
+  const escPol = s => String(s).replace(/[<>&"]/g, '');
   function renderPose(){
     const C = store.ctrl, on = !!C?.on && store.link.ok;
     $('#chPose').hidden = $('#poseRow').hidden = !on;
+    if (!on) $('#policyRow').hidden = true;
     if (!on) return;
     const name = C.state == null ? '运控离线' : POSE[C.state] || String(C.state).replace(/[<>&"]/g, '');
-    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.state === 'FixStand' && !C.ready ? '站起中…'
+    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…' : C.state === 'FixStand' && !C.ready ? '站起中…'
       : C.lieIn != null ? `${Math.ceil(C.lieIn)} s 后趴下` : name;
     chip('#chPose', C.state == null ? 'crit' : C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
+    renderPolicy(C);
     const pt = $('#poseTxt');
     pt.className = 'pose-txt' + (C.lieIn != null ? ' warn' : '');
-    pt.innerHTML = C.state == null ? '<b class="crit">运控离线</b> · 收不到运控状态'
+    pt.innerHTML = C.op === 'policy' ? '姿态 <b>切换策略中…</b> · 运控重启'
+      : C.state == null ? '<b class="crit">运控离线</b> · 收不到运控状态'
       : C.lieIn != null ? `空闲 · <b>${Math.ceil(C.lieIn)} s 后原地趴下</b>`
       : `姿态 <b>${txt}</b>${C.hold ? ' · 保持站立' : ''}`;
     const busy = !!C.op || C.state == null;
@@ -223,6 +229,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#poseDown').disabled = busy && C.op !== 'up';   // 站起过程中可以打断
     $('#poseHold').hidden = !(C.lieIn != null || C.hold);
     $('#poseHold').textContent = C.hold ? '取消保持' : '保持站立';
+  }
+  function renderPolicy(C){
+    const sel = $('#policySel'), list = C.policies || [];
+    $('#policyRow').hidden = !list.length && !C.policy;
+    const lying = C.state === 'Passive' && C.ready;
+    sel.disabled = !lying || !!C.op || list.length < 2;
+    if (policyPicking) return;   // 确认框开着 / 正在切：别把选中值改回去
+    const opts = list.includes(C.policy) || !C.policy ? list : [C.policy, ...list];
+    const key = opts.join('|');
+    if (sel.dataset.k !== key){
+      sel.innerHTML = opts.map(p => `<option value="${escPol(p)}">${escPol(p.replace(/^mjlab_go2w_/, ''))}</option>`).join('');
+      sel.dataset.k = key;
+    }
+    if (C.policy) sel.value = C.policy;
+    sel.title = C.policy ? `当前：${C.policy}` + (lying ? '' : '（只能趴着时切换）') : '读不到当前策略';
   }
   function renderChips(){
     const lk = store.link, anyMode = !!actions.curMode();
@@ -249,6 +270,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const rp = $('#robotPill'); rp.dataset.s = rs[0]; rp.textContent = rs[1];
     const R = store.robot;
     $('#sBat').textContent = store.battery==null ? '--' : `${store.battery}%`;
+    renderMotorTemp();
     $('#sSpd').textContent = R.valid ? Math.hypot(R.v, R.vy).toFixed(2) : '--';
     $('#sOdo').textContent = store.odo==null ? '--' : `${store.odo.toFixed(0)} m`;
     $('#sFrame').textContent = R.valid ? store.fixed : '--';
@@ -260,6 +282,27 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     if (ros && !lk.ok){ off.hidden = false; $('#offT').textContent = '机器人未连接，正在重试…'; $('#offS').textContent = '机器人关机或网络断开时会显示这个提示，恢复后自动连接'; }
     else if (ros && !store.map){ off.hidden = false; $('#offT').textContent = '已连接，等待 /map'; $('#offS').textContent = '建图、定位或导航运行后才会有地图'; }
     else off.hidden = true;
+  }
+  // 电机温度：一行显示最热的电机（超过阈值变黄 / 红），点开是 4 条腿 × 髋 / 大腿 / 小腿 / 轮 的表，展开状态记在本机浏览器
+  const mtRow = $('#mtRow'), mtGrid = $('#mtGrid'), mtCells = [];
+  {
+    mtGrid.innerHTML = '<span></span>' + MOTOR_JOINTS.map(j => `<span>${j}</span>`).join('')
+      + MOTOR_LEGS.map((l, li) => `<span class="lg">${MOTOR_LEG_CN[l]}</span>` + MOTOR_JOINTS.map((_, j) => `<b data-i="${motorIdx(li, j)}">--</b>`).join('')).join('');
+    mtGrid.querySelectorAll('b').forEach(b => { mtCells[+b.dataset.i] = b; b.title = motorName(+b.dataset.i); });
+    let open = false; try { open = localStorage.getItem('go2w.mtOpen') === '1'; } catch {}
+    const setOpen = v => { open = v; mtGrid.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} };
+    setOpen(open);
+    mtRow.onclick = () => setOpen(!open);
+    mtRow.title = `点开看全部电机温度（≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
+  }
+  function renderMotorTemp(){
+    const T = store.motorTemp;
+    if (!T){ $('#mtSum').textContent = '--'; mtRow.dataset.s = ''; mtCells.forEach(b => { b.textContent = '--'; b.dataset.s = ''; }); return; }
+    let k = 0; T.forEach((v, i) => { if (v > T[k]) k = i; });
+    const hot = T.filter(v => v >= MOTOR_WARN).length;
+    $('#mtSum').innerHTML = `<small>${hot > 1 ? `${hot} 个偏热 · ` : ''}最高 ${motorName(k)}</small>${T[k]} ℃`;
+    mtRow.dataset.s = motorLevel(T[k]) === 'ok' ? '' : motorLevel(T[k]);
+    T.forEach((v, i) => { const b = mtCells[i]; if (!b) return; b.textContent = v; b.dataset.s = motorLevel(v) === 'ok' ? '' : motorLevel(v); });
   }
   function renderHud(){
     const R = store.robot, m = store.map;
@@ -327,6 +370,105 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#saveMap').disabled = busy;
     $('#mapName').disabled = busy;
   }
+  /* ---------- 续建 ---------- */
+  // 基准图只能选带完整 posegraph + data 的：slam_toolbox 只能从这两件恢复图，
+  // 光有 pgm/yaml 的图（lab_20261021 就是）续建无从谈起。
+  let contBaseFilled = null;
+  function renderCont(){
+    const c = store.cont, busy = store.mapSaving || store.mapBusy;
+    // 基准图下拉：列出所有地图，标一下有没有 posegraph（后端 preflight 会把关，这里只做提示）
+    const names = store.maps.map(m => m.name);
+    if (contBaseFilled !== names.join(',')){
+      contBaseFilled = names.join(',');
+      const sel = $('#contBase'), keep = sel.value;
+      sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
+      if (names.includes(keep)) sel.value = keep;
+      else { const def = names.find(n => n === 'lab_20261116') || names[0]; if (def) sel.value = def; }
+    }
+    const base = $('#contBase').value;
+    const nameIn = $('#contName');
+    if (!nameIn.value && base) nameIn.value = `${base}_c1`;
+    $('#contPre').disabled = busy || !base;
+    const starting = !!store.contStarting || (!c && Date.now() - (store.contStartOkAt || 0) < 3000);
+    $('#contStart').disabled = busy || starting || !run('mapping') || !base || !!c;
+    $('#contStart').textContent = starting ? '正在开始…' : '开始续建';
+    const manual = contManualPose();
+    $('#contStartManual').disabled = busy || starting || !run('mapping') || !base || !!c || !manual;
+    ['#contMx', '#contMy', '#contMyaw'].forEach(id => { $(id).disabled = busy || !!c; });
+    // 停车点记在基准图坐标系里。建图档刚启动时 map 系是 slam_toolbox 新建的，此刻记下来的位置是错的，
+    // 而且不会报错——所以只在「导航 / 定位加载了这张图且定好位」或「续建这张图并自检通过」时放开（后端同样把关）
+    const parkWhy = parkingBlocked(base, c);
+    const pk = $('#contPark');
+    pk.disabled = busy || !base || !!parkWhy;
+    pk.title = parkWhy || '把机器人现在的位置记成这张图的续建停车点：下次停在这儿就直接用，不用重新定位';
+    $('#contRow').hidden = !c;
+    $('#contCheck').disabled = !c || busy;
+    $('#contFinish').disabled = !c || busy || !c.check?.ok;
+    $('#contAbort').disabled = !c;
+    const st = $('#contStatus');
+    let text = '';
+    if (c){
+      const chk = c.check;
+      text = `${c.base} → ${c.name} · 起点 ${c.source === 'parking' ? '停车点' : c.source === 'globloc' ? '自动定位' : '手动'}`
+        + ` (${c.pose[0].toFixed(2)}, ${c.pose[1].toFixed(2)}, ${(c.pose[2]*180/Math.PI).toFixed(0)}°)`
+        + (chk ? (chk.ok ? ` · 自检通过（贴合率 ${(chk.fit*100).toFixed(0)}%）` : ` · 自检没通过：${chk.reason || ''}`) : ' · 还没自检')
+        + (c.warn ? ` · ${c.warn}` : '');
+      st.classList.toggle('warn', !!c.warn || (chk && !chk.ok));
+    } else if (starting){
+      text = '正在定起点位姿并加载基准图（一般 5–15 s），机器人保持静止，不要遥控……';
+      st.classList.remove('warn');
+    } else if (store.contErr){
+      text = '没开始：' + store.contErr;
+      st.classList.add('warn');
+    } else if (store.contPre){
+      const p = store.contPre;
+      text = (p.reasons?.length ? '不能续建：' + p.reasons.join('；') : '可以续建')
+        + (p.chain?.length > 1 ? ` · 链 ${p.chain.join(' → ')}` : '')
+        + (p.warns?.length ? ` · 注意：${p.warns.join('；')}` : '');
+      st.classList.toggle('warn', !p.ok);
+    } else {
+      text = '选中基准图后点「检查基准」（只查文件，不动机器人）。';
+      st.classList.remove('warn');
+    }
+    if (st.textContent !== text) st.textContent = text;
+  }
+  function contManualPose(){
+    const v = ['#contMx', '#contMy', '#contMyaw'].map(id => $(id).value.trim());
+    if (v.some(x => x === '')) return null;
+    const [x, y, deg] = v.map(Number);
+    if (![x, y, deg].every(Number.isFinite)) return null;
+    return [x, y, deg * Math.PI / 180];
+  }
+  function parkingBlocked(base, c){
+    if (run('mapping')){
+      if (!c) return '建图档里还没开始续建：此刻的地图坐标是新建的，不是基准图的，记下来会是错的。请在导航 / 定位里定好位后记，或续建自检通过后记';
+      if (c.base !== base) return `正在续建的基准是 ${c.base}，不是 ${base}`;
+      if (!c.check?.ok) return '续建自检通过后才能记停车点';
+      return '';
+    }
+    if (run('navigation') || run('localization')){
+      if (store.mapCurrent !== base) return `当前加载的是 ${store.mapCurrent || '（未知）'}，不是 ${base}`;
+      const m = store.loc?.match;
+      if (m == null) return '还没有定位，先设初始位姿';
+      if (m < 70) return `定位匹配率 ${m.toFixed(0)}% 低于 70%，先把位置定准`;
+      return '';
+    }
+    return '导航、定位、建图都没在跑，拿不到可信的位置';
+  }
+  ['#contMx', '#contMy', '#contMyaw'].forEach(id => { $(id).oninput = () => renderCont(); });
+  $('#contStartManual').onclick = () => {
+    const p = contManualPose();
+    if (!p) return;
+    actions.contStart($('#contBase').value, $('#contName').value.trim(), p, 'manual');
+  };
+  $('#contPre').onclick = () => actions.contPreflight($('#contBase').value);
+  $('#contBase').onchange = () => { contBaseFilled = null; $('#contName').value = ''; store.contPre = null; store.contErr = null; renderCont(); };
+  $('#contStart').onclick = () => actions.contStart($('#contBase').value, $('#contName').value.trim(), null, null);
+  $('#contPark').onclick = () => actions.contParking($('#contBase').value, false);
+  $('#contParkClear').onclick = () => actions.contParking($('#contBase').value, true);
+  $('#contCheck').onclick = () => actions.contCheck();
+  $('#contFinish').onclick = () => actions.contFinish(null);
+  $('#contAbort').onclick = () => actions.contAbort();
   // 录包 topic 下拉多选：记「取消勾选的」，默认一个都没取消 = 全选 = *（之后新冒出来的 topic 也录）；
   // 取消了任何一个就发具体勾选的列表。刷新页面恢复全选。
   const bagOff = new Set(), esc = x => String(x).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
@@ -516,7 +658,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
 
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
-    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); },  // 4 Hz
+    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
     slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,

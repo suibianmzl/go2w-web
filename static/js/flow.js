@@ -391,6 +391,11 @@ export function setupFlow(store, src, actions, setTool, reloc){
         if (!nameTouched && document.activeElement !== mapName && !mapName.value) mapName.value = freeName(today());
         const saved = store.mapSavedAt;
         setStep('mpSave', on ? 'cur' : 'todo', store.mapSaving ? '正在保存…' : saved ? `已保存 ${store.mapSavedName || ''} · ${Math.max(0, Math.round((Date.now() - saved) / 60000))} 分钟前` : '还没有保存');
+        const ct = store.cont;
+        // 和建图流程其他步骤一样：建图在跑就是 cur（展开）。以前是 todo / done，而这两种状态在建图流程里
+        // 都隐藏步骤内容（console.css），续建的按钮根本点不到
+        setStep('mpCont', on ? 'cur' : 'todo',
+          ct ? `${ct.base} → ${ct.name}${ct.check ? (ct.check.ok ? ' · 自检通过' : ' · 自检没通过') : ' · 还没自检'}` : '在已有地图上继续采集');
         setStep('mpEnd', on ? 'cur' : 'todo', saved ? `导航会用 ${store.mapSavedName || '刚保存的地图'}` : '先保存，否则停止后地图会丢失');
         $('#mapToNav').disabled = !on || !saved;
         $('#mapStop').disabled = !on;
