@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""回溯录制的缓存和存包逻辑（不需要 ROS）。python3 web/dev/test_rollback_recorder.py"""
+"""回溯录制的缓存和存包逻辑（不需要 ROS）。python3 dev/test_rollback_recorder.py"""
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'scripts'))
-from rollback_recorder import Ring, save, wanted  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+from rollback_recorder_py import Ring, save, wanted  # noqa: E402
 
 S = 1_000_000_000
 fails = 0

@@ -1,13 +1,13 @@
-"""分段录包 scripts/segment_recorder.py 的切段逻辑（不需要 ROS）。
+"""分段录包 tools/segment_recorder.py 的切段逻辑（不需要 ROS）。
 
-    python3 web/dev/test_segment_recorder.py
+    python3 dev/test_segment_recorder.py
 """
 import os
 import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'scripts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
 from segment_recorder import Segments, recover_leftovers  # noqa: E402
 
 fails = 0
