@@ -1,0 +1,22 @@
+[Unit]
+Description=Go2W Robot Edge Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/go2w-edge-gateway
+Environment=PYTHONUNBUFFERED=1
+Environment=GO2W_EDGE_LOCAL_WS=ws://127.0.0.1:8080/ws
+Environment=GO2W_CLOUD_WS=wss://fleet.evoxrobot.com/quadruped/robot/ws
+Environment=GO2W_ROBOT_ID=go2w-01
+Environment=GO2W_EDGE_FORWARD_CAMERA=1
+ExecStart=/home/unitree/go2w-edge-gateway/.venv/bin/python /home/unitree/go2w-edge-gateway/tools/go2w_edge_gateway.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

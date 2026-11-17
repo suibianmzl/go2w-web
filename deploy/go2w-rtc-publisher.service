@@ -1,0 +1,17 @@
+[Unit]
+Description=Go2W Volcengine RTC Publisher
+After=network-online.target go2w-rtc-http.service go2w-edge-gateway.service
+Wants=network-online.target go2w-rtc-http.service
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/go2w-rtc-publisher
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/unitree/go2w-rtc-publisher/run-rtc-publisher.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

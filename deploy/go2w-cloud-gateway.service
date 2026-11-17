@@ -1,0 +1,19 @@
+[Unit]
+Description=Go2W Cloud WebSocket Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/go2w-web/current
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/go2w-web/etc/rtc.env
+ExecStart=/opt/go2w-web/venv/bin/python /opt/go2w-web/current/server/cloud_gateway.py --host 0.0.0.0 --port 8080 --static /opt/go2w-web/current/static
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

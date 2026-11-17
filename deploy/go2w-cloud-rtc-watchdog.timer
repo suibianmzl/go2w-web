@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Go2W Cloud RTC Publisher watchdog
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=go2w-cloud-rtc-watchdog.service
+
+[Install]
+WantedBy=timers.target

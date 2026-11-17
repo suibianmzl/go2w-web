@@ -103,7 +103,7 @@
         </div>
         <div class="cam-float" id="camFloat" hidden>
           <div class="cam-head" id="camHead" title="拖动移动位置"><span class="cam-title">前置摄像头</span><span class="sp"></span><button class="ib cam-x" id="camClose" title="关闭" aria-label="关闭摄像头浮窗"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
-          <div class="cam-view"><video id="camVideo" muted playsinline autoplay disablepictureinpicture></video><div class="cam-msg" id="camMsg">正在连接摄像头…</div></div>
+          <div class="cam-view"><video id="camVideo" muted playsinline autoplay disablepictureinpicture></video><div class="cam-rtc" id="camRtc"></div><div class="cam-msg" id="camMsg">正在连接摄像头…</div></div>
           <div class="cam-bar"><span id="camInfo">最多 3 人同时观看</span></div>
           <div class="cam-grip" id="camGrip" title="拖动调整大小（保持比例），双击恢复默认"></div>
         </div>
@@ -396,7 +396,8 @@
     </aside>
   </div>
 </div>
-<script src="js/vendor/jmuxer.min.js"></script><!-- jmuxer 2.0.7（MIT，见 js/vendor/jmuxer.LICENSE）：H.264 → MSE，播放摄像头画面 -->
+<script src="https://lf-unpkg.volccdn.com/obj/vcloudfe/sdk/@volcengine/rtc/4.69.5/1794303598678/index.min.js"></script>
+<script src="js/vendor/jmuxer.min.js"></script><!-- 本地调试仍使用 jmuxer；公网页面使用火山 RTC Web SDK -->
 <script type="module" src="js/main.js"></script>
 </body>
 </html>

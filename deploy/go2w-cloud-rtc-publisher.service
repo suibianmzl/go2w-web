@@ -1,0 +1,15 @@
+[Unit]
+Description=Go2W Cloud Volcengine RTC Publisher
+After=network-online.target go2w-cloud-gateway.service go2w-cloud-rtc-http.service
+Wants=network-online.target go2w-cloud-rtc-http.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/go2w-cloud-rtc-publisher
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/go2w-cloud-rtc-publisher/run-cloud-rtc-publisher.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

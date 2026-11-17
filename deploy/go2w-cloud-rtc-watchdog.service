@@ -1,0 +1,7 @@
+[Unit]
+Description=Go2W Cloud RTC Publisher Health Watchdog
+After=go2w-cloud-gateway.service go2w-cloud-rtc-publisher.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/go2w-cloud-rtc-watchdog.py

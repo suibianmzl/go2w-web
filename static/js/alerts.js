@@ -38,6 +38,11 @@ export function setupAlerts(store, bus){
       add('link', 'crit', '和后端断开', '网页收不到扩展坞的数据，页面上的状态都不是最新的。', '检查扩展坞有没有开机、网络通不通；连上后自动恢复。', 3, true);
       return out;
     }
+    if (store.source === 'ros' && store.robotOnline === false){
+      add('robot_link', 'crit', '机器狗与云端断开', '云端连接正常，但机器狗已经离线，页面上的机器人状态不是最新的。',
+        '检查机器狗电源、网络和 go2w-edge-gateway 服务；恢复后自动重连。', 0, true);
+      return out;
+    }
     const C = store.ctrl;
     if (C?.on && C.state == null){
       add('ctrl', 'crit', '运控离线',

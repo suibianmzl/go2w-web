@@ -4,6 +4,7 @@
 // 只在浮窗开着、浏览器标签页在前台时才向后端要画面；关掉就停，省扩展坞的 Wi-Fi。
 // 后端最多同时给 3 个网页传画面（每人一路，占扩展坞 Wi-Fi），满了显示谁在看，并每隔几秒自动重试。
 import { $ } from './util.js';
+import { createRtcViewer } from './rtc_viewer.js';
 
 const LAG_MAX = 0.5;          // s：播放落后缓冲这么多就跳到最新一帧
 const MARGIN = 8;             // px：浮窗离地图区边缘至少这么远
@@ -15,7 +16,7 @@ export function setupCamera(src, bus){
   const stage = $('#stage'), win = $('#camFloat'), head = $('#camHead'), grip = $('#camGrip');
   const btn = $('#vCam'), video = $('#camVideo'), msg = $('#camMsg'), info = $('#camInfo');
   const show = text => { msg.hidden = !text; if (text) msg.textContent = text; };
-  let ready = false, want = false, mux = null, stats = null, frames = 0, retry = null;
+  let ready = false, want = false, mux = null, stats = null, frames = 0, retry = null, refresh = null;
   const IDLE_INFO = '最多 3 人同时观看';
   const stopRetry = () => { clearTimeout(retry); retry = null; };
 
@@ -52,7 +53,7 @@ export function setupCamera(src, bus){
     open = v; win.hidden = !v;
     btn.classList.toggle('on', v); btn.setAttribute('aria-pressed', String(v));
     btn.setAttribute('aria-label', v ? '关闭摄像头浮窗' : '打开摄像头浮窗');
-    layout(); if (ready) update();
+    layout(); if (ready && refresh) refresh();
   }
   btn.onclick = () => setOpen(!open);
   $('#camClose').onclick = () => setOpen(false);
@@ -93,6 +94,35 @@ export function setupCamera(src, bus){
   });
   grip.ondblclick = () => { geo = null; save(); layout(); };
 
+  // 云端页面走火山 RTC；机器狗本地 / 页面继续使用原来的 H.264 WebSocket。
+  if (location.pathname.startsWith('/quadruped/')){
+    ready = true;
+    video.hidden = true;
+    const rtc = createRtcViewer($('#camRtc'), show);
+    const rtcVisible = () => open && !document.hidden && !document.body.classList.contains('demo');
+    let rtcWant = false;
+    function updateRtc(){
+      const value = rtcVisible();
+      if (value === rtcWant) return;
+      rtcWant = value;
+      if (value){
+        info.textContent = '火山 RTC 实时视频';
+        show('正在连接 RTC 视频…');
+        rtc.start();
+      } else {
+        rtc.stop();
+        stats = null;
+        info.textContent = IDLE_INFO;
+        show('浏览器标签页在后台，已暂停 RTC 视频');
+      }
+    }
+    refresh = updateRtc;
+    updateRtc();
+    document.addEventListener('visibilitychange', updateRtc);
+    setInterval(updateRtc, 250);
+    return;
+  }
+
   /* ---------- 画面 ---------- */
   if (!src.camera || typeof JMuxer === 'undefined'){
     show(src.camera ? '播放器没有加载（js/vendor/jmuxer.min.js）' : '模拟模式没有摄像头画面');
@@ -101,6 +131,7 @@ export function setupCamera(src, bus){
   ready = true;
 
   const visible = () => open && !document.hidden && !document.body.classList.contains('demo');
+  refresh = update;
 
   function startMux(){
     stopMux();

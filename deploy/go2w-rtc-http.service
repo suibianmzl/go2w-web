@@ -1,0 +1,16 @@
+[Unit]
+Description=Go2W RTC Publisher Static Page
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/go2w-rtc-publisher
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m http.server 8090 --bind 127.0.0.1 --directory /home/unitree/go2w-rtc-publisher
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

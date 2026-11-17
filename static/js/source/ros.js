@@ -21,7 +21,8 @@ async function inflate(bytes){
 export function createRosSource(store, bus){
   const log = (lv, node, msg) => bus.emit('log', lv, node, msg);
   const t0 = performance.now(), now = () => (performance.now() - t0) / 1000;
-  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+  const basePath = location.pathname.startsWith('/quadruped/') ? '/quadruped' : '';
+  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${basePath}/ws`;
   let ws = null, lastMsg = 0, mapGrid = null, rateWarned = -Infinity, seq = 0, pingPausedUntil = 0, lastTask = null;
   let camWanted = false;                            // 摄像头标签页开着：断线重连后要重新申请
   let layers = [], gcost = null, rawPlan = null;   // rawPlan：后端最近一次的 /plan（任务结束后不再显示）
@@ -33,6 +34,7 @@ export function createRosSource(store, bus){
 
   store.source = 'ros';
   store.link = { ok: false, ms: null };
+  store.robotOnline = null;
   store.robot.valid = false;
   store.armed = null;
 
@@ -45,11 +47,12 @@ export function createRosSource(store, bus){
   function connect(){
     ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { store.link.ok = true; lastMsg = performance.now(); log('INFO', 'go2w_web', `connected to ${url}`); sendLayers(); sendWatches(); if (camWanted) ws.send(JSON.stringify({ t: 'cam', on: true })); };
+    ws.onopen = () => { store.link.ok = true; store.robotOnline = null; lastMsg = performance.now(); log('INFO', 'go2w_web', `connected to ${url}`); sendLayers(); sendWatches(); if (camWanted) ws.send(JSON.stringify({ t: 'cam', on: true })); };
     ws.onmessage = e => { lastMsg = performance.now(); typeof e.data === 'string' ? onJson(JSON.parse(e.data)) : onBinary(e.data); };
     ws.onclose = () => {
       if (store.link.ok) log('WARN', 'go2w_web', 'connection lost, retrying');
       store.link = { ok: false, ms: null };
+      store.robotOnline = false;
       store.robot.valid = false; store.odomOk = false; store.armed = null;
       for (const [, res] of pending) res({ ok: false, msg: '和后端的连接断开了' });
       pending.clear();
@@ -84,6 +87,25 @@ export function createRosSource(store, bus){
   function onJson(m){
     switch (m.t){
       case 'pong': store.link.ms = performance.now() - m.ts; break;
+      case 'robot_status': {
+        const was = store.robotOnline, online = !!m.online;
+        store.robotOnline = online;
+        if (!online){
+          store.robot.valid = false; store.odomOk = false; store.armed = null;
+          store.scan = new Float32Array(0); store.cloud = [];
+          store.costmap = null; store.lcostmap = null; store.particles = new Float32Array(0);
+          store.task = { type: 'idle' }; store.goal = null; store.plan = null; rawPlan = null;
+          store.nodes = []; store.battery = null;
+          for (const key of Object.keys(store.profiles)) store.profiles[key] = 'stop';
+          if (was !== false) log('ERROR', 'go2w_cloud', `机器狗 ${m.robot_id || ''} 与云端连接已断开`);
+          if (was !== false) bus.emit('toast', '机器狗与云端连接已断开', 'err');
+          if (camWanted) bus.emit('cam', { state: 'disconnected' });
+        } else if (was === false){
+          log('INFO', 'go2w_cloud', `机器狗 ${m.robot_id || ''} 已重新连接`);
+          bus.emit('toast', '机器狗已重新连接到云端', 'ok');
+        }
+        break;
+      }
       case 'cam': bus.emit('cam', m); break;
       case 'ack': { const res = pending.get(m.id); if (res){ pending.delete(m.id); res({ ok: m.ok, msg: m.msg, data: m.data }); } break; }
       case 'log': log(m.level, m.node, m.msg); break;

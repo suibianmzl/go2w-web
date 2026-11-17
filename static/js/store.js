@@ -3,6 +3,7 @@ export function createStore(){
   return {
     source: 'mock',                 // 'mock' | 'ros'
     link: { ok: false, ms: null },  // 浏览器 ↔ 后端
+    robotOnline: null,              // 云端 ↔ 机器狗
     fixed: 'map',                   // 位姿和 scan 所在坐标系（没有 map TF 时后端退回 odom）
     // 地图：img 画布覆盖世界坐标 [ox, ox+w] × [oy, oy+h]（米）
     map: null,                      // { img, w, h, ox, oy, res, name, cells }

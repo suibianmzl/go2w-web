@@ -1,0 +1,14 @@
+[Unit]
+Description=Go2W Cloud RTC Publisher Static Page
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/go2w-cloud-rtc-publisher
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m http.server 8091 --bind 127.0.0.1 --directory /opt/go2w-cloud-rtc-publisher
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

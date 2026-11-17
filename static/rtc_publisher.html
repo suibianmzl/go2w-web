@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Go2W RTC Publisher</title>
+</head>
+<body>
+  <video id="source" muted autoplay playsinline></video>
+  <canvas id="frame" width="1280" height="720" style="position:absolute;left:-10000px"></canvas>
+  <pre id="status">starting</pre>
+  <script src="https://lf-unpkg.volccdn.com/obj/vcloudfe/sdk/@volcengine/rtc/4.69.5/1794303598678/index.min.js"></script>
+  <script src="js/vendor/jmuxer.min.js"></script>
+  <script type="module" src="js/rtc_publisher.js"></script>
+</body>
+</html>

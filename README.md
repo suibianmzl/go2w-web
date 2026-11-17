@@ -6,12 +6,25 @@
 server/go2w_web.py   后端：rclpy 节点（域 43）+ aiohttp，HTTP 和 WebSocket 同一端口
 server/procs.py      运行档位的进程管理（经运行容器 supervisor 的 socket 启停进程组）
 server/camera.py     前置摄像头 RTP 组播接收、拼帧
+server/cloud_gateway.py  云端无 ROS WebSocket 网关（浏览器与机器狗消息路由）
+server/rtc_token.py      火山 RTC 短期 Token 生成
 static/              前端：原生 JS 模块，不需要构建
   js/source/mock.js  模拟数据源（示例地图 + 机器人仿真）
   js/source/ros.js   ROS 数据源（连后端 /ws）
 dev/                 本地调试：假 ROS、假摄像头、协议测试
 prototype/           最早的单文件原型和右栏原型，留作对照
+tools/go2w_edge_gateway.py  机器狗到云端的 WebSocket 长连接转发
+static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行）
 ```
+
+云端 Demo 由 `server/cloud_gateway.py` 直接监听 8080，提供 `/quadruped/`、
+`/quadruped/ws` 和 `/quadruped/robot/ws`。机器狗运行
+`tools/go2w_edge_gateway.py` 连接本地 `go2w_web`，再主动连接云端机器人入口；
+本地 ROS 后端本身不需要修改。
+
+为降低机器狗 CPU，RTC 转码默认在云端执行：机器狗只转发原始 H.264 到
+`/quadruped/camera/ws`，云端 Chrome 以 1280×720、15 FPS 发布
+`go2w-01-camera` 到火山 RTC。
 
 界面只读 `js/store.js` 里的状态，两个数据源负责填它；操作统一经过 `js/actions.js` 做前置检查和确认。
 

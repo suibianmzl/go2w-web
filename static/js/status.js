@@ -31,6 +31,7 @@ export function setupRunState(store, actions, mapView){
     if (result && R.valid && Math.hypot(R.x - result.x, R.y - result.y) > KEEP) result = null;
 
     if (!store.link.ok) return ['off', '未连接', '等待后端'];
+    if (store.robotOnline === false) return ['crit', '机器狗离线', '云端已连接 · 等待机器狗'];
     if (store.estop) return ['crit', '急停', '解除急停后才能动'];
     const bad = store.alerts?.find(a => a.level === 'crit');      // 运控离线、节点掉了、没有激光……（alerts.js）
     if (bad) return ['crit', bad.title, store.alerts.length > 1 ? `等 ${store.alerts.length} 项 · 见上方提示` : '见上方提示'];
