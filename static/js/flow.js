@@ -390,13 +390,21 @@ export function setupFlow(store, src, actions, setTool, reloc){
         if (store.mapSavedName && store.mapSavedName !== lastSaved){ lastSaved = store.mapSavedName; nameTouched = false; mapName.value = freeName(store.mapSavedName); }
         if (!nameTouched && document.activeElement !== mapName && !mapName.value) mapName.value = freeName(today());
         const saved = store.mapSavedAt;
-        setStep('mpSave', on ? 'cur' : 'todo', store.mapSaving ? '正在保存…' : saved ? `已保存 ${store.mapSavedName || ''} · ${Math.max(0, Math.round((Date.now() - saved) / 60000))} 分钟前` : '还没有保存');
+        const A0 = store.autosave;
+        setStep('mpSave', on ? 'cur' : 'todo', store.mapSaving ? '正在保存…' : saved ? `已保存 ${store.mapSavedName || ''} · ${Math.max(0, Math.round((Date.now() - saved) / 60000))} 分钟前`
+          : A0?.wall ? `还没有保存 · 已自动保存 ${Math.round(A0.ago)} 秒前` : '还没有保存');
         const ct = store.cont;
         // 和建图流程其他步骤一样：建图在跑就是 cur（展开）。以前是 todo / done，而这两种状态在建图流程里
         // 都隐藏步骤内容（console.css），续建的按钮根本点不到
         setStep('mpCont', on ? 'cur' : 'todo',
           ct ? `${ct.base} → ${ct.name}${ct.check ? (ct.check.ok ? ' · 自检通过' : ' · 自检没通过') : ' · 还没自检'}` : '在已有地图上继续采集');
-        setStep('mpEnd', on ? 'cur' : 'todo', saved ? `导航会用 ${store.mapSavedName || '刚保存的地图'}` : '先保存，否则停止后地图会丢失');
+        // 建图自动保存（后端每 30 s 覆盖一份 autosave_<开始时间>，停止前、出问题时也会存）
+        const A = store.autosave, au = $('#mpAuto');
+        const autoTxt = !A ? '' : A.err ? `自动保存失败：${A.err}` : A.running ? '正在自动保存…'
+          : A.wall ? `已自动保存到 ${A.name} · ${A.ago < 60 ? `${Math.round(A.ago)} 秒前` : `${Math.round(A.ago / 60)} 分钟前`}` : `等待第一次自动保存（每 ${Math.round(A.period)} 秒）`;
+        au.hidden = !A; au.textContent = A ? `${autoTxt}（每 ${Math.round(A.period)} 秒、停止前、出问题时覆盖这一份，只是兜底）` : '';
+        au.classList.toggle('warn', !!A?.err);
+        setStep('mpEnd', on ? 'cur' : 'todo', saved ? `导航会用 ${store.mapSavedName || '刚保存的地图'}` : A?.wall ? `还没正式保存；停止后可在地图列表找到自动保存 ${A.name}` : '先保存，否则停止后地图会丢失');
         $('#mapToNav').disabled = !on || !saved;
         $('#mapStop').disabled = !on;
       }

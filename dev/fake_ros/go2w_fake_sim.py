@@ -18,10 +18,19 @@
 import heapq
 import math
 import os
+import struct
 import queue
 
 FAKE_CTRL_OFF = os.environ.get('GO2W_FAKE_CTRL_OFF', '/tmp/go2w_fake_ctrl_off')
+# 测试用：往这个文件写「x,y,朝向弧度」（真实坐标），假机器人瞬移过去，读完删掉（建图档没有导航可开）
+FAKE_MOVE = os.environ.get('GO2W_FAKE_MOVE', '/tmp/go2w_fake_move')
 FAKE_SCAN_OFF = os.environ.get('GO2W_FAKE_SCAN_OFF', '/tmp/go2w_fake_scan_off')
+# 测试建图自动保存：这个文件存在时假里程计报不健康（/odom_healthy 停发）
+FAKE_ODOM_OFF = os.environ.get('GO2W_FAKE_ODOM_OFF', '/tmp/go2w_fake_odom_off')
+# GO2W_FAKE_MAP_GROW=1：建图时 /map 每 2 s 发一次且内容在变（真机 slam 也是一直在发），测自动保存
+FAKE_MAP_GROW = os.environ.get('GO2W_FAKE_MAP_GROW') == '1'
+# GO2W_FAKE_SERIALIZE_FAIL=1：serialize_map 返回写文件失败
+FAKE_SERIALIZE_FAIL = os.environ.get('GO2W_FAKE_SERIALIZE_FAIL') == '1'
 import time
 import uuid
 from types import SimpleNamespace as N
@@ -86,6 +95,11 @@ def wrap(a):
 # GO2W_FAKE_MOTOR_TEMP="52,88,..."（16 个 ℃）可以指定温度，测过热提醒
 FAKE_MOTOR_TEMP = [int(v) for v in os.environ.get('GO2W_FAKE_MOTOR_TEMP', '49,61,31,55,32,33,63,29,32,53,29,32,23,23,24,23').split(',')]
 
+# GO2W_FAKE_MOTOR_ERR="0,0,0,4,..."（16 个）指定 reserve[0] 错误标志
+FAKE_MOTOR_ERR = [int(v, 0) for v in os.environ.get('GO2W_FAKE_MOTOR_ERR', ','.join(['0'] * 16)).split(',')][:16] + [0] * 16
+FAKE_MOTOR_Q = [0.05, 1.21, -2.58]   # 髋 / 大腿 / 小腿，趴下附近的角度
+_fake_lost = [120, 3400, 0, 7, 0, 0, 15, 0, 0, 2, 0, 0, 0, 980, 0, 0]
+
 
 def fake_lowstate():
     b = bytearray(1180)
@@ -93,6 +107,10 @@ def fake_lowstate():
     b[4 + 1039] = 76               # bms_state.soc
     for i, t in enumerate(FAKE_MOTOR_TEMP[:16]):
         b[4 + 108 + 48*i] = t & 0xFF   # motor_state[i].temperature（int8）
+        struct.pack_into('<f', b, 4 + 80 + 48*i, FAKE_MOTOR_Q[i % 3] if i < 12 else 700.0 + i)   # q（rad）
+        struct.pack_into('<I', b, 4 + 112 + 48*i, _fake_lost[i])   # lost（累计丢包）
+        struct.pack_into('<I', b, 4 + 116 + 48*i, FAKE_MOTOR_ERR[i])   # reserve[0]（错误标志）
+    _fake_lost[1] += 3; _fake_lost[13] += 1   # 左前髋、左前轮慢慢丢包
     return bytes(b)
 
 
@@ -237,10 +255,13 @@ class Sim:
             self.yaml_param = map_yaml
             self.deliver_map()
         self.procs[mode] = True
+        if mode == 'mapping':
+            self.slam_frame = None   # 新建图：map 坐标系和真实坐标重合
         self.ready_at[mode] = time.monotonic() + START_DELAY
         self.rosout(20, 'launch', f'[{mode}.launch.py] all processes started')
 
     def stop_modes(self):
+        self.slam_frame = None
         self.patrol_stop('patrol.py 收到 SIGINT')
         if self.goal and self.goal['status'] in (ACCEPTED, EXECUTING):
             self.finish(CANCELED)
@@ -413,8 +434,21 @@ class Sim:
                 return DeserializePoseGraph.Response()
             self.cont_load = {'file': req.filename, 'match_type': req.match_type,
                              'pose': [req.initial_pose.x, req.initial_pose.y, req.initial_pose.theta]}
+            # 和真机一样：slam 认定「机器人此刻在给定位姿」，给错了 map 坐标系就整体偏掉，之后一直带着
+            g = req.initial_pose
+            a = g.theta - self.th
+            ca, sa = math.cos(a), math.sin(a)
+            self.slam_frame = (g.x - (ca*self.x - sa*self.y), g.y - (sa*self.x + ca*self.y), a)
             self.plog(20, 'DeserializePoseGraph: 已加载 %s（match_type=%d）' % (base, req.match_type))
             return DeserializePoseGraph.Response()
+        if name == '/slam_toolbox/serialize_map':
+            from slam_toolbox.srv import SerializePoseGraph
+            if FAKE_SERIALIZE_FAIL:
+                return SerializePoseGraph.Response(result=SerializePoseGraph.Response.RESULT_FAILED_TO_WRITE_FILE)
+            for ext in ('.posegraph', '.data'):   # 假内容：真 slam 写的是 boost 序列化的位姿图
+                with open(req.filename + ext, 'wb') as f:
+                    f.write(b'fake ' + ext.encode() + b' %d\n' % getattr(self, 'map_grow', 0))
+            return SerializePoseGraph.Response(result=0)
         if name == '/slam_toolbox/pause_new_measurements':
             self.slam_paused = not getattr(self, 'slam_paused', False)
             return SlamPause.Response()
@@ -468,6 +502,15 @@ class Sim:
 
     def teleport(self, x, y, th):
         self.x, self.y, self.th, self.v, self.w_ = x, y, th, 0.0, 0.0
+
+    def map_pose(self):
+        """TF 里 map → base_footprint：续建时套上 slam 坐标系的偏移（起点给对时偏移为零）。"""
+        f = getattr(self, 'slam_frame', None)
+        if not f or not self.procs.get('mapping'):
+            return self.x, self.y, self.th
+        tx, ty, a = f
+        ca, sa = math.cos(a), math.sin(a)
+        return ca*self.x - sa*self.y + tx, sa*self.x + ca*self.y + ty, wrap(self.th + a)
 
     # ---------- 假 Nav2 ----------
     def nav_ready(self):
@@ -834,6 +877,16 @@ def run(node):
             cb()
         now = time.monotonic()
         sim.ctrl_step(now)
+        if os.path.exists(FAKE_MOVE):
+            try:
+                with open(FAKE_MOVE) as f:
+                    sim.teleport(*(float(v) for v in f.read().strip().split(',')))
+            except (OSError, ValueError, TypeError) as e:
+                sim.plog(40, f'GO2W_FAKE_MOVE 读不了：{e}')
+            try:
+                os.unlink(FAKE_MOVE)
+            except OSError:
+                pass
         sim.step(dt, now)
         sim.patrol_step(now)
         k += 1
@@ -874,8 +927,14 @@ def run(node):
                     sim.rosout(20, 'controller_server', 'Passing new path to controller.')
         if sim.bridge_up() and k % 2 == 1:  # cmd_bridge 的 ~/armed 和真机一样按自己的频率发
             b = Bool(); b.data = sim.armed; node.deliver('/go2w_cmd_bridge/armed', b)
-        if alive and k % 10 == 0:  # 里程计健康 2 Hz
+        if alive and k % 10 == 0 and not os.path.exists(FAKE_ODOM_OFF):  # 里程计健康 2 Hz
             b = Bool(); b.data = True; node.deliver('/odom_healthy', b)
+        if FAKE_MAP_GROW and sim.ready('mapping') and k % 40 == 20:   # 假 slam：地图一直在长
+            sim.map_grow = getattr(sim, 'map_grow', 0) + 1
+            free = np.flatnonzero(sim.grid.ravel() == -1)
+            if len(free):
+                sim.grid.ravel()[free[sim.map_grow * 37 % len(free)]] = 0
+            sim.deliver_map()
         if nav and k % 10 == 5:   # 局部代价地图 2 Hz
             node.deliver('/local_costmap/costmap', sim.costmap_msg(local=True))
         if sim.loc_ready() and k % 10 == 5:   # 粒子 2 Hz

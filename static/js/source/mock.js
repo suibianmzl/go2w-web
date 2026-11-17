@@ -59,6 +59,9 @@ export function createMockSource(store, bus){
   const mtBase = /[?&]hot\b/.test(location.search) ? [52, 88, 33, 58, 32, 33, 74, 29, 32, 55, 29, 32, 23, 23, 24, 23]
     : [49, 61, 31, 55, 32, 33, 63, 29, 32, 53, 29, 32, 23, 23, 24, 23];
   store.motorTemp = mtBase.slice();
+  // 电机错误标志（下拉里的 错误标志）：?mock&err 让右前大腿、左后轮报错
+  const mtErr = /[?&]err\b/.test(location.search) ? [0, 0x4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20] : Array(16).fill(0);
+  store.motorInfo = { err: mtErr };
   store.ctrl = { on: false };   // 纯前端模拟没有运控：自检跳过「站立」
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';

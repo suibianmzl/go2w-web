@@ -152,33 +152,27 @@ class CoverageTests(unittest.TestCase):
         self.assertFalse(C.check_start(self.BASE, None)[0])
 
 
-class DriftTests(unittest.TestCase):
-    """自检必须停在起点做。开走之后的偏差不是起点位姿的问题，要分开报。"""
+class StartFixTests(unittest.TestCase):
+    """自检在别处量的修正量换算回起点：起点和量的位置在同一个 slam 坐标系里，套同一个刚体变换。"""
 
-    START = [1.0, 2.0, 0.5]
+    def test_纯平移(self):
+        x, y, th = C.start_fix([1.0, 2.0, 0.5], (5.0, 6.0), [0.3, -0.2, 0.0])
+        self.assertAlmostEqual(x, 1.3); self.assertAlmostEqual(y, 1.8); self.assertAlmostEqual(th, 0.5)
 
-    def test_停在起点可以自检(self):
-        ok, why = C.check_drift(self.START, (1.05, 2.03, 0.5))
-        self.assertTrue(ok, why)
+    def test_绕量的位置转(self):
+        # 起点在量的位置正西 2 m，坐标系偏 +90°：起点应落到量的位置正南 2 m，朝向也加 90°
+        x, y, th = C.start_fix([3.0, 4.0, 0.0], (5.0, 4.0), [0.0, 0.0, 90.0])
+        self.assertAlmostEqual(x, 5.0, places=6); self.assertAlmostEqual(y, 2.0, places=6)
+        self.assertAlmostEqual(th, math.pi / 2, places=6)
 
-    def test_开走了就拦下(self):
-        ok, why = C.check_drift(self.START, (1.0 + 0.8, 2.0, 0.5))
-        self.assertFalse(ok)
-        self.assertIn('已经离开起点', why)
-        self.assertIn('0.80 m', why)
+    def test_量的位置就是起点(self):
+        x, y, th = C.start_fix([1.0, 2.0, 0.2], (1.0, 2.0), [0.1, 0.0, -10.0])
+        self.assertAlmostEqual(x, 1.1); self.assertAlmostEqual(y, 2.0)
+        self.assertAlmostEqual(th, 0.2 - math.radians(10))
 
-    def test_原地转多了也拦(self):
-        ok, why = C.check_drift(self.START, (1.0, 2.0, 0.5 + math.radians(30)))
-        self.assertFalse(ok)
-        self.assertIn('30°', why)
-
-    def test_容差边界(self):
-        self.assertTrue(C.check_drift(self.START, (1.0 + 0.49, 2.0, 0.5))[0])
-        self.assertFalse(C.check_drift(self.START, (1.0 + 0.51, 2.0, 0.5))[0])
-
-    def test_拿不到当前位姿时放行(self):
-        # 趴着 / 没有 TF：不拦，由贴合率自己说话
-        self.assertTrue(C.check_drift(self.START, None)[0])
+    def test_缺数据(self):
+        self.assertIsNone(C.start_fix([1.0, 2.0, 0.0], (0.0, 0.0), None))
+        self.assertIsNone(C.start_fix([1.0, 2.0, 0.0], (0.0, 0.0), [1, 2]))
 
 
 if __name__ == '__main__':

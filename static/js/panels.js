@@ -1,6 +1,6 @@
 import { setupRouteEditor } from './routes.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
-import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, motorIdx, motorName, motorLevel } from './util.js';
+import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount } from './util.js';
 import { LAYERS, L } from './layers.js';
 import { MODES, MODE_PKG } from './actions.js';
 
@@ -234,7 +234,8 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const sel = $('#policySel'), list = C.policies || [];
     $('#policyRow').hidden = !list.length && !C.policy;
     const lying = C.state === 'Passive' && C.ready;
-    sel.disabled = !lying || !!C.op || list.length < 2;
+    const dis = !lying || !!C.op || list.length < 2;
+    if (sel.disabled !== dis) sel.disabled = dis;
     if (policyPicking) return;   // 确认框开着 / 正在切：别把选中值改回去
     const opts = list.includes(C.policy) || !C.policy ? list : [C.policy, ...list];
     const key = opts.join('|');
@@ -242,8 +243,9 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       sel.innerHTML = opts.map(p => `<option value="${escPol(p)}">${escPol(p.replace(/^mjlab_go2w_/, ''))}</option>`).join('');
       sel.dataset.k = key;
     }
-    if (C.policy) sel.value = C.policy;
-    sel.title = C.policy ? `当前：${C.policy}` + (lying ? '' : '（只能趴着时切换）') : '读不到当前策略';
+    // 4 Hz 重绘：下拉框展开（有焦点）时别动选中值，不然高亮一直被拉回当前策略、闪个不停；其它也只在变了才写
+    if (C.policy && sel.value !== C.policy && document.activeElement !== sel) sel.value = C.policy;
+    setAttr(sel, 'title', C.policy ? `当前：${C.policy}` + (lying ? '' : '（只能趴着时切换）') : '读不到当前策略');
   }
   function renderChips(){
     const lk = store.link, anyMode = !!actions.curMode();
@@ -283,26 +285,55 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     else if (ros && !store.map){ off.hidden = false; $('#offT').textContent = '已连接，等待 /map'; $('#offS').textContent = '建图、定位或导航运行后才会有地图'; }
     else off.hidden = true;
   }
-  // 电机温度：一行显示最热的电机（超过阈值变黄 / 红），点开是 4 条腿 × 髋 / 大腿 / 小腿 / 轮 的表，展开状态记在本机浏览器
-  const mtRow = $('#mtRow'), mtGrid = $('#mtGrid'), mtCells = [];
+  // 电机温度：一行显示最热的电机（超过阈值变黄 / 红），点开是 4 条腿 × 髋 / 大腿 / 小腿 / 轮 的表，展开状态记在本机浏览器。
+  // 表上面的下拉切换看 温度 / 错误标志（选的哪个也记在本机）
+  const mtRow = $('#mtRow'), mtGrid = $('#mtGrid'), mtBox = $('#mtBox'), mtSel = $('#mtView'), mtCells = [];
+  let mtView = 'temp';
   {
+    mtSel.innerHTML = MOTOR_VIEWS.map(([k, cn]) => `<option value="${k}">${cn}</option>`).join('');
+    try { const v = localStorage.getItem('go2w.mtView'); if (MOTOR_VIEWS.some(([k]) => k === v)) mtView = v; } catch {}
+    mtSel.value = mtView;
+    mtSel.onchange = () => { mtView = mtSel.value; try { localStorage.setItem('go2w.mtView', mtView); } catch {} renderMotorTemp(); };
     mtGrid.innerHTML = '<span></span>' + MOTOR_JOINTS.map(j => `<span>${j}</span>`).join('')
       + MOTOR_LEGS.map((l, li) => `<span class="lg">${MOTOR_LEG_CN[l]}</span>` + MOTOR_JOINTS.map((_, j) => `<b data-i="${motorIdx(li, j)}">--</b>`).join('')).join('');
     mtGrid.querySelectorAll('b').forEach(b => { mtCells[+b.dataset.i] = b; b.title = motorName(+b.dataset.i); });
     let open = false; try { open = localStorage.getItem('go2w.mtOpen') === '1'; } catch {}
-    const setOpen = v => { open = v; mtGrid.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} };
+    const setOpen = v => { open = v; mtBox.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} };
     setOpen(open);
     mtRow.onclick = () => setOpen(!open);
-    mtRow.title = `点开看全部电机温度（≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
+    mtRow.title = `点开看全部电机温度和错误标志（温度 ≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
   }
+  const hex = v => '0x' + v.toString(16).toUpperCase();
+  // 每种视图：单元格文字、颜色等级、鼠标悬停说明
+  function motorCell(view, T, I, i){
+    const name = motorName(i);
+    if (view === 'temp') return [T[i], motorLevel(T[i]) === 'ok' ? '' : motorLevel(T[i]), `${name} ${T[i]} ℃`];
+    if (!I) return ['--', '', name];
+    if (view === 'err'){
+      const e = I.err[i];
+      return [e ? hex(e) : '0', e ? 'crit' : 'dim', `${name} 错误标志 ${e}（${hex(e)}）${e ? '' : '：正常'}`];
+    }
+    return ['--', '', name];
+  }
+  // 只在内容变了才写 DOM：这里 4 Hz 重绘，下拉框展开时改它的选项（哪怕文字一样）Chrome 会重建弹出列表 → 闪、点不中
+  const setTxt = (el, v) => { v = String(v); if (el.textContent !== v) el.textContent = v; };
+  const setAttr = (el, k, v) => { if (el.getAttribute(k) !== v) el.setAttribute(k, v); };
+  let mtSumHtml = null;
+  const MT_NOTE = { temp: '℃', err: '0 = 正常' };
   function renderMotorTemp(){
-    const T = store.motorTemp;
-    if (!T){ $('#mtSum').textContent = '--'; mtRow.dataset.s = ''; mtCells.forEach(b => { b.textContent = '--'; b.dataset.s = ''; }); return; }
+    const T = store.motorTemp, I = store.motorInfo, nErr = motorErrCount(I);
+    setTxt($('#mtNote'), MT_NOTE[mtView]);
+    setTxt(mtSel.querySelector('option[value="err"]'), nErr ? `错误标志（${nErr}）` : '错误标志');
+    if (!T){ mtSumHtml = null; setTxt($('#mtSum'), '--'); setAttr(mtRow, 'data-s', ''); mtCells.forEach(b => { setTxt(b, '--'); setAttr(b, 'data-s', ''); }); return; }
     let k = 0; T.forEach((v, i) => { if (v > T[k]) k = i; });
     const hot = T.filter(v => v >= MOTOR_WARN).length;
-    $('#mtSum').innerHTML = `<small>${hot > 1 ? `${hot} 个偏热 · ` : ''}最高 ${motorName(k)}</small>${T[k]} ℃`;
-    mtRow.dataset.s = motorLevel(T[k]) === 'ok' ? '' : motorLevel(T[k]);
-    T.forEach((v, i) => { const b = mtCells[i]; if (!b) return; b.textContent = v; b.dataset.s = motorLevel(v) === 'ok' ? '' : motorLevel(v); });
+    // 一行放不下：有报错时省掉最热电机的名字，保证温度数字露出来
+    const html = nErr
+      ? `<small class="mt-err">${nErr} 个报错</small><small>${hot > 1 ? `${hot} 偏热 · ` : ''}最高</small>${T[k]} ℃`
+      : `<small>${hot > 1 ? `${hot} 个偏热 · ` : ''}最高 ${motorName(k)}</small>${T[k]} ℃`;
+    if (html !== mtSumHtml){ mtSumHtml = html; $('#mtSum').innerHTML = html; }
+    setAttr(mtRow, 'data-s', nErr ? 'crit' : motorLevel(T[k]) === 'ok' ? '' : motorLevel(T[k]));
+    mtCells.forEach((b, i) => { const [txt, s, tip] = motorCell(mtView, T, I, i); setTxt(b, txt); setAttr(b, 'data-s', s); setAttr(b, 'title', tip); });
   }
   function renderHud(){
     const R = store.robot, m = store.map;

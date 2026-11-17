@@ -1,9 +1,13 @@
 // 地图续建协议测试：停车点只在可信坐标系里记、手动起点的校验、自检能拦住给错的起点。
 // 只能对本地假 ROS 运行（会切档位）。准备：数据目录里要有带 .posegraph/.data 的 lab_20261116
 // （假 slam_toolbox 只查文件在不在，空文件就行），假机器人站在图里的空地上：
-//   GO2W_FAKE_MAP=<数据>/maps/lab_20261116.yaml GO2W_FAKE_START=11.67,0.93,0 GO2W_DATA=<数据> dev/run.sh
+//   GO2W_FAKE_START=11.67,0.93,0 GO2W_DATA=<数据> dev/run.sh <数据>/maps/lab_20261116.yaml   （地图要作为参数传，run.sh 会覆盖 GO2W_FAKE_MAP）
 //   node dev/test_continue.mjs [ws://127.0.0.1:8080/ws]
+import { writeFileSync } from 'node:fs';
 const URL_ = process.argv[2] || 'ws://127.0.0.1:8080/ws';
+// 假机器人瞬移（真实坐标）：建图档没有导航，用 go2w_fake_sim 的 GO2W_FAKE_MOVE 文件
+const FAR = [11.42, -2.58, 1.0];   // 基准图里离起点约 3.5 m 的空地
+const moveTo = async p => { writeFileSync(process.env.GO2W_FAKE_MOVE || '/tmp/go2w_fake_move', p.join(',')); await new Promise(r => setTimeout(r, 2500)); };
 const BASE = 'lab_20261116', TRUE = [11.67, 0.93, 0];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function client(){
@@ -52,15 +56,20 @@ try {
   r = await c.cmd('cont_start', { base: BASE, name: 'lab_c_bad', pose: TRUE, source: 'bogus' });
   ok('未知起点来源：拒绝', !r.ok, r.msg);
 
-  // 4. 手动给错的起点（朝向偏 13°：超过自检门限 8°，又在「还在起点」的容差 15° 内——假机器人在建图档
-  //    给的是真实位置，偏太多会先被「离开起点」拦下；平移偏差的分辨率是 0.05 m，卡门限测不稳）：
-  //    能开始，但自检必须拦下，且停车点不能记
+  // 4. 手动给错的起点（朝向偏 13°，超过自检门限 8°；平移偏差的分辨率是 0.05 m，卡门限测不稳）：
+  //    能开始，但自检必须拦下（开到别处再量也一样拦下，并换算出正确起点），且停车点不能记
   r = await c.cmd('cont_start', { base: BASE, name: 'lab_c_off', pose: [TRUE[0], TRUE[1], TRUE[2] + 13 * Math.PI / 180], source: 'manual' });
   ok('手动起点（朝向偏 13°）：开始', r.ok && r.data?.source === 'manual' && !!r.data?.warn, r.msg);
   r = await c.cmd('cont_parking', { base: BASE });
   ok('续建未自检：拒绝记停车点', !r.ok && /自检/.test(r.msg), r.msg);
   r = await c.cmd('cont_check');
   ok('自检拦下朝向偏 13° 的起点', !r.ok && /偏了|对不上/.test(r.msg), r.msg);
+  await moveTo(FAR);
+  r = await c.cmd('cont_check');
+  const fx = r.data?.start_fix;
+  ok('开到别处自检：照样拦下并换算出起点', !r.ok && /偏了|对不上/.test(r.msg) && !!fx
+     && Math.hypot(fx[0] - TRUE[0], fx[1] - TRUE[1]) < 0.2 && Math.abs(fx[2] - TRUE[2]) < 3 * Math.PI / 180, `${r.msg} · start_fix ${JSON.stringify(fx)}`);
+  await moveTo(TRUE);
   r = await c.cmd('cont_finish'); ok('自检没过：拒绝保存', !r.ok, r.msg);
   r = await c.cmd('cont_abort'); ok('放弃', r.ok, r.msg);
 
@@ -68,6 +77,9 @@ try {
   r = await c.cmd('cont_start', { base: BASE, name: 'lab_c_ok', pose: TRUE, source: 'manual' });
   ok('手动起点（正确）：开始', r.ok && r.data?.source === 'manual', r.msg);
   r = await c.cmd('cont_check'); ok('自检通过', r.ok, r.msg);
+  await moveTo(FAR);
+  r = await c.cmd('cont_check'); ok('开走 3.5 m 后自检：不再要求回起点', r.ok && r.data?.at === 'current', r.msg);
+  await moveTo(TRUE);
   r = await c.cmd('cont_parking', { base: 'lab_20261021' });
   ok('续建中：别的图的停车点拒绝', !r.ok, r.msg);
   r = await c.cmd('cont_parking', { base: BASE });

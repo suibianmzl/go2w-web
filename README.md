@@ -97,7 +97,7 @@ static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行�
 
 - 基准图必须有 `.posegraph` + `.data`。续建永远另存新名字，基准图不动；收工时写 `<name>.meta.json`，`routes.json` 里指向基准的任务改指新图（坐标系不变，站点不用重标）。
 - 开始续建：起点位姿按 停车点（`data/parkings.json`）→ 自动定位（在磁盘上的基准图上做）→ 手动 的顺序取，起点必须在基准图范围内；然后暂停收 scan、调 `/slam_toolbox/deserialize_map`（`START_AT_GIVEN_POSE`）、再恢复。
-- 这个服务读文件失败也返回成功，所以**自检是唯一判据**，没通过不许存图。自检要停在起点做；角度修正绕起点转（`--pivot`），超出 0.40 m / 8° 报「起点位姿偏了」并给出修正量，贴合率 < 85% 报「环境和图对不上」。
+- 这个服务读文件失败也返回成功，所以**自检是唯一判据**，没通过不许存图。自检（11-17 起不用回起点）用 slam 当前位姿（TF `map→base_footprint`，还没有 map 坐标系时退回起点位姿），角度修正绕该位姿转（`--pivot`），超出 0.40 m / 8° 报「起点位姿偏了」，并把修正量换算成起点位姿（`start_fix`）供重来；贴合率 < 85% 报「环境和图对不上」，提示站到能看到旧墙的地方。
 - 检查基准时核对运控策略（环境变量或 `runtime.env` 的 `GO2W_CONTROL_POLICY`）和切片高度（`pcl2scan_slam.yaml`，运行镜像里在 `/opt/go2w/base/go2w_bringup/share/go2w_bringup/config`），和基准 `meta.json` 不一致就拦下。
 
 测试：`dev/test_map_overlap_check.py`、`dev/test_mapmeta.py`、`dev/test_mapcontinue.py`（不用起 run.sh）。
@@ -112,7 +112,17 @@ static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行�
 
 后端每 5 s 临时订阅一帧 `/go2w/robot_lowstate`，不反序列化，按 CDR 偏移读电量和 16 个 `motor_state[i].temperature`（int8，℃，字节 `4 + 108 + 48·i`；0–11 是 右前 / 左前 / 右后 / 左后 × 髋 / 大腿 / 小腿，12–15 是轮子），状态里发 `motorTemp`，20 s 没读到就是 `null`。偏移用真机录包核对过：髋关节平时 46–67 ℃（低电量跑久了到过 81 ℃），大腿 / 小腿约 30 ℃，轮子约 23 ℃。
 
-机器人卡片里「电机温度」一行显示最热的电机，点开是 4×4 的表。≥70 ℃ 黄、≥85 ℃ 红，并在地图上方提醒（只提醒，不拦出发）；阈值在 `static/js/util.js` 的 `MOTOR_WARN` / `MOTOR_CRIT`，是按实测定的保守值，不是宇树的保护温度。本地：`?mock&hot` 或 `GO2W_FAKE_MOTOR_TEMP=52,88,…（16 个）dev/run.sh` 看过热效果。
+机器人卡片里「电机温度」一行显示最热的电机，点开是 4×4 的表。≥65 ℃ 黄、≥85 ℃ 红，并在地图上方提醒（只提醒，不拦出发）；阈值在 `static/js/util.js` 的 `MOTOR_WARN` / `MOTOR_CRIT`，是按实测定的保守值，不是宇树的保护温度。本地：`?mock&hot` 或 `GO2W_FAKE_MOTOR_TEMP=52,88,…（16 个）dev/run.sh` 看过热效果。
+
+表上面的下拉（同 app「狗腿信息」）切换 **温度 / 错误标志**。错误标志读同一帧的 `motor_state[i].reserve[0]`（uint32，字节 `4 + 116 + 48·i`），状态里发 `motorInfo: {err: [16 个]}`；0 = 正常，非 0 标红显示十六进制，机器人卡片那一行变红写「N 个报错」（不进地图上方提醒）。用录包核对过：16 个电机平时全程 0；`reserve[1]` 一直是 507/508，不是错误码，不读。本地：`?mock&err` 或 `GO2W_FAKE_MOTOR_ERR=0,4,…（16 个）dev/run.sh`。
+
+注意：`/go2w/robot_lowstate` 只在导航 / 建图档位运行时有人发，什么都没开时电量、电机温度都显示 `--`。
+
+这一块 4 Hz 重绘，只在内容变了才改 DOM——下拉框展开时改它的选项或选中值，Chrome 会重建弹出列表，闪个不停（策略下拉框同理）。
+
+## 建图自动保存（11-17）
+
+建图时每 30 s（`GO2W_AUTOSAVE_SECONDS`）、停止建图前、雷达 / FAST-LIO / 里程计出问题时（两次至少隔 5 s），把当前地图存成 `data/maps/autosave_<建图开始时间>`，同一次建图覆盖同一份；地图没变就不存，单次存图耗时超过周期的 1/10 自动拉长间隔。只留最近 3 次建图的自动保存（被路线引用的不删）。测试：`dev/test_autosave.mjs`。
 
 ## 地图显示方向
 

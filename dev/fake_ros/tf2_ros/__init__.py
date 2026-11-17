@@ -29,7 +29,8 @@ class Buffer:
         if fixed == 'base_footprint' and frame == 'body':
             return _tf(z=BODY_Z)
         if fixed in ('map', 'odom') and frame == 'base_footprint':
-            return _tf(sim.x, sim.y, 0.0, N(x=0.0, y=0.0, z=math.sin(sim.th / 2), w=math.cos(sim.th / 2)))
+            x, y, th = sim.map_pose() if fixed == 'map' else (sim.x, sim.y, sim.th)
+            return _tf(x, y, 0.0, N(x=0.0, y=0.0, z=math.sin(th / 2), w=math.cos(th / 2)))
         raise LookupError(f'{fixed} -> {frame} not available')
 
 

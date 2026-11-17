@@ -141,7 +141,7 @@ export function createRosSource(store, bus){
           store.routeDraft = { id: null, map: null, points: [], confirmed: false };
           store.routeCheck = null;
         }
-        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
+        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.motorInfo = m.motorInfo ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
         Object.assign(store.params, m.params || {});
         for (const [k, st] of Object.entries(m.profiles)){   // stop / starting / run / stopping
           if (st === 'run' && store.profiles[k] !== 'run') store.since[k] = now();
@@ -160,6 +160,7 @@ export function createRosSource(store, bus){
         Object.assign(store.loc, { std: null, yaw: null, match: null }, m.loc || {});
         store.autoLoc = m.autoLoc || null;
         store.cont = m.cont || null;
+        store.autosave = m.autosave || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));

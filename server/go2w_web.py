@@ -70,6 +70,10 @@ try:
     from slam_toolbox.srv import Pause as SlamPause
 except ImportError:  # pragma: no cover - 只在没有 slam_toolbox 的环境走到
     DeserializePoseGraph = SlamPause = None
+try:
+    from slam_toolbox.srv import SerializePoseGraph
+except ImportError:  # pragma: no cover
+    SerializePoseGraph = None
 from geometry_msgs.msg import Pose2D
 
 import camera as C
@@ -140,6 +144,17 @@ BAT_SOC_OFFSET = 4 + 1039
 # motor_state[i].temperature（int8，℃）：motor_state 从 77 开始、每个 48 字节，temperature 在元素内 +31
 # （11-17 用 11-13/11-16 录包验证：关节角按 FR/FL/RR/RL × 髋/大腿/小腿 排列，12–15 是轮子，温度 23–81 ℃）
 MOTOR_TEMP_OFFSET, MOTOR_STRIDE, MOTOR_N = 4 + 108, 48, 16
+# motor_state[i].reserve[0]（uint32）当错误标志（同 app「狗腿信息 → 错误标志」），在元素内 +39 = temperature 后 8 字节。
+# 11-17 用 go2w-01_1116_172503 录包核对（14772 帧）：16 个电机全程 0（= 正常）；reserve[1] 一直 507/508，不是错误码
+MOTOR_ERR_OFFSET = MOTOR_TEMP_OFFSET + 8
+# 建图自动保存（11-17，用户：「报错自动保存地图」「两分钟太长，三十秒」）：建图时每 AUTOSAVE_PERIOD 秒、
+# 停止建图前、雷达 / FAST-LIO / 里程计出问题时，把当前地图存成 data/maps/autosave_<建图开始时间>，
+# 同一次建图覆盖同一份。只在地图有变化时存；单次存图耗时超过周期的 1/10 就自动拉长间隔，免得拖慢 slam。
+# 只留最近 AUTOSAVE_KEEP 次建图的自动保存（被路线引用的不删）
+AUTOSAVE_PERIOD = float(os.environ.get('GO2W_AUTOSAVE_SECONDS', '30'))
+AUTOSAVE_KEEP = 3
+AUTOSAVE_PREFIX = 'autosave_'
+AUTOSAVE_PROBLEM_GAP = 5.0    # s：出问题时立刻存，但两次之间至少隔这么久
 # 路线启动时离第 1 站不到这么远，就当已在第 1 站、直接去第 2 站：这么短的路径 RotationShim 不会先转正
 # （forward_sampling_distance 0.5），MPPI 只给出很小的速度，Go2W 不执行，会一直卡住
 ROUTE_NEAR_START = 0.5
@@ -394,6 +409,7 @@ class Bridge(Node):
         # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
         self.battery, self.battery_t, self.bat_sub = None, 0.0, None
         self.motor_temp, self.motor_temp_t = None, 0.0   # 16 个电机温度 ℃（顺序见 MOTOR_TEMP_OFFSET）
+        self.motor_info = None   # 同一帧的错误标志，和 motor_temp 一起更新、一起过期
         self.create_timer(BAT_PERIOD, self.poll_battery)
         self.poll_battery()
 
@@ -406,6 +422,7 @@ class Bridge(Node):
         self.match = None        # scan / map 匹配率 %，平滑过
         self.scan_blob, self.scan_ver = None, 0
         self.map_raw = None      # 自动定位用：(OccupancyGrid 原始 int8 栅格 h×w, res, ox, oy)
+        self.map_crc = None      # 最新 /map 内容的 crc32（自动保存判断有没有变化）
         self.scans_base = deque(maxlen=AUTOLOC_SCANS)   # 自动定位用：(收到时间, base_footprint 下的 N×2 点, 收到时是否静止)
         self.odom = None
         self.odom_pose = None    # (x, y, yaw, 收到时间)，odom 坐标系；卡住检测用
@@ -451,6 +468,9 @@ class Bridge(Node):
                           if DeserializePoseGraph is not None else None)
         self.pause_cli = (self.create_client(SlamPause, '/slam_toolbox/pause_new_measurements')
                           if SlamPause is not None else None)
+        # 建图自动保存：直接调 serialize_map（不起 ros2 命令行进程，30 s 一次也不费事）
+        self.ser_cli = (self.create_client(SerializePoseGraph, '/slam_toolbox/serialize_map')
+                        if SerializePoseGraph is not None else None)
         # slam_toolbox 的 pause 是「切换」，调之前必须先读到当前状态（paused_new_measurements）
         self.slam_param_cli = self.create_client(GetParameters, '/slam_toolbox/get_parameters')
 
@@ -509,6 +529,7 @@ class Bridge(Node):
                             info.resolution, info.origin.position.x, info.origin.position.y)
         else:
             self.map_raw = None
+        self.map_crc = zlib.crc32(np.asarray(m.data, dtype=np.int8).tobytes())   # 自动保存用来判断地图变没变
         self.map_ver += 1
         self.get_logger().info(f'map {info.width}x{info.height} @ {info.resolution:.3f} m')
 
@@ -734,6 +755,14 @@ class Bridge(Node):
         return self.loadmap_cli.call_async(req)
 
     # ---------- 续建：从基准 posegraph 恢复 ----------
+    def serialize_posegraph(self, path):
+        """slam_toolbox 把当前位姿图写成 <path>.posegraph / <path>.data（path 不带扩展名）。"""
+        if self.ser_cli is None or not self.ser_cli.service_is_ready():
+            raise RuntimeError('slam_toolbox 的 serialize_map 服务不可用')
+        req = SerializePoseGraph.Request()
+        req.filename = path
+        return self.ser_cli.call_async(req)
+
     def deserialize_posegraph(self, name, pose):
         """slam_toolbox 的 deserialize_map 服务，START_AT_GIVEN_POSE。
 
@@ -745,7 +774,8 @@ class Bridge(Node):
             raise RuntimeError('slam_toolbox 的 deserialize_map 服务不可用（建图没在跑？）')
         req = DeserializePoseGraph.Request()
         req.filename = os.path.join(DATA, 'maps', name)
-        req.match_type = DeserializePoseGraph.START_AT_GIVEN_POSE
+        # srv 里的常量在 rosidl 生成的 Request 类上，服务类本身只有 Request / Response（11-17 真机报 AttributeError）
+        req.match_type = getattr(DeserializePoseGraph.Request, 'START_AT_GIVEN_POSE', 2)
         req.initial_pose = Pose2D(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2]))
         return self.deser_cli.call_async(req)
 
@@ -813,9 +843,15 @@ class Bridge(Node):
                 t = [((data[MOTOR_TEMP_OFFSET + MOTOR_STRIDE*i] + 128) & 0xFF) - 128 for i in range(MOTOR_N)]   # int8
                 if any(t) and all(-30 <= v <= 150 for v in t):   # 全 0 = 电机还没上报
                     self.motor_temp, self.motor_temp_t = t, time.monotonic()
+                    self.motor_info = self._parse_motor_info(data, self.motor_temp_t)
         if self.bat_sub is not None:
             self.destroy_subscription(self.bat_sub)
             self.bat_sub = None
+
+    def _parse_motor_info(self, data, now):
+        if len(data) < MOTOR_ERR_OFFSET + 4 + MOTOR_STRIDE * (MOTOR_N - 1):
+            return None
+        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]}
 
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
@@ -1053,6 +1089,7 @@ class Bridge(Node):
             'armed': self.is_armed() if 'go2w_cmd_bridge' in names else None,
             'battery': self.battery if now - self.battery_t < BAT_STALE else None,
             'motorTemp': self.motor_temp if now - self.motor_temp_t < MOTOR_STALE else None,
+            'motorInfo': self.motor_info if now - self.motor_temp_t < MOTOR_STALE else None,
             'navReady': self.nav.server_is_ready(),
             'nodes': nodes, 'profiles': profiles, 'topics': topics,
             'hasMap': self.map_blob is not None,
@@ -1133,6 +1170,9 @@ class Server:
         # 续建（docs/地图续建.md）：一次会话 = 基准图 + 新图名字 + 起点位姿 + 自检结果
         self.cont = None              # {base, name, source, pose, warn, check, started, paused}
         self.cont_busy = False
+        # 建图自动保存：name = 这次建图的自动保存名；t = 上次存成功的时间；crc = 那时 /map 的 crc
+        self.autosave = {'name': None, 't': 0.0, 'wall': None, 'crc': None, 'dur': None, 'err': None,
+                         'running': False, 'problem': False, 'count': 0}
         self.teleop = None            # (vx, vy, wz, 收到时间)；None = 没有在遥控
         self.maps = P.list_maps(os.path.join(DATA, 'maps'))
         self.bags = P.list_bags(os.path.join(DATA, 'bags'))
@@ -2535,6 +2575,11 @@ class Server:
                 # 「停止全部」不走下面的 if mode 分支，所以重置要放在停档位这一侧：
                 # 建图一停，续建的起点位姿和自检结果都不再成立
                 if 'mapping' in cur:
+                    # 停掉之前先存一份：地图只在 slam_toolbox 内存里，一停就没了（11-16 就这样丢过图）
+                    t_wait = time.monotonic()
+                    while self.autosave['running'] and time.monotonic() - t_wait < 60.0:   # 等正在写的那次写完
+                        await asyncio.sleep(0.2)
+                    await self.autosave_now('停止建图前')
                     self.reset_cont('停止建图')
                 ok = await self.procs.stop_modes()   # supervisor 正常停止导航组和巡逻，不影响控制组
                 self.bridge_t, self.bridge_started = -1e9, False   # 不算异常退出；停完马上可以重新拉起
@@ -2560,6 +2605,8 @@ class Server:
                 self.reset_cont('切换运行档位')
                 self.transitions[mode] = 'starting'
                 self.starting[mode] = time.monotonic()
+                if mode == 'mapping':
+                    self.autosave_new_session()
                 await self.procs.start_mode(mode, map_name)
                 await asyncio.sleep(0.3)
                 await self.refresh_procs()
@@ -2888,6 +2935,138 @@ class Server:
             why = ' | '.join(tail) or f'rsync 退出码 {code}'
             self.uploads[name] = {'state': 'fail', 'pct': last_pct, 'msg': why[-200:]}
             n.event('ERROR', f'上传录包 {name} 失败（退出码 {code}，{dt:.0f} s）：{why[-300:]}')
+
+    # ---------- 建图自动保存 ----------
+    def autosave_new_session(self):
+        """新的一次建图：起一个新的自动保存名（建图开始时间），之前那次的留着。"""
+        a = self.autosave
+        a.update(name=f"{AUTOSAVE_PREFIX}{time.strftime('%m%d_%H%M%S')}", t=time.monotonic(), wall=None,
+                 crc=None, err=None, problem=False, count=0)
+
+    def autosave_view(self):
+        a = self.autosave
+        if not a['name']:
+            return None
+        return {'name': a['name'], 'ago': (time.monotonic() - a['t']) if a['wall'] else None, 'wall': a['wall'],
+                'count': a['count'], 'err': a['err'], 'running': a['running'],
+                'period': self.autosave_period(), 'on': self.prof('mapping') == 'run'}
+
+    def autosave_period(self):
+        # 单次存图（slam 写 posegraph 时会锁住建图）超过周期的 1/10 就拉长间隔，免得拖慢 slam
+        d = self.autosave['dur']
+        return max(AUTOSAVE_PERIOD, 10.0 * d) if d else AUTOSAVE_PERIOD
+
+    def autosave_problem(self):
+        """建图时雷达 / FAST-LIO / 里程计出问题，而 slam_toolbox 还活着：这时要马上存，它可能随时跟着挂。"""
+        n = self.node
+        names = set(n.get_node_names())
+        if 'slam_toolbox' not in names:
+            return None
+        for node, label in (('livox_lidar_publisher', '雷达驱动'), ('fast_lio', 'FAST-LIO')):
+            if node not in names:
+                return f'{label}不在了'
+        if not (bool(n.healthy) and time.monotonic() - n.healthy_t < STALE):
+            return '里程计不可用'
+        return None
+
+    def autosave_tick(self):
+        """procs_poll 每 2 s 调一次：到点了、或刚出问题，就在后台存一次。"""
+        a = self.autosave
+        if self.prof('mapping') != 'run':
+            a['problem'] = False
+            return
+        if not a['name']:
+            self.autosave_new_session()   # 后端重启时建图已经在跑
+        if a['running'] or self.busy or self.map_busy or self.map_loading or self.cont_busy:
+            return
+        now = time.monotonic()
+        problem = self.autosave_problem()
+        if problem and not a['problem'] and now - a['t'] >= AUTOSAVE_PROBLEM_GAP:
+            a['problem'] = True
+            self.background(self.autosave_now(f'建图出问题（{problem}）'))
+            return
+        if not problem:
+            a['problem'] = False
+        if now - a['t'] >= self.autosave_period():
+            self.background(self.autosave_now(None))
+
+    async def autosave_now(self, reason):
+        """存一次。reason=None 是定时保存（只在地图有变化时存、成功不刷日志）。返回 (ok, msg)。"""
+        a, n = self.autosave, self.node
+        if a['running']:
+            return False, '自动保存正在进行'
+        if not a['name']:
+            return False, '没有在建图'
+        raw, crc = n.map_raw, n.map_crc
+        if raw is None:
+            return False, '还没有收到 /map'
+        if crc is not None and crc == a['crc']:
+            a['t'] = time.monotonic()   # 地图没变：不重复写盘，下个周期再看
+            return True, '地图没有变化'
+        a['running'] = True
+        t0 = time.monotonic()
+        maps_dir = os.path.join(DATA, 'maps')
+        tmp_dir = os.path.join(maps_dir, '.autosave_tmp')
+        name = a['name']
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp = os.path.join(tmp_dir, name)
+            res = await self.aw(n.serialize_posegraph(tmp), 60.0)
+            code = getattr(res, 'result', 0)
+            if code not in (0, None):
+                raise RuntimeError(f'serialize_map 返回 {code}')
+            for ext in ('.posegraph', '.data'):
+                if not os.path.isfile(tmp + ext) or os.path.getsize(tmp + ext) == 0:
+                    raise RuntimeError(f'slam_toolbox 没有写出 {name}{ext}')
+            grid, res_m, ox, oy = raw
+            await asyncio.get_running_loop().run_in_executor(None, mapfile.write, tmp, grid, res_m, ox, oy)
+            base = os.path.join(maps_dir, name)
+            for ext in ('.posegraph', '.data', '.pgm', '.yaml'):   # yaml 最后：列表里出现时其余文件已经齐了
+                os.replace(tmp + ext, base + ext)
+                if hasattr(os, 'geteuid') and os.geteuid() == 0:
+                    try:
+                        os.chown(base + ext, 1000, 1000)   # 和 save_map.sh 一样交给 unitree
+                    except OSError:
+                        pass
+        except Exception as e:
+            msg = str(e) or repr(e)
+            if msg != a['err'] or reason:
+                n.event('WARN', f"建图自动保存失败{'（' + reason + '）' if reason else ''}：{msg}")
+            a['err'] = msg
+            a['t'] = time.monotonic()   # 失败也等下个周期再试，别每 2 s 打一次
+            return False, f'自动保存失败：{msg}'
+        finally:
+            a['running'] = False
+        first = a['count'] == 0
+        a.update(t=time.monotonic(), wall=time.time(), crc=crc, dur=time.monotonic() - t0, err=None, count=a['count'] + 1)
+        if first or reason:
+            n.event('INFO', f"建图自动保存{'（' + reason + '）' if reason else ''}：data/maps/{name}"
+                            f"（{a['dur']:.1f} s；建图期间每 {self.autosave_period():.0f} s 覆盖这一份）")
+        if first:
+            self.autosave_prune()
+        self.maps = P.list_maps(maps_dir)
+        return True, f'已自动保存 {name}'
+
+    def autosave_prune(self):
+        """只留最近 AUTOSAVE_KEEP 次建图的自动保存；被路线用到的、正在用的不删。"""
+        maps_dir = os.path.join(DATA, 'maps')
+        try:
+            files = os.listdir(maps_dir)
+        except OSError:
+            return
+        names = sorted({f.split('.', 1)[0] for f in files if f.startswith(AUTOSAVE_PREFIX) and f.endswith('.yaml')})
+        keep = set(names[-AUTOSAVE_KEEP:]) | {self.autosave['name'], self.node.map_current}
+        keep |= {r.get('map') for r in self.routes.values()}
+        for name in names:
+            if name in keep:
+                continue
+            for f in files:
+                if f.split('.', 1)[0] == name:
+                    try:
+                        os.unlink(os.path.join(maps_dir, f))
+                    except OSError:
+                        pass
+            self.node.event('INFO', f'删掉较早的建图自动保存 {name}（只留最近 {AUTOSAVE_KEEP} 次）')
 
     async def save_map(self, name):
         if self.busy or self.map_loading:
@@ -3222,26 +3401,27 @@ class Server:
         raise RuntimeError(f'找不到 {name}（试过 {"; ".join(cands)}）')
 
     async def cont_check(self):
-        """续建自检：用现在扫到的墙和基准图在该位姿下的预测比，量起点位姿到底对不对。
+        """续建自检：把现在扫到的墙按机器人在 slam 里的当前位姿摆到基准图上，量贴合率。
 
         必须做，因为反序列化服务本身不可信：上游读文件失败也 `return true`，而且 response
         是空结构。唯一的判据就是重新量一次贴合率。
+
+        11-17 起不用再停在起点：起点给错的后果是 slam 的 map 坐标系整体偏离基准图，机器人开到
+        哪都带着这个偏差，所以用当前位姿在任何能看到旧墙的地方都量得出来（存图前量还更贴近
+        最终结果）。拿不到 map 坐标系的位姿时才退回起点位姿（这时机器人应当还没动）。
         """
         n = self.node
         if not self.cont:
             return False, '没有正在进行的续建'
         if self.prof('mapping') != 'run':
             return False, '建图没有在跑，量不到 scan'
-        # 自检拿「现在扫到的墙」和「基准图在起点位姿下预测的墙」比：机器人已经开走的话，
-        # 用来变换 scan 的起点位姿就不成立，量出来的偏差是假的，而且会误报成「图对不上」
-        drift_ok, why = MC.check_drift(self.cont['pose'],
-                                       n.lookup(BASE_FRAME) if n.fixed == 'map' else None)
-        if not drift_ok:
-            return False, why
         scans, why = self.autoloc_scans()
         if scans is None:
             return False, f'拿不到可用的 scan（{why}）'
-        pose = self.cont['pose']
+        start = self.cont['pose']
+        cur = n.lookup(BASE_FRAME)          # scan 是静止时的，取现在的位姿就对得上
+        at = 'current' if cur is not None and n.fixed == 'map' else 'start'
+        pose = cur if at == 'current' else start
         pts = np.concatenate(scans).astype(np.float32)
         c, s = math.cos(pose[2]), math.sin(pose[2])
         world = np.stack([pose[0] + c * pts[:, 0] - s * pts[:, 1],
@@ -3273,6 +3453,18 @@ class Server:
             report = json.loads(out.decode().strip().splitlines()[-1])
         except (ValueError, IndexError):
             return False, '自检没有输出可解析的结果'
+        report['at'] = at
+        report['at_pose'] = [round(float(v), 3) for v in pose]
+        moved = math.hypot(pose[0] - start[0], pose[1] - start[1]) > 0.5
+        if not report.get('ok'):
+            fix = MC.start_fix(start, pose, report.get('correction'))
+            if fix is not None:
+                # 修正量是绕当前位置算的，换算成「起点该给多少」，下次开始续建直接用
+                report['start_fix'] = [round(v, 3) for v in fix]
+                report['reason'] = (report.get('reason', '') + f'；换算到起点应为 ({fix[0]:.2f}, {fix[1]:.2f}, '
+                                    f'{math.degrees(fix[2]):.0f}°)')
+            if moved:
+                report['reason'] = report.get('reason', '') + '（自检要站在能看到基准图旧墙的地方，全是新区域时量不准）'
         self.cont['check'] = report
         ok = bool(report.get('ok'))
         n.event('INFO' if ok else 'ERROR', f"续建自检{'通过' if ok else '不通过'}：{report.get('reason', '')}")
@@ -3525,6 +3717,10 @@ class Server:
                 self.stuck_tick()
             except Exception as e:
                 n.get_logger().warn(f'卡住检测失败：{e!r}')
+            try:
+                self.autosave_tick()
+            except Exception as e:
+                n.get_logger().warn(f'建图自动保存检查失败：{e!r}')
             try:
                 await self.bridge_tick()
             except Exception as e:
@@ -3814,7 +4010,7 @@ class Server:
                               autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
-                              cont=self.cont_state())
+                              cont=self.cont_state(), autosave=self.autosave_view())
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
