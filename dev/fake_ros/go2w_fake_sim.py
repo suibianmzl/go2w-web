@@ -361,6 +361,9 @@ class Sim:
             return self.ready('navigation')
         if name.startswith('/map_server/'):
             return self.loc_ready()
+        # 续建：slam_toolbox 的三个服务只在建图档位里存在
+        if name.startswith('/slam_toolbox/'):
+            return self.ready('mapping')
         return False
 
     def call_service(self, name, req):
@@ -368,6 +371,7 @@ class Sim:
         from nav2_msgs.srv import LoadMap
         from rcl_interfaces.msg import ParameterType, ParameterValue, SetParametersResult
         from rcl_interfaces.srv import GetParameters, SetParameters
+        from slam_toolbox.srv import Pause as SlamPause
         from std_srvs.srv import SetBool
         if '/clear_except_' in name:
             from nav2_msgs.srv import ClearCostmapExceptRegion
@@ -383,6 +387,31 @@ class Sim:
         if name == '/map_server/get_parameters':
             # 真机的 map_server：load_map 服务换图后，yaml_filename 参数仍是启动时的那张（11-06 实测）
             return GetParameters.Response([ParameterValue(4, string_value=f'/go2w/data/maps/{self.yaml_param}.yaml')])
+        # 续建用的 slam_toolbox 接口（真机上的字段照 Humble 上游 srv）
+        if name == '/slam_toolbox/deserialize_map':
+            from slam_toolbox.srv import DeserializePoseGraph
+            base = os.path.basename(req.filename)
+            if not os.path.exists(os.path.join(DATA, 'maps', base + '.posegraph')):
+                # 上游读失败也返回成功（response 是空结构），这里照抄——所以要靠事后自检
+                self.plog(40, 'DeserializePoseGraph: Failed to read file: %s' % req.filename)
+                return DeserializePoseGraph.Response()
+            self.cont_load = {'file': req.filename, 'match_type': req.match_type,
+                             'pose': [req.initial_pose.x, req.initial_pose.y, req.initial_pose.theta]}
+            self.plog(20, 'DeserializePoseGraph: 已加载 %s（match_type=%d）' % (base, req.match_type))
+            return DeserializePoseGraph.Response()
+        if name == '/slam_toolbox/pause_new_measurements':
+            self.slam_paused = not getattr(self, 'slam_paused', False)
+            return SlamPause.Response()
+        if name == '/slam_toolbox/get_parameters':
+            from slam_toolbox.srv import Pause as _P  # noqa: F401  确认 srv 包在
+            vals = []
+            for n in req.names:
+                if n == 'paused_new_measurements':
+                    vals.append(ParameterValue(ParameterType.PARAMETER_BOOL,
+                                               bool_value=getattr(self, 'slam_paused', False)))
+                else:
+                    vals.append(ParameterValue(ParameterType.PARAMETER_NOT_SET))
+            return GetParameters.Response(vals)
         if name.endswith('/arm'):
             if req.data:
                 self.armed = True

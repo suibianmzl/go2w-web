@@ -63,7 +63,18 @@ from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 
+# 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
+# 和续建无关，所以缺失时只把续建这条路标成不可用
+try:
+    from slam_toolbox.srv import DeserializePoseGraph
+    from slam_toolbox.srv import Pause as SlamPause
+except ImportError:  # pragma: no cover - 只在没有 slam_toolbox 的环境走到
+    DeserializePoseGraph = SlamPause = None
+from geometry_msgs.msg import Pose2D
+
 import camera as C
+import mapcontinue as MC
+import mapmeta as MM
 import mapfile
 import procs as P
 import robot_ctrl as R
@@ -79,6 +90,14 @@ PLAN_MAX = 500
 ROSOUT_PER_S = 30   # /rosout 转发限流（条 / 秒）
 # 已挂载的持久数据；离线测试可以显式指定临时目录。
 DATA = os.environ.get('GO2W_DATA') or '/go2w/data'
+# 部署在扩展坞上时镜像里的 launch/config 读不到（/opt/go2w/releases 是 root-only），
+# 所以续建核对切片高度时优先读这几处，找不到再用代码里的默认值并明确标注来源
+CONFIG_DIRS = [os.environ.get('GO2W_CONFIG_DIR') or '',
+               os.path.join(DATA, 'config'),
+               '/opt/go2w/config',
+               # V1.0.0.1 运行时镜像里 go2w_bringup 装在这里（11-17 在 go2w_runtime 容器里 find 到的）
+               '/opt/go2w/base/go2w_bringup/share/go2w_bringup/config',
+               '/go2w/ws/src/go2w_bringup/config']
 # 录包上传到常驻服务器 166:~/go2w_bags。密钥在 data/ssh（不随 sync.sh 同步）；166 上这把钥匙被 rrsync 限制成只能往 go2w_bags 写
 UPLOAD_DEST = os.environ.get('GO2W_UPLOAD_DEST', 'evoengine@192.168.1.22:')
 UPLOAD_LABEL = os.environ.get('GO2W_UPLOAD_LABEL', '166:~/go2w_bags')
@@ -420,6 +439,14 @@ class Bridge(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.loadmap_cli = self.create_client(LoadMap, '/map_server/load_map')
         self.mapparam_cli = self.create_client(GetParameters, '/map_server/get_parameters')
+        # 续建：从基准 posegraph 恢复。服务名照核实过的上游源码（slam_toolbox_common.cpp），
+        # 注意 save_map.sh 里用的是 /slam_toolbox/serialize_map，两者同一套命名
+        self.deser_cli = (self.create_client(DeserializePoseGraph, '/slam_toolbox/deserialize_map')
+                          if DeserializePoseGraph is not None else None)
+        self.pause_cli = (self.create_client(SlamPause, '/slam_toolbox/pause_new_measurements')
+                          if SlamPause is not None else None)
+        # slam_toolbox 的 pause 是「切换」，调之前必须先读到当前状态（paused_new_measurements）
+        self.slam_param_cli = self.create_client(GetParameters, '/slam_toolbox/get_parameters')
 
         self.initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -699,6 +726,22 @@ class Bridge(Node):
         req = LoadMap.Request()
         req.map_url = os.path.join(DATA, 'maps', f'{name}.yaml')
         return self.loadmap_cli.call_async(req)
+
+    # ---------- 续建：从基准 posegraph 恢复 ----------
+    def deserialize_posegraph(self, name, pose):
+        """slam_toolbox 的 deserialize_map 服务，START_AT_GIVEN_POSE。
+
+        为什么不信返回值：Humble 上游 deserializePoseGraphCallback 在文件读失败时也是
+        `return true`，而且 DeserializePoseGraph.srv 的 response 段是空的（没有 result）。
+        所以这里只负责把请求发出去，图到底加载没有交给 map_overlap_check.py 量。
+        """
+        if not self.deser_cli.service_is_ready():
+            raise RuntimeError('slam_toolbox 的 deserialize_map 服务不可用（建图没在跑？）')
+        req = DeserializePoseGraph.Request()
+        req.filename = os.path.join(DATA, 'maps', name)
+        req.match_type = DeserializePoseGraph.START_AT_GIVEN_POSE
+        req.initial_pose = Pose2D(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2]))
+        return self.deser_cli.call_async(req)
 
     def fetch_map_current(self):
         if not self.mapparam_cli.service_is_ready():
@@ -1075,6 +1118,9 @@ class Server:
             pass
         self.preview_key = None       # 已经显示的文件地图 (名字, 修改时间)；导航 / 建图在跑时为 None
         self.map_busy = False         # 保存和导出地图期间保护源快照及目标文件
+        # 续建（docs/地图续建.md）：一次会话 = 基准图 + 新图名字 + 起点位姿 + 自检结果
+        self.cont = None              # {base, name, source, pose, warn, check, started, paused}
+        self.cont_busy = False
         self.teleop = None            # (vx, vy, wz, 收到时间)；None = 没有在遥控
         self.maps = P.list_maps(os.path.join(DATA, 'maps'))
         self.bags = P.list_bags(os.path.join(DATA, 'bags'))
@@ -1367,6 +1413,19 @@ class Server:
                 return await self.align_map(d.get('source'), d.get('name'), d.get('angle'))
             if op == 'load_map':
                 return await self.load_map(d.get('name', ''))
+            if op == 'cont_preflight':
+                return self.cont_preflight(d.get('base'))
+            if op == 'cont_start':
+                return await self.cont_start(d.get('base'), d.get('name'), d.get('pose'),
+                                            d.get('source'), d.get('reason'))
+            if op == 'cont_check':
+                return await self.cont_check()
+            if op == 'cont_finish':
+                return await self.cont_finish(d.get('reason'))
+            if op == 'cont_abort':
+                return await self.cont_abort()
+            if op == 'cont_parking':
+                return self.cont_parking(d.get('base'), d.get('clear'))
             return False, f'不支持的操作：{op}'
         except asyncio.TimeoutError:
             return False, '对方没有响应（超时）'
@@ -2377,6 +2436,10 @@ class Server:
                     self.transitions[m] = 'stopping'
                 if n.is_armed() or n.nav_active():
                     await self.disarm_and_cancel('切换运行档位')
+                # 「停止全部」不走下面的 if mode 分支，所以重置要放在停档位这一侧：
+                # 建图一停，续建的起点位姿和自检结果都不再成立
+                if 'mapping' in cur:
+                    self.reset_cont('停止建图')
                 ok = await self.procs.stop_modes()   # supervisor 正常停止导航组和巡逻，不影响控制组
                 self.bridge_t, self.bridge_started = -1e9, False   # 不算异常退出；停完马上可以重新拉起
                 await self.refresh_procs()
@@ -2396,6 +2459,9 @@ class Server:
             if mode:
                 self.autoloc = {'state': 'idle', 'seq': self.autoloc['seq']}   # 上一轮的自动定位结果作废
                 self.autoloc_reset()   # FAST-LIO 重启，odom 坐标系变了
+                # 续建会话跟着建图档位走：档位一换，起点位姿和自检结果都作废。
+                # 不清的话，停掉建图再重开后界面还显示上一个起点位姿，而它已经不对了
+                self.reset_cont('切换运行档位')
                 self.transitions[mode] = 'starting'
                 self.starting[mode] = time.monotonic()
                 await self.procs.start_mode(mode, map_name)
@@ -2749,6 +2815,440 @@ class Server:
             return False, '保存失败：' + (P.tail(os.path.join(DATA, 'logs', 'save_map.log'), 6) or '看 data/logs/save_map.log')
         finally:
             self.map_busy = False
+
+    # ---------- 续建（docs/地图续建.md） ----------
+    # 一次续建 = 基准图 + 新图名字 + 起点位姿 + 自检。四步都是显式动作，不串成一个大流程：
+    # 起点位姿给错不会报错，只能靠人在中间看一眼自检结果。
+    PARKING_FILE = 'parkings.json'
+
+    def parkings(self):
+        """data/parkings.json：按基准图名存的续建停车点 {'<map>': {'pose': [x, y, yaw]}}。"""
+        path = os.path.join(DATA, self.PARKING_FILE)
+        try:
+            with open(path, encoding='utf-8') as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        out = {}
+        for name, rec in (raw or {}).items():
+            pose = (rec or {}).get('pose')
+            if (isinstance(name, str) and P.SAFE_NAME.fullmatch(name)
+                    and isinstance(pose, (list, tuple)) and len(pose) == 3
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in pose)):
+                out[name] = {'pose': [float(v) for v in pose]}
+        return out
+
+    def set_parking(self, base, pose=None):
+        """把机器人现在的位置记成这张基准图的续建停车点；pose=None 是删掉。
+
+        停车点是三级降级里的第 1 级：机器人停在框内就直接用，可重复、零耗时，
+        也是唯一不需要每次重新定位的一级。
+        """
+        if not isinstance(base, str) or not P.SAFE_NAME.fullmatch(base):
+            return False, '基准图名不合法'
+        path = os.path.join(DATA, self.PARKING_FILE)
+        data = {k: v for k, v in self.parkings().items()}
+        if pose is None:
+            if base not in data:
+                return False, f'{base} 上没有存过停车点'
+            del data[base]
+            msg = f'已删掉 {base} 的续建停车点'
+        else:
+            if not (isinstance(pose, (list, tuple)) and len(pose) == 3
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                            and math.isfinite(v) for v in pose)):
+                return False, '位姿必须是 [x, y, yaw]'
+            data[base] = {'pose': [float(pose[0]), float(pose[1]), MC.normalize_yaw(pose[2])]}
+            msg = (f"已记下 {base} 的续建停车点 "
+                   f"({pose[0]:.2f}, {pose[1]:.2f}, {math.degrees(pose[2]):.0f}°)")
+        tmp = path + '.tmp'
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except OSError as e:
+            return False, f'存不下停车点：{e}'
+        self.node.event('INFO', msg)
+        return True, msg
+
+    def current_parking_pose(self):
+        """现在就能当停车点用的位姿：有 map→base_footprint 才有意义（没有定位就是在猜）。"""
+        n = self.node
+        if n.fixed != 'map':
+            return None
+        return n.lookup(BASE_FRAME)
+
+    def cont_state(self):
+        """推给网页的续建状态。None 表示没有正在进行的续建。"""
+        if not self.cont:
+            return None
+        c = self.cont
+        return {'active': True, 'base': c['base'], 'name': c['name'], 'source': c['source'],
+                'pose': c['pose'], 'note': c['note'], 'warn': c['warn'],
+                'check': c.get('check'), 'elapsed': round(time.monotonic() - c['started'], 1)}
+
+    def cont_preflight(self, base):
+        """续建前能不能开始。不动机器人，纯查文件。"""
+        if not isinstance(base, str) or not P.SAFE_NAME.fullmatch(base):
+            return False, '基准图名不合法'
+        maps_dir = os.path.join(DATA, 'maps')
+        slice_now, slice_src = self._slice_now()
+        # 读不到真实配置时不能拿默认值去比：那会以「和基准一致」通过，而实际上什么都没核对。
+        # 传 None 让 preflight 走「没有记录，无法核对」那条告警。
+        # _slice_now() 读到文件时返回的来源是文件路径，读不到才是 'default'（以前这里比的是 'config'，
+        # 永远不成立：读到了也从没和基准比过，还一直报「读不到」）
+        found_slice = slice_src != 'default'
+        checked_slice = slice_now if found_slice else None
+        policy, policy_src = MM.current_policy()
+        ok, reasons, warns = MM.preflight(maps_dir, base, policy=policy,
+                                          slice_now=checked_slice)
+        if not policy:
+            warns.append('读不到当前运控策略（环境变量和 runtime.env 里都没有 GO2W_CONTROL_POLICY），'
+                         '没法核对站姿——续建前请确认没换过策略')
+        if not found_slice:
+            warns.append(f'读不到 pcl2scan_slam.yaml，没法核对切片高度（用的是默认值 '
+                         f'{slice_now[0]:.2f}–{slice_now[1]:.2f} m）——续建前请确认它没被改过')
+        park = self.parkings().get(base)
+        detail = {'base': base, 'ok': ok, 'reasons': reasons, 'warns': warns,
+                  'chain': MM.lineage(maps_dir, base), 'slice': slice_now, 'slice_source': slice_src,
+                  'policy': policy, 'policy_source': policy_src, 'parking': park.get('pose') if park else None}
+        if not ok:
+            return False, '；'.join(reasons), detail
+        return True, ('可以续建' + ('（注意：' + '；'.join(warns) + '）' if warns else '')), detail
+
+    def _base_grid(self, name):
+        """基准图的栅格，判断起点在不在覆盖范围内。
+
+        mapfile.load 返回的是 dict（grid/res/ox/oy），不是 map_overlap_check.BaseMap。
+        这里包一层 with_inside：只要 (ox, oy, w, h, res) 就够了，不需要 BaseMap 全套。
+        """
+        try:
+            rec = mapfile.load(os.path.join(DATA, 'maps', f'{name}.yaml'))
+        except (OSError, ValueError, KeyError) as e:
+            raise RuntimeError(f'读不出基准图 {name}：{e}') from e
+        h, w = rec['grid'].shape
+        return (rec['ox'], rec['oy'], w, h, rec['res'])
+
+    def _slice_now(self):
+        for d in CONFIG_DIRS:
+            if d:
+                got, src = MM.current_slice(config_dir=d)
+                if src == 'config':
+                    return got, os.path.join(d, 'pcl2scan_slam.yaml')
+        return MM.current_slice(config_dir='/nonexistent')
+
+    async def _globloc_now(self, base):
+        """拿当前静止 scan 在**基准图**上做全局定位，返回 globloc 的结果 dict 或 None。
+
+        为什么不用 n.map_raw：建图档位跑着的时候 /map 是 slam_toolbox 的实时图（此刻还是空的
+        或只有刚扫到的一点），拿它去定位会得到完全无关的位置。续建要找的是磁盘上那张基准图。
+        """
+        scans, _ = self.autoloc_scans()
+        if scans is None:
+            return None
+        try:
+            rec = mapfile.load(os.path.join(DATA, 'maps', f'{base}.yaml'))
+        except (OSError, ValueError, KeyError) as e:
+            self.node.event('WARN', f'自动定位读不出基准图 {base}：{e}')
+            return None
+        # globloc 要 OccupancyGrid 的原始 int8（未知是 -1），mapfile.load 给的正是这个口径
+        grid = np.ascontiguousarray(rec['grid'].astype(np.int8))
+        fd, path = tempfile.mkstemp(prefix='go2w_cont_', suffix='.npz')
+        os.close(fd)
+        try:
+            np.savez(path, grid=grid, res=rec['res'], origin=np.array([rec['ox'], rec['oy']]),
+                     pts=np.concatenate(scans).astype(np.float32))
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
+            proc = await asyncio.create_subprocess_exec(
+                'nice', '-n', '10', 'python3', script, path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, _ = await asyncio.wait_for(proc.communicate(), AUTOLOC_TIMEOUT)
+            if proc.returncode != 0:
+                return None
+            return json.loads(out.decode().strip().splitlines()[-1])
+        except (asyncio.TimeoutError, ValueError, OSError):
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    async def set_slam_paused(self, want):
+        """暂停 / 恢复 slam_toolbox 收新 scan。
+
+        `pause_new_measurements` 是**切换**服务（上游 pauseNewMeasurementsCallback 里是
+        `state_.set(NEW_MEASUREMENTS, !curr_state)`），盲目调一次会把状态翻过来。所以先读
+        镜像参数 `paused_new_measurements`（上游在同一个回调里 set_parameter），不一样才翻，
+        翻完再读一次确认。读不到就明确报错，不猜。
+        """
+        n = self.node
+        cli = getattr(n, 'pause_cli', None)
+        param_cli = getattr(n, 'slam_param_cli', None)
+        if cli is None or param_cli is None:
+            raise RuntimeError('这个镜像里的 slam_toolbox 没有 pause 接口')
+        if not cli.service_is_ready() or not param_cli.service_is_ready():
+            raise RuntimeError('slam_toolbox 还没起来')
+
+        async def paused_now():
+            req = GetParameters.Request()
+            req.names = ['paused_new_measurements']
+            r = await self.aw(param_cli.call_async(req), 3.0)
+            values = getattr(r, 'values', None) or []
+            if not values or values[0].type == ParameterType.PARAMETER_NOT_SET:
+                return None
+            return bool(values[0].bool_value)
+
+        cur = await paused_now()
+        if cur is None:
+            raise RuntimeError('读不到 paused_new_measurements，无法确认扫描状态')
+        if cur == bool(want):
+            return
+        await self.aw(cli.call_async(SlamPause.Request()), 3.0)
+        await asyncio.sleep(0.3)
+        after = await paused_now()
+        if after is None or after != bool(want):
+            raise RuntimeError(f'切换扫描状态没生效（想要 {"暂停" if want else "恢复"}，现在是 {after}）')
+
+    async def cont_start(self, base, name, pose, source, reason):
+        """开一次续建：定起点位姿 → 暂停收 scan → 反序列化基准图 → 恢复收 scan。"""
+        n = self.node
+        if self.cont_busy:
+            return False, '上一次续建操作还没完成'
+        if self.busy or self.map_busy or self.map_loading:
+            return False, '档位或地图正在切换，请稍等'
+        if self.prof('mapping') != 'run':
+            return False, '续建要先让「建图」跑起来（slam_toolbox 在 mapping 档）'
+        if not isinstance(base, str) or not P.SAFE_NAME.fullmatch(base):
+            return False, '基准图名不合法'
+        if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
+            return False, '新图名只能用字母、数字、下划线和减号'
+        if name == base:
+            return False, '续建必须另存新名字，不能覆盖基准图'
+        ok, msg, detail = self.cont_preflight(base)
+        if not ok:
+            return False, msg, detail
+        self.cont_busy = True
+        try:
+            # 决定起点位姿。source='manual' 表示人明确指定，跳过前两级
+            globloc = None
+            if source != 'manual':
+                robot = n.lookup(BASE_FRAME) if n.fixed == 'map' else None
+                parking = self.parkings().get(base)
+                if not (parking and MC.choose_parking(parking, robot)[0]):
+                    globloc = await self._globloc_now(base)
+                settled = MC.settle(parking, robot, globloc,
+                                    manual=pose if source == 'manual' else None,
+                                    force='manual' if source == 'manual' else None)
+            else:
+                settled = MC.settle(None, None, None, manual=pose, force='manual')
+            if not settled['source']:
+                why = '；'.join(f'{MC.SOURCE_NOTE[k]}：{v}' for k, v in settled['tried'])
+                return False, f'定不了起点位姿（{why or settled["note"]}）', {'tried': settled['tried']}
+            base_grid = self._base_grid(base)
+            good, why = MC.check_start(base_grid, settled['pose'])
+            if not good:
+                return False, why, {'pose': settled['pose'], 'source': settled['source']}
+
+            # 先暂停：反序列化之前进来几帧 scan 会先建出少量新节点，之后清不掉
+            paused = False
+            try:
+                await self.set_slam_paused(True)
+                paused = True
+            except Exception as e:
+                n.event('WARN', f'没能暂停收 scan（{e}）：反序列化前可能有几帧新节点')
+            try:
+                await self.aw(n.deserialize_posegraph(base, settled['pose']), 30.0)
+            except Exception as e:
+                if paused:
+                    try:
+                        await self.set_slam_paused(False)
+                    except Exception:
+                        pass
+                return False, f'反序列化失败：{e}'
+            finally:
+                if paused:
+                    try:
+                        await self.set_slam_paused(False)
+                    except Exception as e:
+                        n.event('ERROR', f'恢复收 scan 失败（{e}）：机器人现在采不了新数据')
+
+            gl = None
+            if globloc and 'score' in globloc:
+                gl = {'score': globloc.get('score'), 'ratio': globloc.get('ratio')}
+            self.cont = {'base': base, 'name': name, 'source': settled['source'],
+                         'pose': settled['pose'], 'note': settled['note'], 'warn': settled['warn'],
+                         'reason': reason if isinstance(reason, str) else None,
+                         'globloc': gl, 'check': None, 'started': time.monotonic()}
+            note = f"续建已开始：基准 {base} → 新图 {name}，起点 {settled['note']}"
+            n.event('WARN' if settled['warn'] else 'INFO', f'{note}（{self.remote(self.owner) if self.owner else "网页"}）')
+            if settled['warn']:
+                n.event('WARN', settled['warn'])
+            return True, note, {'source': settled['source'], 'pose': settled['pose'],
+                                'warn': settled['warn'], 'tried': settled['tried'], 'detail': detail}
+        finally:
+            self.cont_busy = False
+
+    def _tool_script(self, name):
+        """找工具脚本。扩展坞上 release 里是 web/current/tools，仓库里是 scripts/calib。
+        找到了才返回路径，找不到明确抛错——静默降级会让「自检没跑」被误当成「自检通过」。"""
+        here = os.path.dirname(os.path.abspath(__file__))
+        cands = [os.path.join(here, name),                       # 和 server 放一起（工具目录）
+                 os.path.join(here, '..', 'tools', name),        # web/current/tools
+                 os.path.join(here, '..', '..', 'scripts', 'calib', name),  # 仓库
+                 os.path.join('/opt/go2w/console/tools', name)]
+        for p in cands:
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+        raise RuntimeError(f'找不到 {name}（试过 {"; ".join(cands)}）')
+
+    async def cont_check(self):
+        """续建自检：用现在扫到的墙和基准图在该位姿下的预测比，量起点位姿到底对不对。
+
+        必须做，因为反序列化服务本身不可信：上游读文件失败也 `return true`，而且 response
+        是空结构。唯一的判据就是重新量一次贴合率。
+        """
+        n = self.node
+        if not self.cont:
+            return False, '没有正在进行的续建'
+        if self.prof('mapping') != 'run':
+            return False, '建图没有在跑，量不到 scan'
+        # 自检拿「现在扫到的墙」和「基准图在起点位姿下预测的墙」比：机器人已经开走的话，
+        # 用来变换 scan 的起点位姿就不成立，量出来的偏差是假的，而且会误报成「图对不上」
+        drift_ok, why = MC.check_drift(self.cont['pose'],
+                                       n.lookup(BASE_FRAME) if n.fixed == 'map' else None)
+        if not drift_ok:
+            return False, why
+        scans, why = self.autoloc_scans()
+        if scans is None:
+            return False, f'拿不到可用的 scan（{why}）'
+        pose = self.cont['pose']
+        pts = np.concatenate(scans).astype(np.float32)
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        world = np.stack([pose[0] + c * pts[:, 0] - s * pts[:, 1],
+                          pose[1] + s * pts[:, 0] + c * pts[:, 1]], 1)
+        fd, path = tempfile.mkstemp(prefix='go2w_cont_check_', suffix='.npz')
+        os.close(fd)
+        try:
+            np.savez(path, pts=world.astype(np.float32))
+            script = self._tool_script('map_overlap_check.py')
+            base_yaml = os.path.join(DATA, 'maps', f"{self.cont['base']}.yaml")
+            proc = await asyncio.create_subprocess_exec(
+                'nice', '-n', '10', 'python3', script, base_yaml, path, '--json',
+                f'--pivot={pose[0]:.4f},{pose[1]:.4f}',   # 角度修正绕起点转，不是绕地图原点
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), 90.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return False, '自检 90 s 内没有算完'
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if proc.returncode not in (0, 1):
+            lines = err.decode(errors='replace').strip().splitlines()
+            return False, '自检失败：' + (lines[-1] if lines else f'退出码 {proc.returncode}')
+        try:
+            report = json.loads(out.decode().strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return False, '自检没有输出可解析的结果'
+        self.cont['check'] = report
+        ok = bool(report.get('ok'))
+        n.event('INFO' if ok else 'ERROR', f"续建自检{'通过' if ok else '不通过'}：{report.get('reason', '')}")
+        return ok, report.get('reason', ''), report
+
+    async def cont_finish(self, reason):
+        """收工：另存新名字 → 写 meta.json → 把路线指到新图。基准图一个字节都不动。"""
+        n = self.node
+        c = self.cont
+        if not c:
+            return False, '没有正在进行的续建'
+        if not c.get('check') or not c['check'].get('ok'):
+            return False, '先跑自检并通过（起点位姿不对就存图，等于把双线墙固化下来）'
+        if self.busy or self.map_busy:
+            return False, '档位或地图正在切换，请稍等'
+        self.map_busy = True
+        try:
+            ok, msg = await self.save_map(c['name'])
+            if not ok:
+                return False, msg
+            maps_dir = os.path.join(DATA, 'maps')
+            slice_now, _ = self._slice_now()
+            meta = MM.build(c['name'], c['base'], c['pose'], c['source'],
+                            globloc=c.get('globloc'), check=c['check'],
+                            policy=MM.current_policy()[0], slice=slice_now,
+                            free_thresh_saved=MM.FREE_THRESH_DEFAULT,
+                            git_revision=os.environ.get('GO2W_GIT_REVISION'),
+                            reason=(reason if isinstance(reason, str) and reason.strip() else c.get('reason')),
+                            tool='web-continue')
+            MM.write(maps_dir, meta)
+            changed = 0
+            try:
+                with open(self.routes_file, encoding='utf-8') as f:
+                    raw = json.load(f)
+                new, changed = MM.retarget_routes(raw, c['base'], c['name'])
+                if changed:
+                    tmp = self.routes_file + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        json.dump(new, f, ensure_ascii=False, indent=1)
+                    os.replace(tmp, self.routes_file)
+                    self.routes = {r['id']: self.route_record(r, r['id'], strict=False) for r in new}
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                n.event('WARN', f'路线没能改到新图（{e}）：需要手动把任务地图切到 {c["name"]}')
+            self.maps = P.list_maps(maps_dir)
+            self.cont = None
+            tail = f'，{changed} 条任务已指到新图' if changed else ''
+            n.event('INFO', f"续建完成：{c['name']}（基准 {c['base']} 未改动）{tail}")
+            return True, f'已保存 {c["name"]}，基准 {c["base"]} 未改动{tail}'
+        finally:
+            self.map_busy = False
+
+    def cont_parking(self, base, clear=False):
+        """把机器人现在的位置记成（或清掉）这张基准图的续建停车点。"""
+        if not isinstance(base, str) or not P.SAFE_NAME.fullmatch(base):
+            return False, '基准图名不合法'
+        if clear:
+            return self.set_parking(base, None)
+        pose = self.current_parking_pose()
+        if pose is None:
+            return False, ('现在没有 map 定位，记不了停车点：'
+                           '没有 map→base_footprint 的话记下来的位置是错的')
+        ok, msg = self.set_parking(base, list(pose))
+        if ok:
+            # 位置记下来了，但还要确认它在这张图里
+            try:
+                good, why = MC.check_start(self._base_grid(base), list(pose))
+            except RuntimeError as e:
+                return True, f'{msg}；但读不出基准图核对覆盖范围：{e}'
+            if not good:
+                return True, f'{msg}；注意：{why}'
+        return ok, msg
+
+    def reset_cont(self, why=''):
+        """丢掉续建会话。档位一换、基准图换了，起点位姿就不再成立——留着比清掉更危险。"""
+        if not self.cont:
+            return False
+        name = self.cont['name']
+        self.cont = None
+        if why:
+            self.node.event('WARN', f'续建会话已作废（{why}）：{name} 没有保存，'
+                                    f'建图档位里已有的节点仍在')
+        return True
+
+    async def cont_abort(self):
+        """放弃这次续建。**已经建进去的节点清不掉**——这是 slam_toolbox 的硬限制，
+        所以要说清楚：想干净就只能重启建图档位。"""
+        if not self.cont:
+            return False, '没有正在进行的续建'
+        self.cont = None
+        self.node.event('WARN', '已放弃这次续建：建图档位里已有的节点不会消失，'
+                                '想要干净的地图请停掉建图再重新开始')
+        return True, '已放弃；建图档位里已有的节点仍在，要干净就停掉建图重开'
 
     async def align_map(self, source, name, angle):
         if self.busy or self.map_loading:
@@ -3156,7 +3656,8 @@ class Server:
                               procsKnown=self.procs_status is not None, teleop=self.teleop is not None,
                               autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
-                              bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None)
+                              bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
+                              cont=self.cont_state())
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):

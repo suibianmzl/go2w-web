@@ -13,8 +13,9 @@ class ParameterType:
 
 
 class ParameterValue:
-    def __init__(self, type=0, double_value=0.0, integer_value=0, string_value=''):
-        self.type, self.double_value, self.integer_value, self.string_value = type, double_value, integer_value, string_value
+    def __init__(self, type=0, double_value=0.0, integer_value=0, string_value='', bool_value=False):
+        self.type, self.double_value, self.integer_value = type, double_value, integer_value
+        self.string_value, self.bool_value = string_value, bool_value
 
 
 class Parameter:

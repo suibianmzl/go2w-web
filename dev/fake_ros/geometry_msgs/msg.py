@@ -21,3 +21,10 @@ class PoseWithCovarianceStamped:
     def __init__(self):
         self.header = N(frame_id='', stamp=N(sec=0, nanosec=0))
         self.pose = N(pose=_pose(), covariance=[0.0] * 36)
+
+
+class Pose2D:
+    """slam_toolbox 的 DeserializePoseGraph.initial_pose 用的就是这个（x, y, theta 弧度）。"""
+
+    def __init__(self, x=0.0, y=0.0, theta=0.0):
+        self.x, self.y, self.theta = x, y, theta

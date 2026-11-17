@@ -29,6 +29,8 @@ export function createStore(){
     mapViews: {},
     mapSaving: false,
     mapBusy: false,
+    // 续建（docs/地图续建.md）：{active, base, name, source, pose, note, warn, check:{ok,fit,...}, elapsed}
+    cont: null,
     // task.phase: plan | align | follow | final | dwell | arrived
     task: { type: 'idle' },
     armed: null, estop: false, odomOk: false,

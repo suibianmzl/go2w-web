@@ -435,6 +435,33 @@ export function createMockSource(store, bus){
       return { ok: true, msg: `模拟保存 ${name}，实际文件请在本地后端模式中验证` };
     },
     loadMap(name){ store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
+    // 续建：模拟模式只走流程，不碰真文件（基准检查、起点位姿、自检的门限在 test_mapmeta / test_mapcontinue 里测）
+    contPreflight(base){
+      const has = store.maps.some(m => m.name === base);
+      return { ok: has, msg: has ? '可以续建（模拟）' : `没有基准图 ${base}`, preflight: { base, chain: [base], warns: [] } };
+    },
+    contStart(base, name, pose, source){
+      if (name === base) return { ok: false, msg: '续建必须另存新名字' };
+      store.cont = { active: true, base, name, source: source || 'parking', pose: pose || [0, 0, 0],
+        note: '模拟起点位姿', warn: '', check: null, elapsed: 0 };
+      log('INFO','slam_toolbox',`续建（模拟）：${base} → ${name}`);
+      return { ok: true, msg: `续建已开始（模拟）：${base} → ${name}` };
+    },
+    contCheck(){
+      if (!store.cont) return { ok: false, msg: '没有正在进行的续建' };
+      store.cont = { ...store.cont, check: { ok: true, fit: 0.93, fit_best: 0.97, correction: [0.02, -0.01, 0.3], reason: '模拟自检通过' } };
+      return { ok: true, msg: '自检通过（模拟）' };
+    },
+    contFinish(reason){
+      const c = store.cont;
+      if (!c) return { ok: false, msg: '没有正在进行的续建' };
+      if (!c.check?.ok) return { ok: false, msg: '先跑自检并通过' };
+      store.maps.unshift({ name: c.name, meta:`${GW}×${GH} · 0.05 m` });
+      store.cont = null;
+      log('INFO','slam_toolbox',`续建完成（模拟）：${c.name}`);
+      return { ok: true, msg: `已保存 ${c.name}（模拟）` };
+    },
+    contAbort(){ store.cont = null; return { ok: true, msg: '已放弃（模拟）' }; },
     simulateDrop(){ if (!S.link) return; S.link = false; log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
       setTimeout(() => {
         if (routeActive()) cancelTask('网页断开，已取消路线任务');

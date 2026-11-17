@@ -40,11 +40,24 @@ def _seconds(value):
 
 
 class RuntimeProcs:
-    def __init__(self, sock=None, data_dir=None, tools_dir='/opt/go2w/console/tools'):
+    def __init__(self, sock=None, data_dir=None, tools_dir=None):
         self.sock = str(sock or os.environ.get('GO2W_SUPERVISOR_SOCKET', '/run/go2w/supervisor.sock'))
         self.data_dir = Path(data_dir or os.environ.get('GO2W_DATA', '/go2w/data'))
-        self.tools_dir = Path(tools_dir)
+        self.tools_dir = Path(tools_dir or os.environ.get('GO2W_TOOLS_DIR')
+                              or self.default_tools_dir())
         self._helpers = set()
+
+    @staticmethod
+    def default_tools_dir():
+        """工具脚本目录。扩展坞上网页 release 里是 /opt/go2w/web/current/tools（tools 和 server 同级），
+        旧文档写的 /opt/go2w/console/tools 是镜像内打包的布局。两处都试，按存在顺序取。"""
+        here = Path(__file__).resolve().parent          # …/server
+        for cand in (here.parent/'tools',            # web/current/tools：和 server 同级
+                     Path('/opt/go2w/console/tools'),  # 镜像内打包
+                     Path('/go2w/web/tools')):         # 仓库挂载（.q 本地调试）
+            if cand.is_dir():
+                return str(cand)
+        return str(here.parent/'tools')
 
     def available(self):
         try:

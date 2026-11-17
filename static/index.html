@@ -355,6 +355,17 @@
               <div class="inrow"><input id="mapName" aria-label="地图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="saveMap">保存</button></div>
             </div>
           </div>
+          <div class="step" id="mpCont" data-s="todo">
+            <div class="step-h"><div class="step-n"><span>C</span></div><div class="step-t">续建已有地图<span class="step-s" id="mpContSub"></span></div></div>
+            <div class="step-b">
+              <p class="hint">在已有地图上继续采集，把新区域并进同一张图（扩范围、补盲区、补新开的门洞）。<b>只能加不能删</b>：挪走的家具在旧图里仍然占着位置。续建永远另存新名字，基准图不动。</p>
+              <div class="inrow"><select id="contBase" aria-label="续建基准图"></select><button class="btn sm" id="contPre" title="只查文件，不动机器人">检查基准</button></div>
+              <div class="inrow"><input id="contName" aria-label="续建后的新图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="contStart" disabled>开始续建</button></div>
+              <div class="inrow"><button class="btn sm ghost" id="contPark" title="把机器人现在的位置记成这张图的续建停车点：下次停在这儿就直接用，不用重新定位">把当前位置记成停车点</button><button class="btn sm ghost" id="contParkClear" title="删掉这张图的续建停车点">删除停车点</button></div>
+              <div class="meta" id="contStatus"></div>
+              <div class="inrow" id="contRow" hidden><button class="btn sm" id="contCheck">自检</button><button class="btn sm pri" id="contFinish" disabled>收工保存</button><button class="btn sm ghost" id="contAbort">放弃</button></div>
+            </div>
+          </div>
           <div class="step" id="mpEnd" data-s="todo">
             <div class="step-h"><div class="step-n"><span>5</span></div><div class="step-t">结束建图<span class="step-s" id="mpEndSub"></span></div></div>
             <div class="step-b">

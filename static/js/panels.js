@@ -327,6 +327,59 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#saveMap').disabled = busy;
     $('#mapName').disabled = busy;
   }
+  /* ---------- 续建 ---------- */
+  // 基准图只能选带完整 posegraph + data 的：slam_toolbox 只能从这两件恢复图，
+  // 光有 pgm/yaml 的图（lab_20261021 就是）续建无从谈起。
+  let contBaseFilled = null;
+  function renderCont(){
+    const c = store.cont, busy = store.mapSaving || store.mapBusy;
+    // 基准图下拉：列出所有地图，标一下有没有 posegraph（后端 preflight 会把关，这里只做提示）
+    const names = store.maps.map(m => m.name);
+    if (contBaseFilled !== names.join(',')){
+      contBaseFilled = names.join(',');
+      const sel = $('#contBase'), keep = sel.value;
+      sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
+      if (names.includes(keep)) sel.value = keep;
+      else { const def = names.find(n => n === 'lab_20261116') || names[0]; if (def) sel.value = def; }
+    }
+    const base = $('#contBase').value;
+    const nameIn = $('#contName');
+    if (!nameIn.value && base) nameIn.value = `${base}_c1`;
+    $('#contPre').disabled = busy || !base;
+    $('#contStart').disabled = busy || !run('mapping') || !base || !!c;
+    $('#contRow').hidden = !c;
+    $('#contCheck').disabled = !c || busy;
+    $('#contFinish').disabled = !c || busy || !c.check?.ok;
+    $('#contAbort').disabled = !c;
+    const st = $('#contStatus');
+    let text = '';
+    if (c){
+      const chk = c.check;
+      text = `${c.base} → ${c.name} · 起点 ${c.source === 'parking' ? '停车点' : c.source === 'globloc' ? '自动定位' : '手动'}`
+        + ` (${c.pose[0].toFixed(2)}, ${c.pose[1].toFixed(2)}, ${(c.pose[2]*180/Math.PI).toFixed(0)}°)`
+        + (chk ? (chk.ok ? ` · 自检通过（贴合率 ${(chk.fit*100).toFixed(0)}%）` : ` · 自检没通过：${chk.reason || ''}`) : ' · 还没自检')
+        + (c.warn ? ` · ${c.warn}` : '');
+      st.classList.toggle('warn', !!c.warn || (chk && !chk.ok));
+    } else if (store.contPre){
+      const p = store.contPre;
+      text = (p.reasons?.length ? '不能续建：' + p.reasons.join('；') : '可以续建')
+        + (p.chain?.length > 1 ? ` · 链 ${p.chain.join(' → ')}` : '')
+        + (p.warns?.length ? ` · 注意：${p.warns.join('；')}` : '');
+      st.classList.toggle('warn', !p.ok);
+    } else {
+      text = '选中基准图后点「检查基准」（只查文件，不动机器人）。';
+      st.classList.remove('warn');
+    }
+    if (st.textContent !== text) st.textContent = text;
+  }
+  $('#contPre').onclick = () => actions.contPreflight($('#contBase').value);
+  $('#contBase').onchange = () => { contBaseFilled = null; $('#contName').value = ''; store.contPre = null; renderCont(); };
+  $('#contStart').onclick = () => actions.contStart($('#contBase').value, $('#contName').value.trim(), null, null);
+  $('#contPark').onclick = () => actions.contParking($('#contBase').value, false);
+  $('#contParkClear').onclick = () => actions.contParking($('#contBase').value, true);
+  $('#contCheck').onclick = () => actions.contCheck();
+  $('#contFinish').onclick = () => actions.contFinish(null);
+  $('#contAbort').onclick = () => actions.contAbort();
   // 录包 topic 下拉多选：记「取消勾选的」，默认一个都没取消 = 全选 = *（之后新冒出来的 topic 也录）；
   // 取消了任何一个就发具体勾选的列表。刷新页面恢复全选。
   const bagOff = new Set(), esc = x => String(x).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
@@ -516,7 +569,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
 
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
-    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); },  // 4 Hz
+    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
     slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,
