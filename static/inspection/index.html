@@ -77,27 +77,6 @@
             <li class="empty-step">选择任务后显示巡检节点</li>
           </ol>
         </section>
-
-        <section class="panel body-panel">
-          <div class="panel-head compact">
-            <div>
-              <span class="eyebrow">ROBOT TELEMETRY</span>
-              <h2>本体状态</h2>
-            </div>
-            <span class="mini-status" id="presence">离线</span>
-          </div>
-          <div class="telemetry">
-            <div><span>运行模式</span><b id="modeValue">--</b></div>
-            <div><span>行进速度</span><b class="mono" id="speedValue">--</b></div>
-            <div><span>电量</span><b class="mono" id="batteryValue">--</b></div>
-            <div><span>CPU</span><b class="mono" id="cpuValue">--</b></div>
-          </div>
-          <div class="preflight" id="preflight">
-            <div data-k="nav"><i></i><span>导航</span><b>--</b></div>
-            <div data-k="map"><i></i><span>地图</span><b>--</b></div>
-            <div data-k="pose"><i></i><span>定位</span><b>--</b></div>
-          </div>
-        </section>
       </aside>
 
       <section class="center-column">
@@ -152,55 +131,78 @@
           </div>
         </section>
 
-        <section class="panel exception-panel">
-          <div class="panel-head">
-            <div>
-              <span class="eyebrow">ANOMALY ARCHIVE</span>
-              <h1>异常归集</h1>
+        <div class="bottom-panels">
+          <section class="panel body-panel">
+            <div class="panel-head compact">
+              <div>
+                <span class="eyebrow">ROBOT TELEMETRY</span>
+                <h2>本体状态</h2>
+              </div>
+              <span class="mini-status" id="presence">离线</span>
             </div>
-            <div class="exception-head-actions">
-              <span class="count-badge" id="exceptionCount">0</span>
-              <button class="more-button" id="exceptionMore" type="button">更多</button>
+            <div class="telemetry">
+              <div><span>运行模式</span><b id="modeValue">--</b></div>
+              <div><span>行进速度</span><b class="mono" id="speedValue">--</b></div>
+              <div><span>电量</span><b class="mono" id="batteryValue">--</b></div>
+              <div><span>CPU</span><b class="mono" id="cpuValue">--</b></div>
             </div>
-          </div>
-          <p class="panel-note">实时接收机器狗异常记录，同一异常会按 ID 自动更新。</p>
+            <div class="preflight" id="preflight">
+              <div data-k="nav"><i></i><span>导航</span><b>--</b></div>
+              <div data-k="map"><i></i><span>地图</span><b>--</b></div>
+              <div data-k="pose"><i></i><span>定位</span><b>--</b></div>
+            </div>
+          </section>
 
-          <div class="exception-table-wrap">
-            <table class="exception-table">
-              <thead>
-                <tr>
-                  <th>发生时间</th>
-                  <th>异常类型</th>
-                  <th>发生节点</th>
-                  <th>持续 / 数据</th>
-                  <th>查看</th>
-                </tr>
-              </thead>
-              <tbody id="exceptionRows"></tbody>
-            </table>
-            <div class="empty-exception" id="exceptionEmpty">
-              <div class="empty-icon">!</div>
-              <b>暂无异常数据</b>
-              <span>等待机器狗上报 incidents</span>
+          <section class="panel exception-panel">
+            <div class="panel-head">
+              <div>
+                <span class="eyebrow">ANOMALY ARCHIVE</span>
+                <h1>异常归集</h1>
+              </div>
+              <div class="exception-head-actions">
+                <span class="count-badge" id="exceptionCount">0</span>
+                <button class="more-button" id="exceptionMore" type="button">更多</button>
+              </div>
             </div>
-          </div>
+            <p class="panel-note">实时接收机器狗异常记录，同一异常会按 ID 自动更新。</p>
 
-          <div class="exception-detail" id="exceptionDetail" hidden>
-            <div class="detail-head">
-              <b id="detailTitle">异常详情</b>
-              <button id="detailClose" type="button" aria-label="关闭异常详情">×</button>
+            <div class="exception-table-wrap">
+              <table class="exception-table">
+                <thead>
+                  <tr>
+                    <th>发生时间</th>
+                    <th>异常类型</th>
+                    <th>发生节点</th>
+                    <th>持续 / 数据</th>
+                    <th>查看</th>
+                  </tr>
+                </thead>
+                <tbody id="exceptionRows"></tbody>
+              </table>
+              <div class="empty-exception" id="exceptionEmpty">
+                <div class="empty-icon">!</div>
+                <b>暂无异常数据</b>
+                <span>等待机器狗上报 incidents</span>
+              </div>
             </div>
-            <p id="detailBody"></p>
-            <dl>
-              <div><dt>事件编号</dt><dd id="detailId">--</dd></div>
-              <div><dt>状态</dt><dd id="detailStatus">--</dd></div>
-              <div><dt>坐标</dt><dd id="detailPose">--</dd></div>
-              <div><dt>地图</dt><dd id="detailMap">--</dd></div>
-              <div><dt>录包</dt><dd id="detailBag">--</dd></div>
-              <div><dt>设备</dt><dd id="detailRobot">--</dd></div>
-            </dl>
-          </div>
-        </section>
+
+            <div class="exception-detail" id="exceptionDetail" hidden>
+              <div class="detail-head">
+                <b id="detailTitle">异常详情</b>
+                <button id="detailClose" type="button" aria-label="关闭异常详情">×</button>
+              </div>
+              <p id="detailBody"></p>
+              <dl>
+                <div><dt>事件编号</dt><dd id="detailId">--</dd></div>
+                <div><dt>状态</dt><dd id="detailStatus">--</dd></div>
+                <div><dt>坐标</dt><dd id="detailPose">--</dd></div>
+                <div><dt>地图</dt><dd id="detailMap">--</dd></div>
+                <div><dt>录包</dt><dd id="detailBag">--</dd></div>
+                <div><dt>设备</dt><dd id="detailRobot">--</dd></div>
+              </dl>
+            </div>
+          </section>
+        </div>
       </section>
     </main>
 
