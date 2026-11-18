@@ -6,7 +6,7 @@ import { gridToCanvas, costToCanvas, wallMask, CLOUD } from '../util.js';
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
@@ -129,7 +129,7 @@ export function createRosSource(store, bus){
         store.loc.running = m.profiles.localization === 'run' || m.profiles.navigation === 'run';
         // 地图：data/maps 列表，网页上显示的那张（导航没开时是后端直接读的文件，mapLive = false），没在跑时选好的「下次启动用」
         const cur = m.mapCurrent, choice = m.mapChoice;
-        store.maps = (m.maps || []).map(x => ({ name: x.name, meta: `${x.w ?? '?'}×${x.h ?? '?'} · ${x.res} m`, cur: x.name === cur, choice: x.name === choice }));
+        store.maps = (m.maps || []).map(x => ({ name: x.name, meta: `${x.w ?? '?'}×${x.h ?? '?'} · ${x.res} m`, mtime: x.mtime, size: x.size, cur: x.name === cur, choice: x.name === choice }));
         store.mapCurrent = cur; store.mapChoice = choice; store.mapLive = !!m.mapLive;
         store.bags = (m.bags || []).map(b => ({ name: b.name, dur: b.dur ?? 0, size: b.size }));
         store.uploads = m.uploads || {};
@@ -222,6 +222,7 @@ export function createRosSource(store, bus){
     prepHold: () => send('prep_hold'),
     deleteRoute: route_id => send('route_delete', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
+    deleteMaps: names => send('map_delete', { names }, 60000),
     uploadBag: name => send('bag_upload', { name }),
     setRollback: on => send('rollback_set', { on }),
     saveRollback: () => send('rollback_save', {}, 25000),

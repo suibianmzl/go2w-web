@@ -279,6 +279,13 @@ def list_maps(maps_dir):
         names = sorted(os.listdir(maps_dir))
     except OSError:
         return out
+    sizes = {}   # 地图名 → <名字>.* 加起来的字节数（网页「管理地图」里显示）
+    for fn in names:
+        base = fn.split('.', 1)[0]
+        try:
+            sizes[base] = sizes.get(base, 0) + os.path.getsize(os.path.join(maps_dir, fn))
+        except OSError:
+            pass
     for fn in names:
         if not fn.endswith('.yaml'):
             continue
@@ -300,7 +307,7 @@ def list_maps(maps_dir):
             except (ValueError, SyntaxError, TypeError, IndexError):
                 ox = oy = None
             out.append({'name': name, 'w': w, 'h': h, 'res': float(meta.get('resolution', 0)), 'ox': ox, 'oy': oy,
-                        'mtime': os.path.getmtime(os.path.join(maps_dir, fn))})
+                        'mtime': os.path.getmtime(os.path.join(maps_dir, fn)), 'size': sizes.get(name, 0)})
         except (OSError, ValueError, IndexError):
             continue
     return sorted(out, key=lambda m: -m['mtime'])

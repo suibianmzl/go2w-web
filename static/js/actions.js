@@ -311,6 +311,50 @@ export function createActions(store, src){
       confirmBox({ title: `切换到地图 ${name}`, body: 'map_server 会立即加载这张地图，正在执行的导航会取消。切换后要重新设置初始位姿。', ok: '切换',
         onOk: () => exec(src.cmd.loadMap(name), src.name === 'mock' ? `已加载 ${name}（模拟模式仍显示示例地图）` : null) });
     },
+    // 管理地图：勾选多张一起删（后端挪进 data/maps/.trash，14 天后清掉），绑在这些图上的任务一起删
+    manageMaps(){
+      if (!ready('deleteMaps')) return;
+      if (store.mapSaving || store.mapBusy) return toast('地图正在保存，请稍等', 'warn');
+      const navLive = run('localization') || run('navigation');
+      const lock = m => navLive && m.name === store.mapCurrent ? '导航在用'
+        : store.cont?.base === m.name ? '续建基准' : '';
+      const nRoutes = name => store.routes.filter(r => r.map === name).length;
+      const mb = b => b == null ? '' : b >= 1048576 ? (b / 1048576).toFixed(b >= 10485760 ? 0 : 1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+      const when = t => { if (!t) return ''; const d = new Date(t * 1000), p = v => String(v).padStart(2, '0');
+        return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
+      const maps = [...store.maps];   // 打开时的快照：列表在弹窗里不跟着 2 Hz 刷新，免得勾选被打断
+      const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' })[c]);
+      formBox({ title: `管理地图（${maps.length} 张）`, ok: '删除所选', danger: true,
+        build: form => {
+          form.closest('.modal').classList.add('modal-wide');
+          const auto = maps.filter(m => /^autosave_/.test(m.name) && !lock(m)).length;
+          form.innerHTML = `<div class="mapdel-bar"><input class="modal-select" data-q placeholder="筛选地图名…">
+              <button type="button" class="btn sm ghost" data-auto ${auto ? '' : 'disabled'}>选中自动保存（${auto}）</button>
+              <button type="button" class="btn sm ghost" data-none>全不选</button></div>
+            <div class="mapdel-list">${maps.map((m, i) => { const l = lock(m), r = nRoutes(m.name);
+              return `<label class="mapdel-it${l ? ' locked' : ''}" data-n="${esc(m.name)}"><input type="checkbox" data-i="${i}" ${l ? 'disabled' : ''}>
+                <span class="n">${esc(m.name)}</span>${l ? `<em class="tag">${l}</em>` : m.cur || m.name === store.mapCurrent ? '<em class="tag dim">当前显示</em>' : ''}
+                <span class="m">${mb(m.size)}${m.mtime ? ' · ' + when(m.mtime) : ''}${r ? ` · <b>${r} 个任务</b>` : ''}</span></label>`; }).join('')}</div>
+            <div class="mapdel-sum" data-sum>勾选要删除的地图</div>`;
+          const boxes = [...form.querySelectorAll('input[data-i]')];
+          const sum = () => { const sel = boxes.filter(b => b.checked).map(b => maps[+b.dataset.i]);
+            const r = sel.reduce((a, m) => a + nRoutes(m.name), 0), size = sel.reduce((a, m) => a + (m.size || 0), 0);
+            form.querySelector('[data-sum]').textContent = sel.length
+              ? `将删除 ${sel.length} 张地图（${mb(size)}）${r ? `，连同绑在上面的 ${r} 个任务` : ''}。文件先挪到 data/maps/.trash，14 天后自动清掉。`
+              : '勾选要删除的地图'; };
+          const fire = () => form.dispatchEvent(new Event('change'));
+          form.querySelector('[data-q]').oninput = e => { const q = e.target.value.trim().toLowerCase();
+            form.querySelectorAll('.mapdel-it').forEach(el => el.hidden = !!q && !el.dataset.n.toLowerCase().includes(q)); };
+          form.querySelector('[data-auto]').onclick = () => { boxes.forEach(b => { if (!b.disabled && /^autosave_/.test(maps[+b.dataset.i].name)) b.checked = true; }); fire(); };
+          form.querySelector('[data-none]').onclick = () => { boxes.forEach(b => b.checked = false); fire(); };
+          form.addEventListener('change', sum);
+        },
+        valid: form => [...form.querySelectorAll('input[data-i]')].some(b => b.checked),
+        onOk: form => {
+          const names = [...form.querySelectorAll('input[data-i]')].filter(b => b.checked).map(b => maps[+b.dataset.i].name);
+          return exec(src.cmd.deleteMaps(names), null);
+        } });
+    },
     deleteBag(bag){
       if (!ready('deleteBag')) return;
       const size = bag.size > 1024 ? (bag.size/1024).toFixed(1) + ' GB' : bag.size.toFixed(0) + ' MB';

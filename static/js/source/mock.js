@@ -379,6 +379,14 @@ export function createMockSource(store, bus){
         store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } }; }, 600);
       return { ok:true, msg:`开始上传 ${name} → 166:~/go2w_bags（模拟）` };
     },
+    deleteMaps(names){
+      const busy = names.filter(n => n === store.mapCurrent);
+      if (busy.length) return { ok:false, msg:`不能删除：${busy.join('、')}（模拟模式里当前地图一直算在用）` };
+      const before = store.maps.length, nr = store.routes.filter(r => names.includes(r.map)).length;
+      store.maps = store.maps.filter(m => !names.includes(m.name));
+      store.routes = store.routes.filter(r => !names.includes(r.map));
+      return { ok:true, msg:`已删除 ${before - store.maps.length} 张地图${nr ? '和 ' + nr + ' 个任务' : ''}（模拟）` };
+    },
     deleteBag(name){
       const bags = store.bags.filter(b => b.name !== name);
       if (bags.length === store.bags.length) return { ok:false, msg:`data/bags 里没有 ${name}` };
