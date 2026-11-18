@@ -151,6 +151,7 @@ class FakeArchiveStore:
         self.sessions = {}
         self.commands = {}
         self.objects = []
+        self.incidents = {}
 
     async def close(self):
         pass
@@ -192,6 +193,17 @@ class FakeArchiveStore:
 
     async def add_object(self, meta):
         self.objects.append(meta)
+
+    async def upsert_incident(self, robot_id, item):
+        self.incidents[(robot_id, item['id'])] = dict(item)
+
+    async def list_incidents(self, robot_id, limit=50, before_ms=None):
+        items = [
+            item for (stored_robot, _), item in self.incidents.items()
+            if stored_robot == robot_id
+            and (before_ms is None or int(item['ts']) < before_ms)
+        ]
+        return sorted(items, key=lambda item: int(item['ts']), reverse=True)[:limit]
 
 
 async def start_app(app):
@@ -276,6 +288,51 @@ async def test_cloud_gateway():
                 live_exceptions = await browser_reader.text(
                     lambda m: m.get('t') == 'inspection_exceptions')
                 assert live_exceptions['items'][0]['event_id'] == 'evt-1'
+
+                incidents = [{
+                    'id': 'incident-1',
+                    'ts': 1763445936033,
+                    'end': None,
+                    'dur': None,
+                    'ongoing': True,
+                    'robot': 'go2w-01',
+                    'type': 'stuck',
+                    'label': '长时受阻',
+                    'level': 'warn',
+                    'msg': '导航中原地不动超过 8 秒',
+                    'pose': {'x': 3.02, 'y': -2.66, 'th': -0.05, 'frame': 'map'},
+                    'map': 'lab_20261021',
+                    'task': {'routeId': 'route-1', 'pointName': '人行步道'},
+                    'bag': {'state': 'pending', 'name': None, 'msg': ''},
+                }]
+                await robot.send_str(json.dumps({
+                    't': 'incidents', 'items': incidents,
+                }, ensure_ascii=False))
+                live_incidents = await browser_reader.text(
+                    lambda m: m.get('t') == 'incidents')
+                assert live_incidents['items'][0]['id'] == 'incident-1'
+                incident_api = await session.get(
+                    base + '/quadruped/api/incidents?robot_id=go2w-01&limit=50')
+                assert incident_api.status == 200
+                assert (await incident_api.json())['items'][0]['type'] == 'stuck'
+
+                updated_incident = {
+                    **incidents[0],
+                    'end': 1763445948633,
+                    'dur': 12.6,
+                    'ongoing': False,
+                    'bag': {'state': 'saved', 'name': 'bag-1', 'msg': ''},
+                }
+                await robot.send_str(json.dumps({
+                    't': 'incident', 'item': updated_incident,
+                }, ensure_ascii=False))
+                updated_live = await browser_reader.text(
+                    lambda m: m.get('t') == 'incident')
+                assert updated_live['item']['dur'] == 12.6
+                incident_api = await session.get(
+                    base + '/quadruped/api/incidents?robot_id=go2w-01')
+                items = (await incident_api.json())['items']
+                assert len(items) == 1 and items[0]['bag']['name'] == 'bag-1'
 
                 await robot.send_bytes(bytes([T_MAP, 9, 8, 7]))
                 assert await browser_reader.binary(T_MAP) == bytes([T_MAP, 9, 8, 7])
@@ -467,6 +524,19 @@ async def test_archive_gateway():
                 await robot.send_str('{"t":"state","battery":88}')
                 await browser_reader.text(
                     lambda m: m.get('t') == 'state' and m.get('battery') == 88)
+                await robot.send_str(json.dumps({
+                    't': 'incident',
+                    'item': {
+                        'id': 'archive-incident',
+                        'ts': 1763445936033,
+                        'ongoing': True,
+                        'type': 'stuck',
+                        'label': '长时受阻',
+                        'level': 'warn',
+                    },
+                }, ensure_ascii=False))
+                await browser_reader.text(
+                    lambda m: m.get('t') == 'incident')
                 await robot.send_bytes(bytes([2, 1, 2, 3]))
                 await browser_reader.binary(2)
 
@@ -489,6 +559,7 @@ async def test_archive_gateway():
                 assert archived_command['status'] == 'acked'
                 assert archived_command['operation'] == 'arm'
                 assert archived_command['response']['msg'] == 'locked'
+                assert ('go2w-01', 'archive-incident') in store.incidents
 
                 pending = list((Path(tmp, 'archive') / 'spool' / 'pending').rglob('*'))
                 text_files = [path for path in pending if path.suffix == '.jsonl']
@@ -501,7 +572,7 @@ async def test_archive_gateway():
                     for line in path.read_text(encoding='utf-8').splitlines()
                 ]
                 assert {record['message_type'] for record in records} == {
-                    'hello', 'state', 'ack', 'cmd'}
+                    'hello', 'state', 'incident', 'ack', 'cmd'}
                 assert any(record['command_id'] for record in records)
                 assert binary_files[0].read_bytes()[:4] == struct.pack('<I', 4)
 

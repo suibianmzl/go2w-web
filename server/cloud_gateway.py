@@ -138,6 +138,8 @@ class CloudGateway:
         self.robot_records = {}
         self.rtc_publisher_states = {}
         self.command_seq = 0
+        self.incidents = {}
+        self.incident_tasks = set()
 
     @staticmethod
     def clean_robot_id(value):
@@ -363,6 +365,56 @@ class CloudGateway:
         for kind, layer in LAYER_KINDS.items():
             if layer in client.layers and kind in session.binary_cache:
                 self.send_browser(client, session.binary_cache[kind], key=f'b{kind}')
+        incidents = self.incidents.get(client.robot_id)
+        if incidents:
+            self.send_browser(client, json.dumps({
+                't': 'incidents', 'items': incidents[:50],
+            }, ensure_ascii=False, separators=(',', ':')), key='incidents')
+
+    def archive_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.incident_tasks.add(task)
+        task.add_done_callback(self.incident_tasks.discard)
+
+    @staticmethod
+    def normalize_incident(item, robot_id):
+        if not isinstance(item, dict) or item.get('id') is None or item.get('ts') is None:
+            return None
+        try:
+            started = int(item['ts'])
+        except (TypeError, ValueError):
+            return None
+        normalized = dict(item)
+        normalized['id'] = str(item['id'])
+        normalized['ts'] = started
+        normalized['robot'] = str(item.get('robot') or robot_id)
+        normalized['type'] = str(item.get('type') or 'unknown')
+        normalized['label'] = str(item.get('label') or normalized['type'])
+        normalized['level'] = str(item.get('level') or 'warn')
+        return normalized
+
+    def update_incidents(self, robot_id, items, replace=False):
+        current = [] if replace else list(self.incidents.get(robot_id, []))
+        by_id = {str(item.get('id')): item for item in current if item.get('id')}
+        changed = []
+        for raw in items:
+            item = self.normalize_incident(raw, robot_id)
+            if item is None:
+                continue
+            by_id[item['id']] = item
+            changed.append(item)
+        merged = sorted(by_id.values(), key=lambda item: int(item['ts']), reverse=True)[:1000]
+        self.incidents[robot_id] = merged
+        if changed and self.archive_enabled:
+            self.archive_background(self.persist_incidents(robot_id, changed))
+        return changed
+
+    async def persist_incidents(self, robot_id, items):
+        try:
+            for item in items:
+                await self.archive_store.upsert_incident(robot_id, item)
+        except Exception:
+            LOG.exception('persist incidents failed for robot %s', robot_id)
 
     def robot_status(self, robot_id):
         session = self.robots.get(robot_id)
@@ -512,6 +564,12 @@ class CloudGateway:
             return
         msg_type = msg.get('t') or 'unknown'
         self.archive_up_text(session, data, msg, msg_type)
+        if msg_type == 'incidents':
+            items = msg.get('items') if isinstance(msg.get('items'), list) else []
+            self.update_incidents(robot_id, items, replace=True)
+        elif msg_type == 'incident':
+            item = msg.get('item')
+            self.update_incidents(robot_id, [item] if isinstance(item, dict) else [])
         if msg_type == 'ack':
             key = str(msg.get('id'))
             route = session.ack_routes.pop(key, None)
@@ -1075,6 +1133,37 @@ class CloudGateway:
             'online': sum(1 for robot in robots if robot['online']),
         }, headers={'Access-Control-Allow-Origin': '*'})
 
+    async def incidents_api(self, req):
+        robot_id = self.requested_robot_id(req)
+        try:
+            limit = int(req.query.get('limit', '50'))
+            if not 1 <= limit <= 500:
+                raise ValueError
+        except ValueError:
+            raise web.HTTPBadRequest(text='limit must be between 1 and 500')
+        before = req.query.get('before')
+        if before is not None:
+            try:
+                before = int(before)
+            except ValueError:
+                raise web.HTTPBadRequest(text='before must be a millisecond timestamp')
+
+        items = []
+        if self.archive_enabled and self.archive_store.configured:
+            try:
+                items = await self.archive_store.list_incidents(
+                    robot_id, limit, before)
+            except Exception:
+                LOG.exception('query incidents failed for robot %s', robot_id)
+        if not items:
+            items = [
+                item for item in self.incidents.get(robot_id, [])
+                if before is None or int(item.get('ts') or 0) < before
+            ][:limit]
+        return web.json_response({
+            'items': items,
+        }, headers={'Access-Control-Allow-Origin': '*'})
+
     async def robot_camera_api(self, req):
         robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
         if robot_id not in self.robot_records:
@@ -1170,6 +1259,8 @@ class CloudGateway:
 
     async def cleanup(self, _app):
         self.archive_spool.close_all()
+        if self.incident_tasks:
+            await asyncio.gather(*list(self.incident_tasks), return_exceptions=True)
         await self.archive_store.close()
         await self.ssh_registration.close()
 
@@ -1201,6 +1292,7 @@ class CloudGateway:
         app.router.add_delete(
             '/internal/v1/robots/{device_id}/ssh-binding', self.internal_robot_unbind)
         app.router.add_get('/quadruped/api/robots', self.robots_api)
+        app.router.add_get('/quadruped/api/incidents', self.incidents_api)
         app.router.add_route(
             '*', '/quadruped/api/robots/{robot_id}/camera', self.robot_camera_api)
         app.router.add_get('/quadruped/rtc/config', self.rtc_config)

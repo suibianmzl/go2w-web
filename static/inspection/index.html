@@ -160,9 +160,12 @@
               <span class="eyebrow">ANOMALY ARCHIVE</span>
               <h1>异常归集</h1>
             </div>
-            <span class="count-badge" id="exceptionCount">0</span>
+            <div class="exception-head-actions">
+              <span class="count-badge" id="exceptionCount">0</span>
+              <button class="more-button" id="exceptionMore" type="button">更多</button>
+            </div>
           </div>
-          <p class="panel-note">当前预留机器狗异常上报协议，识别程序接入后自动显示。</p>
+          <p class="panel-note">实时接收机器狗异常记录，同一异常会按 ID 自动更新。</p>
 
           <div class="exception-table-wrap">
             <table class="exception-table">
@@ -171,7 +174,7 @@
                   <th>发生时间</th>
                   <th>异常类型</th>
                   <th>发生节点</th>
-                  <th>持续</th>
+                  <th>持续 / 数据</th>
                 </tr>
               </thead>
               <tbody id="exceptionRows"></tbody>
@@ -179,7 +182,7 @@
             <div class="empty-exception" id="exceptionEmpty">
               <div class="empty-icon">!</div>
               <b>暂无异常数据</b>
-              <span>等待机器狗上报 inspection_exceptions</span>
+              <span>等待机器狗上报 incidents</span>
             </div>
           </div>
 
@@ -193,11 +196,46 @@
               <div><dt>事件编号</dt><dd id="detailId">--</dd></div>
               <div><dt>状态</dt><dd id="detailStatus">--</dd></div>
               <div><dt>坐标</dt><dd id="detailPose">--</dd></div>
+              <div><dt>地图</dt><dd id="detailMap">--</dd></div>
+              <div><dt>录包</dt><dd id="detailBag">--</dd></div>
+              <div><dt>设备</dt><dd id="detailRobot">--</dd></div>
             </dl>
           </div>
         </section>
       </aside>
     </main>
+
+    <div class="incident-modal" id="incidentHistory" hidden>
+      <div class="incident-dialog" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+        <div class="incident-dialog-head">
+          <div>
+            <span class="eyebrow">INCIDENT HISTORY</span>
+            <h2 id="historyTitle">异常归集 · 历史记录</h2>
+          </div>
+          <button class="dialog-close" id="historyClose" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="history-table-wrap">
+          <table class="exception-table history-table">
+            <thead>
+              <tr>
+                <th>发生时间</th>
+                <th>设备</th>
+                <th>异常类型</th>
+                <th>发生节点</th>
+                <th>持续</th>
+                <th>录包</th>
+              </tr>
+            </thead>
+            <tbody id="historyRows"></tbody>
+          </table>
+          <div class="history-empty" id="historyEmpty">暂无历史异常</div>
+        </div>
+        <div class="history-foot">
+          <span class="mono" id="historySummary">0 条</span>
+          <button id="historyMore" type="button">加载更多</button>
+        </div>
+      </div>
+    </div>
 
     <div class="toast" id="toast"><i></i><span></span></div>
   </div>

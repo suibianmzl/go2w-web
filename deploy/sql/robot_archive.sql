@@ -69,3 +69,26 @@ CREATE TABLE IF NOT EXISTS robot_data_object (
     KEY idx_robot_data_object_type (stream_type, period_start)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   COMMENT='机器狗数据TOS对象清单';
+
+CREATE TABLE IF NOT EXISTS robot_incident (
+    robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+    incident_id VARCHAR(128) NOT NULL COMMENT '异常唯一ID',
+    started_at_ms BIGINT NOT NULL COMMENT '发生时间Unix毫秒',
+    ended_at_ms BIGINT NULL COMMENT '结束时间Unix毫秒',
+    duration_s DOUBLE NULL COMMENT '持续秒数',
+    ongoing TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否持续中',
+    incident_type VARCHAR(64) NOT NULL COMMENT '异常类型代码',
+    label VARCHAR(128) NOT NULL COMMENT '异常类型名称',
+    level VARCHAR(16) NOT NULL COMMENT 'warn/error',
+    message TEXT NULL COMMENT '异常说明',
+    map_name VARCHAR(255) NULL COMMENT '发生地图',
+    payload JSON NOT NULL COMMENT '完整异常记录',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+        ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (robot_id, incident_id),
+    KEY idx_robot_incident_time (robot_id, started_at_ms),
+    KEY idx_robot_incident_type (robot_id, incident_type, started_at_ms),
+    KEY idx_robot_incident_ongoing (robot_id, ongoing, started_at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='机器狗异常归集记录';

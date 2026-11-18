@@ -221,6 +221,30 @@ class ArchiveStore:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
               COLLATE=utf8mb4_0900_ai_ci
             ''',
+            '''
+            CREATE TABLE IF NOT EXISTS robot_incident (
+                robot_id VARCHAR(128) NOT NULL,
+                incident_id VARCHAR(128) NOT NULL,
+                started_at_ms BIGINT NOT NULL,
+                ended_at_ms BIGINT NULL,
+                duration_s DOUBLE NULL,
+                ongoing TINYINT(1) NOT NULL DEFAULT 0,
+                incident_type VARCHAR(64) NOT NULL,
+                label VARCHAR(128) NOT NULL,
+                level VARCHAR(16) NOT NULL,
+                message TEXT NULL,
+                map_name VARCHAR(255) NULL,
+                payload JSON NOT NULL,
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    ON UPDATE CURRENT_TIMESTAMP(3),
+                PRIMARY KEY (robot_id, incident_id),
+                KEY idx_robot_incident_time (robot_id, started_at_ms),
+                KEY idx_robot_incident_type (robot_id, incident_type, started_at_ms),
+                KEY idx_robot_incident_ongoing (robot_id, ongoing, started_at_ms)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_0900_ai_ci
+            ''',
         ]
         async with self._pool.acquire() as connection:
             async with connection.cursor() as cursor:
@@ -382,6 +406,89 @@ class ArchiveStore:
                     ),
                 )
             await connection.commit()
+
+    async def upsert_incident(self, robot_id, item):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    '''
+                    INSERT INTO robot_incident (
+                        robot_id, incident_id, started_at_ms, ended_at_ms,
+                        duration_s, ongoing, incident_type, label, level,
+                        message, map_name, payload
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        started_at_ms=VALUES(started_at_ms),
+                        ended_at_ms=VALUES(ended_at_ms),
+                        duration_s=VALUES(duration_s),
+                        ongoing=VALUES(ongoing),
+                        incident_type=VALUES(incident_type),
+                        label=VALUES(label),
+                        level=VALUES(level),
+                        message=VALUES(message),
+                        map_name=VALUES(map_name),
+                        payload=VALUES(payload),
+                        updated_at=UTC_TIMESTAMP(3)
+                    ''',
+                    (
+                        robot_id,
+                        str(item['id']),
+                        int(item['ts']),
+                        int(item['end']) if item.get('end') is not None else None,
+                        float(item['dur']) if item.get('dur') is not None else None,
+                        1 if item.get('ongoing') else 0,
+                        str(item.get('type') or 'unknown'),
+                        str(item.get('label') or item.get('type') or '异常'),
+                        str(item.get('level') or 'warn'),
+                        str(item.get('msg') or '')[:65000],
+                        str(item.get('map') or '') or None,
+                        compact_json(item),
+                    ),
+                )
+            await connection.commit()
+
+    async def list_incidents(self, robot_id, limit=50, before_ms=None):
+        await self.ensure()
+        limit = max(1, min(500, int(limit)))
+        async with self._pool.acquire() as connection:
+            async with connection.cursor(aiomysql.DictCursor) as cursor:
+                if before_ms is None:
+                    await cursor.execute(
+                        '''
+                        SELECT payload FROM robot_incident
+                        WHERE robot_id=%s
+                        ORDER BY started_at_ms DESC, incident_id DESC
+                        LIMIT %s
+                        ''',
+                        (robot_id, limit),
+                    )
+                else:
+                    await cursor.execute(
+                        '''
+                        SELECT payload FROM robot_incident
+                        WHERE robot_id=%s AND started_at_ms < %s
+                        ORDER BY started_at_ms DESC, incident_id DESC
+                        LIMIT %s
+                        ''',
+                        (robot_id, int(before_ms), limit),
+                    )
+                rows = await cursor.fetchall()
+        items = []
+        for row in rows:
+            payload = row['payload']
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode('utf-8')
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    continue
+            if isinstance(payload, dict):
+                items.append(payload)
+        return items
 
 
 class _SegmentWriter:

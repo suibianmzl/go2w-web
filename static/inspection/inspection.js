@@ -46,13 +46,23 @@ const els = {
   exceptionRows: $('#exceptionRows'),
   exceptionEmpty: $('#exceptionEmpty'),
   exceptionCount: $('#exceptionCount'),
+  exceptionMore: $('#exceptionMore'),
   exceptionDetail: $('#exceptionDetail'),
   detailTitle: $('#detailTitle'),
   detailBody: $('#detailBody'),
   detailId: $('#detailId'),
   detailStatus: $('#detailStatus'),
   detailPose: $('#detailPose'),
+  detailMap: $('#detailMap'),
+  detailBag: $('#detailBag'),
+  detailRobot: $('#detailRobot'),
   detailClose: $('#detailClose'),
+  incidentHistory: $('#incidentHistory'),
+  historyRows: $('#historyRows'),
+  historyEmpty: $('#historyEmpty'),
+  historySummary: $('#historySummary'),
+  historyMore: $('#historyMore'),
+  historyClose: $('#historyClose'),
   toast: $('#toast'),
 };
 
@@ -74,7 +84,8 @@ const state = {
   task: { type: 'idle' },
   routes: [],
   selectedRouteId: '',
-  exceptions: [],
+  incidents: [],
+  history: { items: new Map(), before: null, loading: false, hasMore: true },
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -114,20 +125,35 @@ function taskForSelectedRoute(){
   return state.task?.type !== 'idle' && state.task?.routeId === state.selectedRouteId;
 }
 
-function formatTime(value){
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString('zh-CN', { hour12:false });
+function formatIncidentTime(value){
+  const date = new Date(Number(value));
+  if (Number.isNaN(date.getTime())) return '--';
+  return date.toLocaleString('zh-CN', {
+    month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit',
+    second:'2-digit', hour12:false,
+  });
 }
 
-function formatDuration(item){
-  if (Number.isFinite(item.duration_s)) return `${item.duration_s.toFixed(1)} s`;
-  if (item.started_at && item.ended_at){
-    const seconds = (new Date(item.ended_at) - new Date(item.started_at)) / 1000;
-    if (Number.isFinite(seconds) && seconds >= 0) return `${seconds.toFixed(1)} s`;
+function incidentDuration(item){
+  if (Number.isFinite(item.dur)) return `${item.dur.toFixed(1)} s`;
+  if (item.ongoing) return '持续中';
+  if (Number.isFinite(item.end) && Number.isFinite(item.ts)){
+    return `${Math.max(0, (item.end - item.ts) / 1000).toFixed(1)} s`;
   }
-  return '进行中';
+  return '--';
+}
+
+function bagLabel(item){
+  const bag = item.bag;
+  if (!bag || !bag.state) return '无录包信息';
+  const labels = {
+    pending:'等待录包',
+    saving:'保存中',
+    saved:bag.name ? `已保存 · ${bag.name}` : '已保存',
+    failed:'录包失败',
+    skipped:'未录包',
+  };
+  return labels[bag.state] || bag.state;
 }
 
 function setChip(el, status, value){
@@ -314,48 +340,148 @@ function renderTelemetry(){
     : 'x -- · y -- · θ --';
 }
 
-function normalizeException(item, index){
+function normalizeIncident(item, index = 0){
   if (!item || typeof item !== 'object') return null;
+  const id = item.id ?? item.event_id ?? item.eventId;
+  const ts = Number(item.ts ?? (item.started_at ? Date.parse(item.started_at) : NaN));
+  if (!id || !Number.isFinite(ts)) return null;
+  const task = item.task && typeof item.task === 'object' ? item.task : null;
+  const pose = item.pose && typeof item.pose === 'object' ? item.pose : null;
   return {
     ...item,
-    event_id: String(item.event_id || item.eventId || `local-${index}`),
-    title: String(item.title || item.anomaly_type || '巡检异常'),
-    anomaly_type: String(item.anomaly_type || item.type || 'unknown'),
-    point_name: String(item.point_name || '--'),
-    status: String(item.status || 'new'),
-    detail: String(item.detail || ''),
+    id:String(id),
+    ts,
+    end:item.end == null ? null : Number(item.end),
+    dur:item.dur == null ? (item.duration_s == null ? null : Number(item.duration_s)) : Number(item.dur),
+    ongoing:!!item.ongoing,
+    robot:String(item.robot || state.robotId || ''),
+    type:String(item.type || item.anomaly_type || 'unknown'),
+    label:String(item.label || item.title || item.anomaly_type || `异常 ${index + 1}`),
+    level:String(item.level || (item.severity === 'error' ? 'error' : 'warn')),
+    msg:String(item.msg || item.detail || ''),
+    map:item.map || null,
+    pose,
+    task,
+    bag:item.bag && typeof item.bag === 'object' ? item.bag : null,
   };
 }
 
+function mergeIncidents(items, replace = false){
+  const byId = new Map(replace ? [] : state.incidents.map(item => [item.id, item]));
+  for (const [index, raw] of (Array.isArray(items) ? items : []).entries()){
+    const item = normalizeIncident(raw, index);
+    if (item) byId.set(item.id, item);
+  }
+  state.incidents = [...byId.values()]
+    .sort((left, right) => right.ts - left.ts)
+    .slice(0, 1000);
+  renderExceptions();
+}
+
 function renderExceptions(){
-  els.exceptionCount.textContent = String(state.exceptions.length);
-  els.exceptionEmpty.hidden = state.exceptions.length > 0;
-  if (!state.exceptions.length){
+  const items = state.incidents;
+  els.exceptionCount.textContent = String(items.length);
+  els.exceptionEmpty.hidden = items.length > 0;
+  if (!items.length){
     els.exceptionRows.replaceChildren();
     return;
   }
 
-  els.exceptionRows.innerHTML = state.exceptions.map((item, index) => `
+  els.exceptionRows.innerHTML = items.map((item, index) => `
     <tr data-index="${index}" tabindex="0">
-      <td class="mono">${esc(formatTime(item.started_at))}</td>
-      <td><span class="exception-type">● ${esc(item.title)}</span></td>
-      <td>${esc(item.point_name)}</td>
-      <td class="mono">${esc(formatDuration(item))}</td>
+      <td class="mono">${esc(formatIncidentTime(item.ts))}</td>
+      <td><span class="exception-type" data-level="${esc(item.level)}">● ${esc(item.label)}</span></td>
+      <td>${esc(item.task?.pointName || '--')}</td>
+      <td>
+        <div class="exception-duration">
+          <span class="mono">${esc(incidentDuration(item))}</span>
+          <span class="bag-state" data-s="${esc(item.bag?.state || '')}">${esc(bagLabel(item))}</span>
+        </div>
+      </td>
     </tr>
   `).join('');
 }
 
-function showException(index){
-  const item = state.exceptions[index];
+function showIncident(item){
   if (!item) return;
   els.exceptionDetail.hidden = false;
-  els.detailTitle.textContent = item.title;
-  els.detailBody.textContent = item.detail || item.anomaly_type;
-  els.detailId.textContent = item.event_id;
-  els.detailStatus.textContent = item.status;
-  els.detailPose.textContent = Number.isFinite(item.x) && Number.isFinite(item.y)
-    ? `${Number(item.x).toFixed(2)}, ${Number(item.y).toFixed(2)}`
+  els.detailTitle.textContent = item.label;
+  els.detailBody.textContent = item.msg || item.type;
+  els.detailId.textContent = item.id;
+  els.detailStatus.textContent = item.ongoing ? '持续中' : '已结束';
+  els.detailPose.textContent = Number.isFinite(item.pose?.x) && Number.isFinite(item.pose?.y)
+    ? `${Number(item.pose.x).toFixed(2)}, ${Number(item.pose.y).toFixed(2)}`
     : '--';
+  els.detailMap.textContent = item.map || '--';
+  els.detailBag.textContent = bagLabel(item);
+  els.detailRobot.textContent = item.robot || '--';
+}
+
+function showException(index){
+  showIncident(state.incidents[index]);
+}
+
+function renderHistory(){
+  const items = [...state.history.items.values()]
+    .sort((left, right) => right.ts - left.ts);
+  els.historyEmpty.hidden = items.length > 0;
+  els.historySummary.textContent = `${items.length} 条`;
+  els.historyMore.disabled = state.history.loading || !state.history.hasMore;
+  els.historyRows.innerHTML = items.map(item => `
+    <tr data-history-id="${esc(item.id)}" tabindex="0">
+      <td class="mono">${esc(formatIncidentTime(item.ts))}</td>
+      <td class="mono">${esc(item.robot || '--')}</td>
+      <td><span class="exception-type" data-level="${esc(item.level)}">● ${esc(item.label)}</span></td>
+      <td>${esc(item.task?.pointName || '--')}</td>
+      <td class="mono">${esc(incidentDuration(item))}</td>
+      <td><span class="bag-state" data-s="${esc(item.bag?.state || '')}">${esc(bagLabel(item))}</span></td>
+    </tr>
+  `).join('');
+}
+
+async function loadHistory(reset = false){
+  if (state.history.loading || (!reset && !state.history.hasMore)) return;
+  state.history.loading = true;
+  els.historyMore.disabled = true;
+  if (reset){
+    state.history.items.clear();
+    state.history.before = null;
+    state.history.hasMore = true;
+    renderHistory();
+  }
+  try {
+    const query = new URLSearchParams({ robot_id:state.robotId, limit:'50' });
+    if (state.history.before != null) query.set('before', String(state.history.before));
+    const response = await fetch(`/quadruped/api/incidents?${query}`, { cache:'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    rawItems.forEach((raw, index) => {
+      const item = normalizeIncident(raw, index);
+      if (item) state.history.items.set(item.id, item);
+    });
+    const oldest = rawItems
+      .map(item => Number(item.ts))
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right)[0];
+    if (Number.isFinite(oldest)) state.history.before = oldest;
+    state.history.hasMore = rawItems.length >= 50;
+  } catch (error){
+    toast(`异常历史加载失败：${error?.message || error}`, 'err');
+    state.history.hasMore = false;
+  } finally {
+    state.history.loading = false;
+    renderHistory();
+  }
+}
+
+function openHistory(){
+  els.incidentHistory.hidden = false;
+  loadHistory(true);
+}
+
+function closeHistory(){
+  els.incidentHistory.hidden = true;
 }
 
 function updateRtc(){
@@ -464,10 +590,15 @@ function onJson(message){
       renderTask();
       renderHint(selectedRoute());
       break;
+    case 'incidents':
+      mergeIncidents(message.items, true);
+      break;
+    case 'incident':
+      mergeIncidents(message.item ? [message.item] : []);
+      break;
     case 'inspection_exceptions': {
       const items = Array.isArray(message.items) ? message.items : message.item ? [message.item] : [];
-      state.exceptions = items.map(normalizeException).filter(Boolean);
-      renderExceptions();
+      mergeIncidents(items, true);
       break;
     }
     case 'ack': {
@@ -854,6 +985,7 @@ els.zoomInMap.addEventListener('click', () => zoomMap(1.25));
 els.fitMap.addEventListener('click', () => { fitView(); drawMap(); });
 els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
 els.expandMap.addEventListener('click', () => setMapCollapsed(false));
+els.exceptionMore.addEventListener('click', openHistory);
 els.exceptionRows.addEventListener('click', event => {
   const row = event.target.closest('tr[data-index]');
   if (row) showException(Number(row.dataset.index));
@@ -866,7 +998,29 @@ els.exceptionRows.addEventListener('keydown', event => {
     showException(Number(row.dataset.index));
   }
 });
+els.historyRows.addEventListener('click', event => {
+  const row = event.target.closest('tr[data-history-id]');
+  if (!row) return;
+  showIncident(state.history.items.get(row.dataset.historyId));
+  closeHistory();
+});
+els.historyRows.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const row = event.target.closest('tr[data-history-id]');
+  if (!row) return;
+  event.preventDefault();
+  showIncident(state.history.items.get(row.dataset.historyId));
+  closeHistory();
+});
+els.historyMore.addEventListener('click', () => loadHistory(false));
+els.historyClose.addEventListener('click', closeHistory);
+els.incidentHistory.addEventListener('click', event => {
+  if (event.target === els.incidentHistory) closeHistory();
+});
 els.detailClose.addEventListener('click', () => { els.exceptionDetail.hidden = true; });
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !els.incidentHistory.hidden) closeHistory();
+});
 new ResizeObserver(resizeCanvas).observe(canvas);
 window.addEventListener('beforeunload', () => state.heartbeat?.terminate());
 
