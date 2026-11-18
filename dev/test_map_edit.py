@@ -156,6 +156,16 @@ class MapEditTest(unittest.TestCase):
         self.assertTrue(ok, reasons)
         self.assertTrue(any('base_e1' in w and '编辑' in w for w in warns), warns)
 
+    def test_derived_map_drops_embedded_teaching_but_keeps_source(self):
+        source=Path(self.d,'base.yaml')
+        source.write_text(source.read_text()+'go2w_taught_route:\n  schema: 1\n  reference:\n    image: not_a_map.pgm\n')
+        original=source.read_bytes()
+        new=self.grid.copy();new[0,0]=0
+        self.edit(new)
+        self.assertNotIn('go2w_taught_route',Path(self.d,'base_e1.yaml').read_text())
+        self.assertEqual(source.read_bytes(),original)
+        np.testing.assert_array_equal(mapfile.load(Path(self.d,'base_e1.yaml'))['grid'],new)
+
     @unittest.skipUnless(REAL, '没给真实地图')
     def test_real_map(self):
         name = Path(REAL).stem

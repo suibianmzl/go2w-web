@@ -60,6 +60,9 @@ async def main():
     st = await d.status(); check('按 GO2W_NAVIGATION_MODE 识别档位', st['localization'] and not st['navigation'] and not st['mapping'], st)
     await d.start_mode('mapping')
     check('建图不带地图', requests[-1]['environment'] == {'GO2W_NAVIGATION_MODE': 'mapping'}, requests[-1])
+    await d.start_mode('navigation', 'lab', taught_route=True)
+    check('示教导航传递真实运行开关', requests[-1]['environment'] == {
+        'GO2W_NAVIGATION_MODE':'navigation','GO2W_MAP':'lab.yaml','GO2W_TAUGHT_ROUTE':'true'}, requests[-1])
 
     await d.start_patrol(3); await d.start_bag('go2w', ['*', '/odom']); await d.start_rollback(20); await d.start_bridge()
     st = await d.status()

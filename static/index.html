@@ -237,6 +237,7 @@
           <button data-t="nav">导航<small>多站任务</small></button>
           <button data-t="reloc">重定位<small>修正定位</small></button>
           <button data-t="map">建图<small>slam_toolbox</small></button>
+          <button data-t="taught">示教采集<small>遥控记录</small></button>
         </div>
         <div class="robot-line"><span>运行中</span><b id="stackTxt">--</b><span class="sp"></span><span>底盘</span><b id="armTxt">--</b></div>
       </section>
@@ -326,6 +327,41 @@
           <button class="btn" id="btnPause">暂停</button>
           <button class="btn danger" id="btnCancel">取消</button>
         </div>
+      </section>
+
+      <section class="panel card" id="flowTaught" hidden>
+        <div class="card-h"><h3>示教采集</h3><span class="pill" id="taughtState">未读取</span></div>
+        <p class="hint">每张地图保存一条参考轨迹。准备完成后，明确开始采集，再用遥控走出路线。</p>
+        <label class="taught-label" for="taughtMapSel">使用的地图</label>
+        <div class="inrow"><select id="taughtMapSel" aria-label="示教地图"></select><button class="btn sm ghost" id="taughtRefresh">读取</button></div>
+        <p class="hint" id="taughtMapHint"></p>
+        <div class="taught-stats"><span>已保存<b id="taughtReference">--</b></span><span>本次采样<b id="taughtSamples">--</b></span></div>
+        <div class="taught-legend"><span><i class="ref"></i>已保存参考</span><span><i class="live"></i>本次采样（断口不连线）</span></div>
+        <div class="btn-row taught-buttons"><button class="btn sm" id="taughtPrepare">加载地图并定位</button><button class="btn sm" id="taughtCheck">重新自检</button></div>
+        <div class="note" id="taughtCheckNote" role="status" aria-live="polite">先选择地图。</div>
+        <ul class="taught-checks" id="taughtChecks"></ul>
+        <div class="taught-section">
+          <label class="taught-label" for="taughtMode">本次如何更新参考轨迹</label>
+          <select id="taughtMode"><option value="replace">整条替换（无轨迹时创建）</option><option value="append">在旧末端追加</option><option value="replace_segment">替换选中区间</option></select>
+          <div id="taughtRangeRow" hidden>
+            <div class="taught-range"><label>起点序号<input id="taughtRangeStart" type="number" min="1" step="1" value="1"></label><label>终点序号<input id="taughtRangeEnd" type="number" min="2" step="1" value="2"></label></div>
+            <button class="btn sm ghost" id="taughtPickRange">在地图上选择两个端点</button>
+            <p class="hint">沿原轨迹顺序选择起止点；只替换两点之间，区间外保持原样。</p>
+          </div>
+          <p class="hint" id="taughtModeHint"></p>
+          <button class="btn pri taught-wide" id="taughtStart" disabled>开始采集</button>
+          <p class="hint" id="taughtStartBlocker"></p>
+        </div>
+        <div class="taught-section" id="taughtCapture" hidden>
+          <div class="taught-capture-head"><b id="taughtCaptureTitle">采集草稿</b><span class="mono" id="taughtCaptureId"></span></div>
+          <p class="hint" id="taughtCaptureNote" role="status" aria-live="polite"></p>
+          <div class="btn-row taught-buttons"><button class="btn sm" id="taughtTeleop">键盘遥控 (T)</button><button class="btn sm" id="taughtPause">暂停采集</button><button class="btn sm" id="taughtResume">自检后继续</button></div>
+          <div class="btn-row taught-buttons"><button class="btn sm pri" id="taughtFinish">结束并校验保存</button><button class="btn sm ghost" id="taughtAbandon">放弃本次草稿</button></div>
+          <a class="taught-link" id="taughtRecover" target="_blank" rel="noopener">在独立编辑器恢复草稿</a>
+        </div>
+        <div class="note" id="taughtMessage" hidden role="status" aria-live="polite"></div>
+        <a class="btn ghost taught-editor-link" id="taughtEditorLink" href="/taught-editor" target="_blank" rel="noopener">打开独立路线编辑器</a>
+        <p class="hint">独立编辑器只读写保存的地图文件，可新建、拖点、插点、删点；不会切换机器人地图。</p>
       </section>
 
       <section class="panel card" id="flowReloc" hidden>

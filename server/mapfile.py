@@ -11,11 +11,23 @@ import os
 import numpy as np
 
 
+def without_teaching(text):
+    """派生底图不能直接继承旧图的已校验示教；同时跳过块式YAML的子字段。"""
+    rows=[];skipping=False
+    for line in text.splitlines(keepends=True):
+        content=line.split('#',1)[0].strip()
+        top=bool(content and not line[:1].isspace())
+        if top:
+            skipping=content.split(':',1)[0].strip()=='go2w_taught_route'
+        if not skipping:rows.append(line)
+    return ''.join(rows)
+
+
 def read_yaml(path):
     """map_server 的 yaml 只有一层 key: value，不依赖 PyYAML。"""
     meta = {}
     with open(path, encoding='utf-8') as f:
-        for line in f:
+        for line in without_teaching(f.read()).splitlines():
             line = line.split('#', 1)[0]
             if ':' in line:
                 k, v = line.split(':', 1)

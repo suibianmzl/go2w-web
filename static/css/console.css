@@ -654,3 +654,35 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .mapdel-it .tag.dim{color:var(--muted)}
 .mapdel-it.locked{cursor:not-allowed;opacity:.6}
 .mapdel-sum{font-size:12px;color:var(--fg-2);line-height:1.6;margin:0 0 12px;min-height:19px}
+
+/* 示教采集：四个任务入口保留紧凑横排；已保存参考和本次采样用线型及文案一起区分。 */
+#taskTabs{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}
+#taskTabs button{min-width:0;padding-left:3px;padding-right:3px;font-size:12px}
+#taskTabs button small{font-size:10px;letter-spacing:0}
+#flowTaught .hint{line-height:1.65;color:var(--fg-2)}
+#flowTaught select,#flowTaught input{min-width:0;height:30px;border:1px solid var(--line-2);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font:12px var(--f-body)}
+#flowTaught select{width:100%}#flowTaught .inrow select{flex:1}
+.taught-label{display:block;font-size:11px;color:var(--fg-2);margin:10px 0 6px}
+.taught-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0 9px}
+.taught-stats span{display:grid;gap:5px;color:var(--fg-2);font-size:11px}
+.taught-stats b{font:500 11px var(--f-mono);color:var(--fg)}
+.taught-legend{display:flex;flex-wrap:wrap;gap:5px 12px;color:var(--fg-2);font-size:10.5px;margin-bottom:12px}
+.taught-legend i{display:inline-block;width:20px;vertical-align:middle;margin-right:5px;border-top:2px solid var(--accent)}
+.taught-legend .ref{border-top-color:var(--warn);border-top-style:dashed}
+.taught-buttons{flex-wrap:wrap;margin-bottom:8px}.taught-buttons .btn{min-height:28px;height:auto;padding:5px 8px;white-space:normal}
+.taught-section{margin-top:12px;padding-top:6px;border-top:1px solid var(--line)}
+.taught-wide{width:100%;min-height:34px}
+.taught-range{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}
+.taught-range label{display:grid;gap:4px;font-size:11px;color:var(--fg-2)}
+.taught-range input{width:100%;font-family:var(--f-mono)!important}
+.taught-checks{padding:0;list-style:none;display:grid;gap:5px;font-size:11px;color:var(--fg-2);margin:8px 0}
+.taught-checks li{overflow-wrap:anywhere;line-height:1.5}
+.taught-checks li[data-s="ok"]{color:var(--ok)}.taught-checks li[data-s="warn"]{color:var(--warn)}
+.taught-capture-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
+.taught-capture-head b{font-size:12px}.taught-capture-head span{font-size:10px;color:var(--fg-2)}
+.taught-link,.taught-layer-edit{color:var(--accent);font-size:11px;text-underline-offset:3px}
+.taught-editor-link{width:100%;text-decoration:none;margin-top:12px;min-height:32px}
+.taught-layer-edit{float:right;font-size:10px;margin-left:8px}
+#taughtMessage{margin-top:10px;overflow-wrap:anywhere;color:var(--fg-2)}
+#taughtState{font-size:10px}
+@media(max-width:420px){#taskTabs{grid-template-columns:repeat(2,minmax(0,1fr))}#taskTabs button{min-height:44px}}

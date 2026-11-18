@@ -12,6 +12,7 @@ import { setupRunState } from './status.js';
 import { setupAlerts } from './alerts.js';
 import { setupFlow } from './flow.js';
 import { setupReloc } from './reloc.js';
+import { setupTaught } from './taught.js';
 import { toast } from './ui.js';
 
 const store = createStore(), bus = new Bus();
@@ -27,7 +28,8 @@ const actions = createActions(store, src);
 const mapView = createMapView(store, actions);
 const panels = createPanels(store, src, actions, mapView, bus, setTool);
 const reloc = setupReloc(store, actions, mapView);
-flow = setupFlow(store, src, actions, setTool, reloc);
+const taught = setupTaught(store, src, setTool);
+flow = setupFlow(store, src, actions, setTool, reloc, taught, mapView);
 const replay = early.splice(0); bus.h.log.shift(); replay.forEach(a => bus.emit('log', ...a));
 bus.on('map', () => mapView.fit());
 setupCamera(src, bus);

@@ -127,7 +127,7 @@ def save(maps_dir, source, name, runs, base_crc, w, h, summary=None, web_version
     base = os.path.join(maps_dir, name)
     yaml_lines = []
     with open(src_yaml, encoding='utf-8') as f:
-        for line in f:
+        for line in mapfile.without_teaching(f.read()).splitlines(keepends=True):
             yaml_lines.append(f'image: {name}.pgm\n' if line.split('#', 1)[0].strip().startswith('image:') else line)
     if not any(l.startswith('image:') for l in yaml_lines):
         yaml_lines.insert(0, f'image: {name}.pgm\n')

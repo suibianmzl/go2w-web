@@ -27,8 +27,8 @@ class FakeProcs:
             await asyncio.sleep(0.05)
         return dict(self.sim.procs)
 
-    async def start_mode(self, mode, map_yaml=None):
-        self.sim.later(lambda: self.sim.start_mode(mode, map_yaml))
+    async def start_mode(self, mode, map_yaml=None, *, taught_route=False):
+        self.sim.later(lambda: self.sim.start_mode(mode, map_yaml, taught_route=taught_route))
 
     async def stop_modes(self):
         self.sim.later(self.sim.stop_modes)

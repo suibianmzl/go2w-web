@@ -77,5 +77,15 @@ class MapAlignmentTests(unittest.TestCase):
         self.assertFalse((self.directory / 'invalid.yaml').exists())
 
 
+    def test_derived_alignment_drops_embedded_teaching(self):
+        source=self.directory/'source.yaml'
+        source.write_text(source.read_text()+'go2w_taught_route:\n  schema: 1\n  reference:\n    image: not_a_map.pgm\n')
+        original=source.read_bytes()
+        export_map(self.directory,'source','aligned',0)
+        self.assertNotIn('go2w_taught_route',(self.directory/'aligned.yaml').read_text())
+        self.assertNotIn('not_a_map',(self.directory/'aligned.yaml').read_text())
+        self.assertEqual(source.read_bytes(),original)
+
+
 if __name__ == '__main__':
     unittest.main()

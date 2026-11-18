@@ -1,5 +1,6 @@
 // 模拟数据源：示例实验室地图 + 机器人仿真。用于不连机器人时调界面（地址后加 ?mock）
 import { clamp, wrap, deg, gauss, mulberry32, gridToCanvas, wallMask, CLOUD } from '../util.js';
+import { createMockTaught } from './mock_taught.js';
 
 /* ---------- 示例地图 24 × 16 m @ 0.05 ---------- */
 const RES = 0.05, MW = 24, MH = 16, GW = Math.round(MW/RES), GH = Math.round(MH/RES);
@@ -80,11 +81,17 @@ export function createMockSource(store, bus){
   store.bags = [{ name:'s7_nav4_162403', dur:1840, size:8120 }, { name:'s7_nav1_114954', dur:612, size:2790 }];
   Object.assign(store.robot, { valid: true, x: 5.6, y: 4.6, th: 0 });
   store.profiles = { mapping: 'stop', localization: 'stop', navigation: 'run', patrol: 'stop', bag: 'stop' };
+  store.taughtAvailable = true; store.taughtNavigation = true; // 纯前端模拟显式支持示教，避免把未知节点当作需无限等待。
   store.rollback = { on: true, run: true, saving: false, seconds: 20 };
   store.since = { navigation: -2405 };
   store.loc = { running: true, std: .035, yaw: 1.5, match: 91 };
 
   const R = store.robot, S = { t: 0, paused: false, keys: null, link: true, bagT0: 0 };
+  const teaching = createMockTaught(store,{
+    prepare(map){cancelTask('模拟示教准备');S.keys=null;lock('模拟示教准备');store.mapCurrent=map;
+      store.profiles.mapping='stop';store.profiles.localization='stop';store.profiles.navigation='run';},
+    halt(){S.keys=null;lock('模拟示教暂停');},
+  });
   const run = id => store.profiles[id] === 'run';
   const anyMode = () => run('mapping') || run('localization') || run('navigation');
   const odomOk = () => anyMode() && S.link;
@@ -313,6 +320,7 @@ export function createMockSource(store, bus){
   ];
   const alive = src => src==='robot' ? S.link : src==='odom' ? odomOk() : src==='loc' ? locRun() : run(src);
   function syncGraph(){
+    store.taughtNavigation = run('navigation');
     store.nodes = NODES.map(([id, name, src]) => ({ id, name, up: alive(src) }));
     store.topics = TOPICS.map(([name, type, hz, src, d0]) => ({ name, type, d0: !!d0, alive: alive(src),
       hz: !alive(src) ? null : hz===0 ? 0 : +(hz*(1+gauss()*.02)).toFixed(hz>=100?0:1) }));
@@ -328,6 +336,7 @@ export function createMockSource(store, bus){
 
   /* ---------- 指令（界面已经做过前置检查和确认） ---------- */
   const cmd = {
+    ...teaching.cmd,
     standUp: () => ({ ok: true, msg: '纯前端模拟：没有运控' }),
     lieDown: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     standHold: () => ({ ok: true }),
@@ -435,6 +444,7 @@ export function createMockSource(store, bus){
     setParam(k, v){ store.params[k] = v; log('INFO','param',`ros2 param set /go2w_cmd_bridge ${{ vmax:'max_vx', wmax:'max_wz', tmo:'cmd_timeout' }[k]} ${v.toFixed(2)}`); },
     // mode = mapping | localization | navigation | null（全部停止）
     setMode(mode, map){
+      teaching.interrupt();
       if (map && map !== store.mapCurrent && store.maps.some(m => m.name === map)){ store.mapCurrent = map; store.maps.forEach(m => m.cur = m.name === map); }
       const cur = ['mapping','localization','navigation'].filter(m => store.profiles[m]!=='stop');
       const down = cur.filter(m => m!==mode);
@@ -460,7 +470,7 @@ export function createMockSource(store, bus){
       store.maps.unshift({ name, meta:`${GW}×${GH} · 0.05 m` });
       return { ok: true, msg: `模拟保存 ${name}（${runs.length} 段修改），实际文件请在本地后端模式中验证` };
     },
-    loadMap(name){ store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
+    loadMap(name){ teaching.interrupt(); store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
     // 续建：模拟模式只走流程，不碰真文件（基准检查、起点位姿、自检的门限在 test_mapmeta / test_mapcontinue 里测）
     contPreflight(base){
       const has = store.maps.some(m => m.name === base);
@@ -488,7 +498,7 @@ export function createMockSource(store, bus){
       return { ok: true, msg: `已保存 ${c.name}（模拟）` };
     },
     contAbort(){ store.cont = null; return { ok: true, msg: '已放弃（模拟）' }; },
-    simulateDrop(){ if (!S.link) return; S.link = false; log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
+    simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
       setTimeout(() => {
         if (routeActive()) cancelTask('网页断开，已取消路线任务');
         lock('web heartbeat lost');
@@ -530,7 +540,7 @@ export function createMockSource(store, bus){
     steps: [['plan', '规划路径', 'Theta*'], ['align', '原地对准', 'RotationShim'], ['follow', '跟随路径', 'MPPI'], ['final', '终点朝向对准', 'goal yaw'], ['arrive', '到达', '停留 1 s']],
     get paused(){ return S.paused; },
     tick(dt){
-      step(dt); a10 += dt; a5 += dt; a1 += dt; aLog += dt;
+      step(dt); teaching.tick(dt); a10 += dt; a5 += dt; a1 += dt; aLog += dt;
       if (a10 >= .1){ a10 = 0; sense(); controllerViz(); }
       if (a5 >= .2){ a5 = 0; amclViz(); }
       if (a1 >= 1){ a1 = 0; syncGraph(); }

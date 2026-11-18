@@ -26,6 +26,9 @@ export function createStore(){
     routes: [],
     routeDraft: { id: null, map: null, points: [], confirmed: false },
     routeCheck: null,
+    // 每图只保留一条活动示教；采集草稿单独存在文档 capture 中，不与多站导航任务混用。
+    taught: null, taughtByMap: {}, taughtMap: null, taughtRange: null,
+    taughtAvailable: null, taughtNavigation: null, // 未提供字段时保持未知，兼容旧后端；不得凭空判定节点就绪。
     // angle：地图显示方向（只转画面）。按地图名存在后端，见 mapViews；points / target：「沿墙选两点」
     alignment: { points: [], angle: 0, target: null, source: null },
     mapViews: {},

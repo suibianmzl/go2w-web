@@ -157,12 +157,14 @@ class RuntimeProcs:
         result = await self._request('stop', name=name)
         return isinstance(result, dict) and not result.get('running', False)
 
-    async def start_mode(self, mode, map_yaml=None):
+    async def start_mode(self, mode, map_yaml=None, *, taught_route=False):
         if mode not in MODES:
             raise ValueError('不支持的运行档位')
         environment = {'GO2W_NAVIGATION_MODE': mode}
         if mode != 'mapping':
             environment['GO2W_MAP'] = _name(map_yaml)+'.yaml'
+        if taught_route:
+            environment['GO2W_TAUGHT_ROUTE'] = 'true'
         return await self._start('navigation', environment)
 
     async def stop_modes(self):

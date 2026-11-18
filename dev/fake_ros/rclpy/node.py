@@ -3,6 +3,7 @@ import time
 from types import SimpleNamespace as N
 
 from rclpy._fake import Client, Publisher
+from rclpy.time import Time
 
 # topic 清单（和导航运行时一致）；有没有发布者由假模拟器按「哪些进程在跑」决定
 TOPICS = [
@@ -42,9 +43,13 @@ class _Logger:
 
 
 class _Clock:
+    def __init__(self, node):
+        self.node = node
+
     def now(self):
-        t = time.time()
-        return N(to_msg=lambda: N(sec=int(t), nanosec=int((t % 1) * 1e9)))
+        sim = getattr(self.node, 'fake_sim', None)
+        # 不能拿系统 epoch 与「从模拟器启动起的秒数」相减；测量和接收时间必须来自同一个模拟 ROS 时钟。
+        return Time(nanoseconds=sim.ros_time_ns() if sim else time.time_ns())
 
 
 class Node:
@@ -58,7 +63,7 @@ class Node:
         return self._log
 
     def get_clock(self):
-        return _Clock()
+        return _Clock(self)
 
     def create_subscription(self, _type, topic, cb, _qos, raw=False):   # raw：假模拟器不发这些 topic
         h = N(topic=topic, cb=cb)

@@ -14,6 +14,7 @@ export const LAYERS = [
     note:'真机上没有：nav2.yaml 里 MPPI 的 visualize 是 false（打开会明显多占扩展坞 CPU 和带宽）' },
   { id:'particles', name:'AMCL 粒子', topic:'/particle_cloud', c:'#ffe08a', on:false, ros:'/particle_cloud · 最多 300', heavy:true },
   { id:'trail', name:'里程轨迹', topic:'base_footprint', c:'#8aa0b8', on:true, ros:'base_footprint' },
+  { id:'taught', name:'示教轨迹', topic:'每张地图一条参考', c:'#f3b13f', on:true, ros:'地图文件中的唯一参考' },
   { id:'rings', name:'测距环', topic:'1 / 2 / 4 m', c:'rgba(255,255,255,.4)', on:true, ros:'1 / 2 / 4 m' },
   { id:'tf', name:'TF 坐标轴', topic:'map · base_link', c:'#ff6b6b', on:false, ros:'map · base_link' },
 ];

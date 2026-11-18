@@ -4,6 +4,7 @@ import { on } from './layers.js';
 import { toast } from './ui.js';
 import { rotatePoint, wallAngle, screenToWorld } from './map_alignment.js';
 import { createMapEditor } from './map_edit.js';
+import { continuousRuns } from './taught_geometry.js';
 
 export function createMapView(store, actions){
   const cv = $('#map'), ctx = cv.getContext('2d'), stage = $('#stage');
@@ -34,6 +35,7 @@ export function createMapView(store, actions){
   // 地图编辑（v1.0.2）：编辑模式下地图图层换成编辑中的那份，指针交给编辑器
   const editor = createMapEditor(store, actions, { exit: () => setTool('pan') });
   function showHint(){
+    if (V.tool === 'taught'){ hint.hidden = false; hint.textContent = '沿已保存的琥珀轨迹，点选区间起点和终点 · 序号也可在右栏填写'; return; }
     if (V.tool === 'edit'){ hint.hidden = !editor.hint; hint.textContent = editor.hint; return; }
     if (V.tool === 'align'){
       hint.hidden = false;
@@ -111,6 +113,27 @@ export function createMapView(store, actions){
   }
 
   function polyline(arr, step = 2){ ctx.beginPath(); for (let i=0;i<arr.length;i+=step){ const x = sx(arr[i]), y = sy(arr[i+1]); i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); } }
+  function drawTaught(){
+    if (!on('taught')) return;
+    const d = store.taughtByMap[store.mapCurrent] || (store.taught?.map === store.mapCurrent ? store.taught : null);
+    if (!d) return;
+    const line = (points,col,dash,width) => {
+      ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.lineCap = ctx.lineJoin = 'round';
+      // continuous_id 是实际采样连续段；断线/暂停产生的断口必须 moveTo，不能凭视觉把两端连成实测线。
+      for (const run of continuousRuns(points)){
+        ctx.beginPath(); run.forEach((p,i)=>i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y))); ctx.stroke();
+        if (run.length === 1){ ctx.beginPath(); ctx.arc(sx(run[0].x),sy(run[0].y),2.5,0,Math.PI*2); ctx.fill(); }
+      }
+      ctx.restore();
+    };
+    line(d.points,'#f3b13f',[7,5],2.5);
+    const range = store.taughtRange;
+    if (range?.map === d.map && Number.isInteger(range.start) && Number.isInteger(range.end) && range.start < range.end){
+      line(d.points.slice(range.start,range.end+1),'#ffe4a6',[],4);
+      for (const i of [range.start,range.end]){ const p = d.points[i]; if (p) drawPin({...p,th:p.yaw},String(i+1),'#ffe4a6',false); }
+    }
+    if (d.capture?.map === store.mapCurrent && !['finished','abandoned'].includes(d.capture.state)) line(d.capture.points,'#38e1dc',[],3.5);
+  }
   function drawPin(p, label, col, showHeading = true){
     const x = sx(p.x), y = sy(p.y);
     ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
@@ -262,6 +285,7 @@ export function createMapView(store, actions){
     } else if (on('scan')){ const sc = store.scan; ctx.fillStyle = '#fff'; for (let i=0;i<sc.length;i+=2) ctx.fillRect(sx(sc[i])-1.2, sy(sc[i+1])-1.2, 2.4, 2.4); }
     // 小车画在路线下面：路径、局部轨迹、站点、目标点都压在车上，导航时路线更显眼
     if (R.valid) drawRobot();
+    drawTaught();
     const P = store.plan;
     if (P && on('plan')){
       const pts = P.pts, k = Math.min(store.planIdx, pts.length-1);
@@ -377,6 +401,14 @@ export function createMapView(store, actions){
     if (V.tool === 'edit' && e.button === 0){ const p = world(px, py); if (editor.down(p.x, p.y)){ V.drag = { tool: 'edit' }; return; } }
     if (V.tool==='pan' || V.tool==='teleop' || V.tool==='edit' || e.button===1){ V.drag = { tool:'pan', px, py, cx:view.cx, cy:view.cy }; cv.style.cursor = 'grabbing'; stopFollow(); return; }
     const {x,y} = world(px,py);
+    if (V.tool === 'taught'){
+      const d = store.taughtByMap[store.mapCurrent] || store.taught;
+      if (d?.map !== store.mapCurrent) return;
+      let best = -1, distance = 16/view.s;
+      (d.points || []).forEach((p,i)=>{ const r = Math.hypot(p.x-x,p.y-y); if (r < distance){ distance = r; best = i; } });
+      if (best >= 0) store.onTaughtPoint?.(best); else toast('请点在已保存轨迹的端点附近，也可在右栏输入序号','warn');
+      return;
+    }
     if (V.tool === 'align'){
       if (!inMap(x,y)) return toast('请在地图范围内选墙', 'warn');
       const points = alignment().points;
@@ -463,5 +495,10 @@ export function createMapView(store, actions){
   // 屏幕方向（像素，y 向下）→ 地图里的单位向量：地图可能转了显示角度
   const screenDir = (dx, dy) => rotatePoint({ x: dx, y: -dy }, -alignment().angle);
   cv.addEventListener('pointerleave', () => editor.leave());
-  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
+  function leaveEdit(next){
+    if (V.tool !== 'edit') return true;
+    if (!editor.close(() => { setTool('pan'); next(); })) return false;
+    setTool('pan'); return true;
+  }
+  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
 }

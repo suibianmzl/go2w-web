@@ -21,6 +21,7 @@ import os
 import struct
 import queue
 import random
+from collections import deque
 
 FAKE_CTRL_OFF = os.environ.get('GO2W_FAKE_CTRL_OFF', '/tmp/go2w_fake_ctrl_off')
 # 测试用：往这个文件写「x,y,朝向弧度」（真实坐标），假机器人瞬移过去，读完删掉（建图档没有导航可开）
@@ -123,6 +124,7 @@ class Sim:
         self.stamp_rate = float(os.environ.get('GO2W_FAKE_STAMP_RATE', '1.0'))
         self.jobs = queue.Queue()   # 其他线程交给模拟器线程执行的回调（模拟异步回复）
         self.t0 = time.monotonic()
+        self.ros_epoch_ns = time.time_ns()
         self.load(os.environ.get('GO2W_FAKE_MAP') or os.path.join(DATA, 'maps', 'lab_20261021.yaml'))
 
         # 起点：离地图原点 (0, 0) 最近的空旷处（建图通常从这里开始）
@@ -152,6 +154,12 @@ class Sim:
         self.ctrl_sent = None  # 上次发出的 (state, ready, seq)
         self.policy = os.environ.get('GO2W_CONTROL_POLICY') or 'mjlab_go2w_dgv2_m22_scratch_w02_7999'
         self.ctrl_off_until = 0.0   # 假运控重启（切策略）期间不发状态
+        self.taught_route_enabled = os.environ.get('GO2W_TAUGHT_ROUTE', '').lower() in ('1', 'true', 'yes', 'on')
+        self.taught_map_yaml = os.path.join(DATA, 'maps', self.map_name + '.yaml')
+        self.mode_environment = {'GO2W_NAVIGATION_MODE': 'navigation', 'GO2W_MAP': self.map_name + '.yaml'}
+        if self.taught_route_enabled:
+            self.mode_environment['GO2W_TAUGHT_ROUTE'] = 'true'
+        self.tf_history = deque(maxlen=200)   # 10 Hz 测量的约 20 s 精确位姿快照；不把最新位姿伪装成历史测量
 
     # ---------- 假运控 ----------
     CTRL_INTERP = 2.0   # FixStand 插值时间
@@ -224,6 +232,8 @@ class Sim:
             names += ['slam_toolbox']
         if self.ready('navigation'):
             names += ['bt_navigator', 'controller_server', 'planner_server']
+            if self.taught_route_enabled:
+                names += ['taught_route']
         if self.bridge_up():
             names += ['go2w_cmd_bridge']
         if self.procs['patrol']:
@@ -252,11 +262,18 @@ class Sim:
             return 1 if self.pat and time.monotonic() >= self.pat['ready_at'] else 0
         return 0
 
-    def start_mode(self, mode, map_yaml):
+    def start_mode(self, mode, map_yaml=None, *, taught_route=False):
+        self.mode_environment = {'GO2W_NAVIGATION_MODE': mode}
+        if mode != 'mapping' and map_yaml:
+            self.mode_environment['GO2W_MAP'] = f'{map_yaml}.yaml'
+        self.taught_route_enabled = bool(taught_route) and mode == 'navigation'
+        if self.taught_route_enabled:
+            self.mode_environment['GO2W_TAUGHT_ROUTE'] = 'true'
         if map_yaml:
             self.load(os.path.join(DATA, 'maps', f'{map_yaml}.yaml'))
             self.yaml_param = map_yaml
             self.deliver_map()
+        self.taught_map_yaml = os.path.join(DATA, 'maps', self.map_name + '.yaml')
         self.procs[mode] = True
         if mode == 'mapping':
             self.slam_frame = None   # 新建图：map 坐标系和真实坐标重合
@@ -271,6 +288,7 @@ class Sim:
         for m in MODES:
             self.procs[m] = False
         self.procs['bridge'] = False   # 真机上同一个 pkill 模式会顺带杀掉遥控速度桥
+        self.taught_route_enabled = False
         self.armed = False
         self.v = self.w_ = 0.0
         self.rosout(20, 'launch', 'all processes have finished cleanly')
@@ -395,6 +413,8 @@ class Sim:
 
     # ---------- 假服务 ----------
     def has_service(self, name):
+        if name in ('/taught_route/get_parameters', '/taught_route/set_parameters'):
+            return self.ready('navigation') and self.taught_route_enabled
         if name.startswith('/go2w_cmd_bridge/'):
             return self.bridge_up()
         if name == '/navigate_to_pose/_action/cancel_goal' or '/clear_except_' in name:
@@ -413,13 +433,29 @@ class Sim:
         from rcl_interfaces.srv import GetParameters, SetParameters
         from slam_toolbox.srv import Pause as SlamPause
         from std_srvs.srv import SetBool
+        if name == '/taught_route/get_parameters':
+            return GetParameters.Response([
+                ParameterValue(ParameterType.PARAMETER_STRING, string_value=self.taught_map_yaml)
+                if n == 'map_yaml' else ParameterValue(ParameterType.PARAMETER_NOT_SET) for n in req.names])
+        if name == '/taught_route/set_parameters':
+            out = []
+            for p in req.parameters:
+                if p.name == 'map_yaml' and p.value.type == ParameterType.PARAMETER_STRING and isinstance(p.value.string_value, str):
+                    self.taught_map_yaml = p.value.string_value
+                    out.append(SetParametersResult(True))
+                else:
+                    out.append(SetParametersResult(False, 'fake taught_route 仅支持字符串参数 map_yaml'))
+            return SetParameters.Response(out)
         if '/clear_except_' in name:
             from nav2_msgs.srv import ClearCostmapExceptRegion
             self.costmap_clears = getattr(self, 'costmap_clears', 0) + 1
             return ClearCostmapExceptRegion.Response()
         if name == '/map_server/load_map':
-            path = req.map_url.replace('/go2w/data', DATA, 1)
-            if not os.path.exists(path):
+            path = req.map_url
+            # 只映射容器数据根；真实开发目录可能在 .../go2w/data/...，其中段必须原样保留。
+            if path == '/go2w/data' or path.startswith('/go2w/data/'):
+                path = DATA + path[len('/go2w/data'):]
+            if not os.path.isfile(path):
                 return LoadMap.Response(1)
             self.load(path)
             self.deliver_map()
@@ -760,9 +796,21 @@ class Sim:
         ranges = np.where(first >= 0, r[np.maximum(first, 0)], np.inf)
         return (ranges + np.random.normal(0, 0.01, n) * np.isfinite(ranges)).astype(np.float32)
 
+    def ros_time_ns(self):
+        """统一假 ROS 时间：epoch + 单调经过时间 × 时间戳倍率；租约/超时仍继续使用真实单调时钟。"""
+        return self.ros_epoch_ns + int((time.monotonic() - self.t0) * self.stamp_rate * 1_000_000_000)
+
     def stamp(self):
-        t = (time.monotonic() - self.t0) * self.stamp_rate
-        return int(t), int((t % 1) * 1e9)
+        stamp = self.ros_time_ns()
+        self.tf_history.append((stamp, self.map_pose(), (self.x, self.y, self.th), self.tilt()))
+        return divmod(stamp, 1_000_000_000)
+
+    def tf_at(self, stamp):
+        """非零查询必须对应已实际发出的测量时间；此轻量假 TF 不做时间插值。"""
+        for sample in reversed(self.tf_history):
+            if sample[0] == stamp:
+                return sample
+        raise LookupError(f'no fake tf at measurement stamp {stamp}')
 
     def tilt(self):
         """机身 (roll, pitch)，弧度：静止约 -0.4° / 0.9°，加速抬头、转弯侧倾，外加一点抖动。"""
@@ -792,7 +840,7 @@ class Sim:
     def costmap_msg(self, local):
         from nav_msgs.msg import OccupancyGrid
         m = OccupancyGrid()
-        m.info.resolution = self.res
+        m.info.resolution = float(np.float32(self.res))
         if local:   # 6 × 6 m 滚动窗口，对齐地图栅格；在 odom 坐标系（假 TF 里和 map 重合）
             half = int(3.0 / self.res)
             cx, cy = int((self.x - self.ox) / self.res), int((self.y - self.oy) / self.res)
@@ -812,7 +860,8 @@ class Sim:
     def deliver_map(self):
         from nav_msgs.msg import OccupancyGrid
         g = OccupancyGrid()
-        g.info.width, g.info.height, g.info.resolution = self.w, self.h, self.res
+        # nav_msgs/MapMetaData.resolution 在线上传输为 float32，假消息也应模拟相同舍入。
+        g.info.width, g.info.height, g.info.resolution = self.w, self.h, float(np.float32(self.res))
         g.info.origin.position.x, g.info.origin.position.y = self.ox, self.oy
         g.data = self.grid.ravel().tolist()
         self.node.deliver('/map', g)
@@ -905,6 +954,8 @@ def run(node):
         map_sent = map_up
         if alive and k % 2 == 0:  # /odom、/scan、点云、Nav2 反馈 10 Hz，和真机一致
             o = Odometry()
+            o.header.frame_id = 'odom'
+            o.child_frame_id = 'base_footprint'
             o.header.stamp.sec, o.header.stamp.nanosec = sim.stamp()
             o.pose.pose.position.x, o.pose.pose.position.y = sim.x, sim.y
             o.pose.pose.orientation.z, o.pose.pose.orientation.w = math.sin(sim.th/2), math.cos(sim.th/2)
@@ -912,6 +963,7 @@ def run(node):
             o.twist.twist.angular.z = sim.w_ / sim.stamp_rate
             node.deliver('/odom', o)
             s = LaserScan()
+            s.header.stamp.sec, s.header.stamp.nanosec = o.header.stamp.sec, o.header.stamp.nanosec
             s.header.frame_id = 'base_footprint'
             s.angle_min, s.angle_increment = -math.pi, 2*math.pi/360
             s.range_min, s.range_max = 0.1, 15.0
@@ -948,6 +1000,7 @@ def run(node):
             node.deliver('/go2w/robot_lowstate', fake_lowstate())
         if sim.loc_ready() and k % 20 == 0:  # /amcl_pose：假定位误差很小，走起来略大
             a = PoseWithCovarianceStamped()
+            a.header.stamp.sec, a.header.stamp.nanosec = sim.stamp()
             a.pose.pose.position.x, a.pose.pose.position.y = sim.x, sim.y
             sd = 0.03 + 0.02*abs(sim.v)
             a.pose.covariance[0] = a.pose.covariance[7] = sd*sd

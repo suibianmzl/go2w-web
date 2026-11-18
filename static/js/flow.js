@@ -1,14 +1,15 @@
-// 右栏「任务」：导航 / 重定位 / 建图三个标签 + 导航的五步流程（原型见 web/prototype/right_panel.html）
+// 右栏「任务」：导航 / 重定位 / 建图 / 示教采集。导航原型见 web/prototype/right_panel.html。
 // 导航（11-12 改）：1 地图 → 2 导航任务（路线 + 运行参数 + 出发按钮）。选图、编辑任务都不用开导航（后端直接读地图文件）；
 // 点「出发」后自动：站立 → 启动导航（或切图）→ 自动定位 → 解锁并下发任务。不再用 Nav2 预先检查站间路径。
 // 建图 / 重定位标签照旧：点标签就切换机器人档位，切换时先停车（取消任务、底盘上锁）。
 import { $, $$, deg } from './util.js';
 import { toast, formBox, stillCheck } from './ui.js';
 
-export function setupFlow(store, src, actions, setTool, reloc){
+export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   const prof = id => store.profiles[id];
   const up = id => ['run', 'starting'].includes(prof(id));       // 在跑或正在起来
   const run = id => prof(id) === 'run';
+  const taughtMissing = () => store.taughtAvailable === true && store.taughtNavigation === false;
   const exec = p => Promise.resolve(p).then(r => { if (r && r.ok === false) toast(r.msg || '操作失败', 'err'); else if (r?.msg) toast(r.msg); return r; });
   store.uiTask = null;          // 用户选的标签（同一个导航栈上可以是「导航」或「重定位」）
   store.initPose = null;        // 这一轮导航里给过初始位置（或确认过当前位置正确）
@@ -19,6 +20,7 @@ export function setupFlow(store, src, actions, setTool, reloc){
   // 当前标签：跟着机器人实际在跑的档位走；什么都没开时默认「导航」（离线选图、编辑任务）
   function tab(){
     if (up('mapping')) return 'map';
+    if (store.uiTask === 'taught') return 'taught';
     if (up('localization')) return store.uiTask === 'nav' ? 'nav' : 'reloc';
     if (up('navigation')) return store.uiTask === 'reloc' ? 'reloc' : 'nav';
     return store.uiTask || 'nav';
@@ -50,11 +52,24 @@ export function setupFlow(store, src, actions, setTool, reloc){
       } });
   }
   // 标签对应的档位已经在跑（或正在起来）
-  const live = t => t === 'nav' ? up('navigation') : t === 'reloc' ? up('navigation') || up('localization') : up('mapping');
-  function switchTo(t){
+  const live = t => t === 'taught' ? store.uiTask === 'taught' : t === 'nav' ? up('navigation') : t === 'reloc' ? up('navigation') || up('localization') : up('mapping');
+  function switchTo(t, guards = {}){
     if (t === tab() && live(t)) return;
+    // 先完成当前地图编辑器的离开确认，避免切换任务/档位让 tick 直接丢掉未保存的格子修改。
+    if (!guards.edit && !mapView.leaveEdit(() => switchTo(t,{...guards,edit:true}))) return;
+    // 采集归属于明确 session；切换任务必须等暂停确认返回，不能只隐藏面板后继续后台采样。
+    if (!guards.taught && store.uiTask === 'taught' && t !== 'taught' && !taught.leave(() => switchTo(t,{...guards,taught:true}))) return;
     if (tab() === 'reloc' && t !== 'reloc' && reloc.changed()) return reloc.leave(() => switchTo(t));
     const b = busyMsg(); if (b) return toast(b, 'warn');
+    if (t === 'taught'){
+      const go = async () => {
+        if (up('mapping')){ const r = await exec(src.cmd.setMode(null)); if (r?.ok === false) return; }
+        await park(); setTool('pan'); resetPrep(); store.uiTask = 'taught'; taught.enter(); render();
+      };
+      if (up('mapping')) return formBox({title:'切换到示教采集',body:'将停止建图，使用已保存的地图记录参考轨迹。',warn:leavingMapWarn(),ok:'停止建图并切换',danger:!store.mapSavedAt,onOk:go});
+      if (routeActive()) return formBox({title:'切换到示教采集',body:'当前导航任务会取消，底盘会上锁。选择地图并完成定位自检后，再明确开始采集。',ok:'取消任务并切换',danger:true,onOk:go});
+      return go();
+    }
     if (t === 'nav'){
       // 导航不在这里启动：点「出发」时再启动
       if (up('mapping')){
@@ -195,11 +210,13 @@ export function setupFlow(store, src, actions, setTool, reloc){
     }
     // 2 导航
     prep.step = 'nav';
-    if (!run('navigation')){
-      if (prep.runT) return prepFail('nav', '导航停了');
-      if (up('navigation') || store.busy) return;              // 启动中
-      if (!prep.navT){ prep.navT = now; exec(src.cmd.setMode('navigation', prep.map)); return; }
-      if (now - prep.navT > 8000) prepFail('nav', '导航没有启动起来：看「日志」里的报错');
+    if (!run('navigation') || taughtMissing()){
+      if (prep.runT) return prepFail('nav', taughtMissing() ? '示教导航节点离线了' : '导航停了');
+      if (store.busy || prof('navigation') === 'starting' || prof('navigation') === 'stopping') return;
+      // 只有用户点普通任务「出发」才会到这里。旧导航未启用示教时也请求一次原档位启用流程；
+      // navT 在整次出发中只写一次，等待期间不重复启停。计划内停/启阶段不能提前写 runT。
+      if (!prep.navT){ prep.navT = now; store.initPose = null; exec(src.cmd.setMode('navigation', prep.map)); return; }
+      if (now - prep.navT > 8000) prepFail('nav', taughtMissing() ? '示教导航节点没有就绪：看「日志」里的报错' : '导航没有启动起来：看「日志」里的报错');
       return;
     }
     if (!prep.runT) prep.runT = now;
@@ -254,13 +271,13 @@ export function setupFlow(store, src, actions, setTool, reloc){
     $('#prepStop').textContent = F ? '关闭' : '取消出发';
     const C = store.ctrl, order = ['stand', 'nav', 'loc', 'go'], cur = order.indexOf(prep.step);
     const st = k => { const i = order.indexOf(k); return F?.k === k ? 'fail' : i < cur ? 'ok' : i === cur && prep.on ? 'run' : 'todo'; };
-    const navHere = run('navigation') && liveMap() && store.mapCurrent === prep.map;
+    const navHere = run('navigation') && !taughtMissing() && liveMap() && store.mapCurrent === prep.map;
     const text = {
       stand: !C?.on ? (store.source === 'ros' ? '运控状态未接入（GO2W_CTRL=0）：用遥控器站起来' : '模拟：没有运控')
         : C.op === 'up' ? '站起中…（站稳约 2 s，再启动策略）'
         : C.state === 'Velocity' && C.ready ? '已站起，策略运行中'
         : C.state === 'Passive' ? '趴着，站起来' : C.state === 'FixStand' ? '站着，启动策略' : C.state || '收不到运控状态',
-      nav: navHere ? `运行中 · ${store.mapCurrent}` : prep.loadT ? `切换到地图 ${prep.map}…` : run('navigation') ? '等待地图…' : '启动中…（机器人保持静止）',
+      nav: navHere ? `运行中 · ${store.mapCurrent}` : prep.loadT ? `切换到地图 ${prep.map}…` : run('navigation') && taughtMissing() ? '启用示教导航中…（机器人保持静止）' : run('navigation') ? '等待地图…' : '启动中…（机器人保持静止）',
       loc: store.initPose && navHere ? `(${R.x.toFixed(2)}, ${R.y.toFixed(2)}) · ${Math.round(deg(R.th)) || 0}°${m != null ? ` · 匹配率 ${m.toFixed(0)}%` : ''}`
         : store.autoLoc?.state === 'move' ? store.autoLoc.msg || '移动后重试…'
         : store.autoLoc?.state === 'run' ? '定位中…（机器人保持静止）' : '等待自动定位…',
@@ -328,6 +345,8 @@ export function setupFlow(store, src, actions, setTool, reloc){
     $('#flowNav').hidden = t !== 'nav';
     $('#flowReloc').hidden = t !== 'reloc';
     $('#flowMap').hidden = t !== 'map';
+    $('#flowTaught').hidden = t !== 'taught';
+    taught.render();
     // 执行中：步骤收起来，只看进度卡片
     const showTask = store.task.type !== 'idle';
     $('#taskCard').hidden = !(showTask && (t === 'nav' || !t));

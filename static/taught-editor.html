@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>示教路线编辑器 · EvoX</title>
+  <link rel="icon" type="image/png" href="/img/favicon-32.png">
+  <link rel="stylesheet" href="/css/console.css">
+  <link rel="stylesheet" href="/css/taught-editor.css">
+</head>
+<body class="taught-editor-page">
+  <main class="te-app">
+    <header class="panel te-header">
+      <div><h1>示教路线编辑器</h1><p>编辑已保存地图上的唯一参考轨迹</p></div>
+      <span class="te-offline">离线文件编辑</span>
+      <a class="btn ghost" href="/" target="_blank" rel="noopener">导航控制台</a>
+    </header>
+    <div class="te-layout">
+      <aside class="panel te-sidebar">
+        <section class="te-section">
+          <h2>地图与参考</h2>
+          <label for="editorMap">已保存地图</label>
+          <select id="editorMap"><option value="">正在读取地图列表…</option></select>
+          <div class="te-meta" id="editorMeta">尚未加载</div>
+          <p class="hint">选图只读取文件，不切换机器人地图，也不发送定位或运动指令。</p>
+          <div class="btn-row"><button class="btn" id="editorReload">重新读取</button><button class="btn" id="editorNew" disabled>新建轨迹</button></div>
+        </section>
+        <section class="te-section">
+          <div class="te-section-head"><h2>路线点</h2><span id="editorCount" class="mono">0 点</span></div>
+          <p class="hint">添加点绘制路线，或选择点后拖动。Shift + 点击可选连续区间。</p>
+          <div class="te-tools" id="editorTools" role="group" aria-label="编辑工具">
+            <button class="btn on" data-editor-tool="select" aria-pressed="true">选择 / 拖点</button><button class="btn" data-editor-tool="add" aria-pressed="false">绘制 / 加点</button><button class="btn" data-editor-tool="insert" aria-pressed="false">在段内插点</button><button class="btn" data-editor-tool="pan" aria-pressed="false">平移地图</button>
+          </div>
+          <div class="btn-row te-history"><button class="btn" id="editorUndo" disabled>撤销</button><button class="btn" id="editorRedo" disabled>重做</button></div>
+          <div class="te-selection">
+            <label for="editorIndex">当前点序号</label>
+            <div class="inrow"><button class="btn" id="editorPrev" aria-label="上一个路线点">上一点</button><input id="editorIndex" type="number" min="1" step="1" value="1" aria-label="当前点序号"><button class="btn" id="editorNext" aria-label="下一个路线点">下一点</button></div>
+            <div class="te-coordinates"><label>x（米）<input id="editorX" type="number" step="0.01"></label><label>y（米）<input id="editorY" type="number" step="0.01"></label></div>
+            <button class="btn te-wide" id="editorApply">应用坐标</button>
+            <div class="te-range"><label>区间起点<input id="editorRangeStart" type="number" min="1" step="1" value="1"></label><label>区间终点<input id="editorRangeEnd" type="number" min="1" step="1" value="1"></label><button class="btn" id="editorRangeSelect">选中区间</button></div>
+            <div class="te-point-list" id="editorPoints" role="group" aria-label="附近路线点"></div>
+            <div class="btn-row"><button class="btn" id="editorInsert">选中点后插入</button><button class="btn danger" id="editorDelete">删除选中点</button></div>
+          </div>
+        </section>
+        <section class="te-section te-save-section">
+          <div class="te-section-head"><h2>保存参考</h2><strong id="editorDirty">未修改</strong></div>
+          <p class="hint">保存会检查完整机器人足迹、平滑与连续性。检查通过后更新地图的参考修订。</p>
+          <button class="btn pri te-wide" id="editorSave" disabled>校验并保存</button>
+          <button class="btn ghost te-wide" id="editorExport" disabled>导出当前草稿</button>
+          <div class="note te-message" id="editorMessage" role="status" aria-live="polite">选择地图后开始编辑。</div>
+        </section>
+      </aside>
+      <section class="panel te-stage" id="editorStage" aria-label="离线地图编辑区">
+        <canvas id="editorCanvas" tabindex="0" aria-label="路线画布。选择点后用方向键移动，Delete 删除，Ctrl 加 Z 撤销。"></canvas>
+        <div class="te-stage-top"><div class="te-map-title"><b id="editorMapTitle">尚未选图</b><span id="editorSummary">无参考轨迹</span></div><div class="te-view-tools" role="group" aria-label="地图显示方向"><button class="btn" id="editorFit">适配全图</button><button class="btn" id="editorRotateLeft" aria-label="逆时针旋转显示 90 度">左转 90°</button><button class="btn" id="editorRotateRight" aria-label="顺时针旋转显示 90 度">右转 90°</button><button class="btn" id="editorRotateReset">方向复位</button></div></div>
+        <div class="te-empty" id="editorEmpty"><b>加载一张已保存地图</b><span>没有示教轨迹时，可以直接绘制并保存。</span></div>
+        <div class="te-stage-bottom"><div><span id="editorToolHint">拖动平移 · 滚轮缩放</span><small id="editorCursor">x -- / y --</small></div><label><input type="checkbox" id="editorShowReference" checked>显示已保存参考（琥珀虚线）</label><span class="mono" id="editorAngle">显示 0°</span></div>
+      </section>
+    </div>
+  </main>
+  <div class="toast" id="toast"><i></i><span></span></div>
+  <script type="module" src="/js/taught_editor.js"></script>
+</body>
+</html>

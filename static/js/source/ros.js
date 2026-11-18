@@ -2,12 +2,14 @@
 // P0：地图、位姿、scan、健康状态；P1：初始位姿、导航目标、取消、解锁 / 上锁、急停、调参、心跳
 // P2：代价地图、全局路径、局部轨迹（按 /cmd_vel 外推）、点云、AMCL 粒子、/rosout 日志
 import { gridToCanvas, costToCanvas, wallMask, CLOUD } from '../util.js';
+import { storeTaughtDocument } from '../taught_geometry.js';
 
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
   'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
-  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking']);
+  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking',
+  'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
 };
@@ -53,6 +55,8 @@ export function createRosSource(store, bus){
       if (store.link.ok) log('WARN', 'go2w_web', 'connection lost, retrying');
       store.link = { ok: false, ms: null };
       store.robot.valid = false; store.odomOk = false; store.armed = null;
+      // 断线后清掉浏览器保存的遥控速度，重连必须重新操作；不能让旧的续发器在新连接上继续发速度。
+      teleCmd = null; if (teleTimer){ clearInterval(teleTimer); teleTimer = null; }
       for (const [, res] of pending) res({ ok: false, msg: '和后端的连接断开了' });
       pending.clear();
       if (camWanted) bus.emit('cam', { state: 'disconnected' });
@@ -94,6 +98,7 @@ export function createRosSource(store, bus){
       case 'toast': bus.emit('toast', m.msg, m.level || 'warn'); break;
       case 'msg': for (const cb of watchers.get(m.topic) || []) cb(m); break;
       case 'routes': store.routes = m.items; break;
+      case 'taught': storeTaughtDocument(store, m); break;
       case 'map_views': store.mapViews = m.items || {}; break;
       case 'task': onTask(m.task); break;
       case 'pose': {
@@ -141,6 +146,8 @@ export function createRosSource(store, bus){
         store.cont = m.cont || null;
         store.autosave = m.autosave || null;
         store.webVersion = m.webVersion || null;
+        store.taughtAvailable = typeof m.taughtAvailable === 'boolean' ? m.taughtAvailable : null;
+        store.taughtNavigation = typeof m.taughtNavigation === 'boolean' ? m.taughtNavigation : null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
@@ -198,6 +205,16 @@ export function createRosSource(store, bus){
   }
 
   const real = {
+    taughtGet: map => send('taught_get', { map }),
+    taughtSave: p => send('taught_save', p, 125000),
+    taughtPrepare: map => send('taught_prepare', { map }, 15000),
+    taughtCheck: map => send('taught_check', { map }, 35000),
+    taughtStart: p => send('taught_start', p, 35000),
+    taughtPause: session_id => send('taught_pause', { session_id }),
+    taughtResume: session_id => send('taught_resume', { session_id }, 35000),
+    taughtFinish: session_id => send('taught_finish', { session_id }, 125000),
+    taughtAbandon: session_id => send('taught_abandon', { session_id }),
+    taughtStatus: map => send('taught_status', map ? { map } : {}),
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
     autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
     autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）

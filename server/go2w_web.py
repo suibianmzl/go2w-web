@@ -32,6 +32,7 @@ import math
 import os
 import shutil
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -83,6 +84,8 @@ import mapedit as ME
 import mapfile
 import procs as P
 import robot_ctrl as R
+from teaching import TeachingError
+from teaching_bridge import TaughtMeasurements, TaughtWeb
 
 # 二进制帧类型。代价地图 / 点云 / 粒子较重，只发给打开了对应图层的网页
 T_MAP, T_SCAN, T_GCOST, T_LCOST, T_CLOUD, T_PART = 1, 2, 3, 4, 5, 6
@@ -400,7 +403,7 @@ class SysStats:
         return {'cpu': cpu, 'mem': round(used_g, 2), 'memTotal': round(total_g, 1)}
 
 
-class Bridge(Node):
+class Bridge(TaughtMeasurements, Node):
     # 节点名 → 界面上的名字；按 launch 文件里的 name= 对应
     NODES = [
         ('livox_lidar_publisher', '雷达驱动'),
@@ -415,6 +418,7 @@ class Bridge(Node):
 
     def __init__(self):
         super().__init__('go2w_web')
+        self.init_taught_measurements()
         self.tf = Buffer()
         self.tf_listener = TransformListener(self.tf, self)
         self.rates = {k: Rate() for k in ('/scan', '/odom', '/odom_healthy', '/go2w_cmd_bridge/armed')}
@@ -498,6 +502,7 @@ class Bridge(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.loadmap_cli = self.create_client(LoadMap, '/map_server/load_map')
         self.mapparam_cli = self.create_client(GetParameters, '/map_server/get_parameters')
+        self.taught_param_cli = self.create_client(SetParameters, '/taught_route/set_parameters')
         # 续建：从基准 posegraph 恢复。服务名照核实过的上游源码（slam_toolbox_common.cpp），
         # 注意 save_map.sh 里用的是 /slam_toolbox/serialize_map，两者同一套命名
         self.deser_cli = (self.create_client(DeserializePoseGraph, '/slam_toolbox/deserialize_map')
@@ -560,6 +565,7 @@ class Bridge(Node):
             n2[1:, :] |= near[:-1, :]; n2[:-1, :] |= near[1:, :]; n2[:, 1:] |= near[:, :-1]; n2[:, :-1] |= near[:, 1:]
             near = n2
         self.near_occ, self.map_info = near, (info.resolution, info.origin.position.x, info.origin.position.y, info.width, info.height)
+        self.observe_taught_map(m, near)
         if abs(yaw_of(info.origin.orientation)) < 1e-6:   # 自动定位只支持不旋转的地图原点（slam_toolbox / map_server 都是）
             self.map_raw = (np.asarray(m.data, dtype=np.int8).reshape(info.height, info.width),
                             info.resolution, info.origin.position.x, info.origin.position.y)
@@ -584,6 +590,7 @@ class Bridge(Node):
     def on_scan(self, m):
         self.rates['/scan'].tick()
         self.keep_scan_base(m)
+        self.observe_taught_scan(m)
         tfm = self.lookup(m.header.frame_id)
         if tfm is None:
             return
@@ -848,6 +855,7 @@ class Bridge(Node):
         return hits[0] if len(hits) == 1 else param
 
     def on_odom(self, m):
+        self.observe_taught_odom(m)
         self.rates['/odom'].tick()
         t = m.twist.twist
         self.odom = (t.linear.x, t.linear.y, t.angular.z)
@@ -965,6 +973,10 @@ class Bridge(Node):
         m = PoseWithCovarianceStamped()
         m.header.frame_id = 'map'
         m.header.stamp = self.get_clock().now().to_msg()
+        # 后续示教仅接受本次修正之后的测量，延迟送达的旧scan/odom不能刷新定位自检。
+        with self._taught_lock:
+            self._taught_pose_stamp = secs(m.header.stamp)
+            self._taught_scan = None
         m.pose.pose.position.x, m.pose.pose.position.y = float(x), float(y)
         m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(th / 2), math.cos(th / 2)
         cov = [0.0] * 36
@@ -1178,7 +1190,7 @@ class Bridge(Node):
         return profiles
 
 
-class Server:
+class Server(TaughtWeb):
     def __init__(self, node, static_dir, heartbeat):
         self.node, self.static_dir, self.heartbeat = node, static_dir, heartbeat
         # 版本号（11-18）：static/version.json，跟着 release 走；推给网页，和页面自己加载的版本比，不一样就提示刷新
@@ -1298,6 +1310,7 @@ class Server:
         self.ctrl_online = None    # 运控在线状态（ctrl_watch 记变化）；None = 刚启动还没判断
         self.t_start = time.monotonic()
         self.prep_hold_t = -1e9    # 网页自检最近一次说「我在自检」的时间
+        self.init_taught(DATA)
 
     # ---------- 工具 ----------
     def aw(self, fut, timeout=3.0):
@@ -1348,6 +1361,7 @@ class Server:
                 n.event('WARN', f'{reason}：已取消导航并上锁')
             return errors
         finally:
+            await self.taught_interrupt(reason)
             self.motion_stops -= 1
 
     # ---------- 指令 ----------
@@ -1371,6 +1385,18 @@ class Server:
             return False, '地图正在保存或对齐，请稍等'
         if ws.closed or ws not in self.clients:
             return False, '网页已断开'
+        if isinstance(op, str) and op.startswith('taught_'):
+            try:
+                return await self.handle_taught(ws, d)
+            except (TeachingError, ValueError) as e:
+                return False, str(e)
+        if self._taught_job is not None and (op in ('goal', 'route_start', 'set_mode', 'load_map', 'autoloc_move')
+                                            or (op == 'arm' and d.get('on'))):
+            return False, '示教正在加载地图或定位自检，请保持静止并等待结果'
+        if self.taught_recording() and op in ('goal', 'route_start', 'initial_pose', 'auto_localize', 'autoloc_move'):
+            return False, '示教正在采集，请先暂停或结束采集'
+        if self.taught_open() and self.taught_owner is not None and self.taught_owner is not ws and op == 'arm' and d.get('on'):
+            return False, '另一个网页正在进行示教采集，请在原页面操作'
         if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize', 'autoloc_move'):
             return False, '正在检查路线，请稍等'
         if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
@@ -1432,6 +1458,9 @@ class Server:
                     return False, 'Nav2 没有运行（navigate_to_pose 不可用）'
                 if self.goal_pending:
                     return False, '正在发送导航目标'
+                ok, message = await self.check_ordinary_taught_binding(n.map_current)
+                if not ok:
+                    return False, message
                 self.route = None
                 # 结束的旧目标（卡片会保留 5 s）先清掉：等 Nav2 接受新目标时，卡片不能显示旧目标的「已取消 / 失败」
                 with n.lock:
@@ -1448,6 +1477,7 @@ class Server:
                 n.event('INFO', f"导航目标 ({d['x']:.2f}, {d['y']:.2f}, {math.degrees(d['th']):.0f}°)")
                 return True, '目标已下发' if n.is_armed() else '目标已下发，底盘上锁中，解锁后才会运动'
             if op == 'cancel':
+                await self.taught_interrupt('手动取消，示教草稿已保留')
                 self.motion_stops += 1
                 try:
                     self.stop_route('手动取消')
@@ -1465,6 +1495,8 @@ class Server:
                     self.motion_stops -= 1
             if op == 'arm':
                 on = bool(d.get('on'))
+                if not on:
+                    await self.taught_interrupt('底盘上锁，示教草稿已保留')
                 if on and self.estop:
                     return False, '急停中：先解除急停'
                 if not on and self.route_running():
@@ -1764,6 +1796,7 @@ class Server:
         """有事在做，不算空闲：任务、导航、遥控、巡逻、检查、自动定位、站起趴下、档位切换、网页自检中、保持站立、还在走。"""
         n = self.node
         return bool(self.route_running() or self.goal_pending or n.nav_active() or self.teleop is not None
+                    or self.taught_recording() or self._taught_job is not None
                     or self.checking_route or self.autoloc_busy or self.ctrl_op or self.busy or self.map_loading
                     or self.stand_hold or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
                     or self.prof('patrol') != 'stop' or self.moving())
@@ -2113,6 +2146,10 @@ class Server:
         """网页「出发」：先把这次的速度上限（vmax / wmax，导航没开时在网页上选好的）设给 cmd_bridge，
         arm=true 时再解锁出发；出发失败就把刚解的锁再上回去。"""
         n, armed_here = self.node, False
+        record = self.routes.get(d.get('route_id'))
+        ok, message = await self.check_ordinary_taught_binding(record['map'] if record else n.map_current)
+        if not ok:
+            return False, message
         for key, top in (('vmax', 1.2), ('wmax', 1.5)):
             v = d.get(key)
             if v is None:
@@ -2213,7 +2250,7 @@ class Server:
             np.savez(path, grid=grid, res=res, origin=np.array([ox, oy]), pts=np.concatenate(scans).astype(np.float32))
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
             # nice：别和 FAST-LIO / AMCL 抢 CPU
-            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', 'python3', script, path,
+            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', sys.executable, script, path,
                                                         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), AUTOLOC_TIMEOUT)
@@ -2631,14 +2668,16 @@ class Server:
         self.pending.add(t)
         t.add_done_callback(self.pending.discard)
 
-    def set_mode(self, mode, map_name=None):
+    def set_mode(self, mode, map_name=None, *, force=False, taught_route=False):
         n = self.node
         if self.busy or self.map_busy:
             return False, '上一个启停还没完成，稍等几秒'
         if mode is not None and mode not in P.MODES:
             return False, f'没有这个档位：{mode}'
         cur = [m for m in P.MODES if self.prof(m) != 'stop']
-        if mode is not None and cur == [mode]:
+        if mode == 'navigation' and self.taught_repo.available and 'taught_route' not in n.get_node_names():
+            force = True
+        if mode is not None and cur == [mode] and not force:
             return True, f'{self.MODE_NAME[mode]}已经在运行'
         if mode in ('localization', 'navigation'):
             names = [m['name'] for m in self.maps]
@@ -2649,14 +2688,16 @@ class Server:
             return True, '没有在运行的档位'
         self.busy = True
         self.stop_route('切换运行档位')
-        self.background(self.do_mode(mode, cur, map_name))
+        self.background(self.do_mode(mode, cur, map_name, taught_route=taught_route))
         if mode is None:
             return True, '正在停止……'
         return True, f"正在启动{self.MODE_NAME[mode]}{'（地图 ' + map_name + '）' if map_name else ''}：FAST-LIO 初始化时机器人要保持静止"
 
-    async def do_mode(self, mode, cur, map_name):
+    async def do_mode(self, mode, cur, map_name, *, taught_route=False):
         n = self.node
         try:
+            await self.taught_interrupt('运行档位切换，示教草稿已保留')
+            self.taught_invalidate('运行服务已切换，请重新加载地图并定位自检')
             if cur or self.prof('patrol') != 'stop':
                 for m in cur:
                     self.transitions[m] = 'stopping'
@@ -2697,7 +2738,8 @@ class Server:
                 self.starting[mode] = time.monotonic()
                 if mode == 'mapping':
                     self.autosave_new_session()
-                await self.procs.start_mode(mode, map_name)
+                # 新版网页启动导航时始终启用示教代理：无参考时仍走原规划；有参考自动读取地图YAML。
+                await self.procs.start_mode(mode, map_name, taught_route=(mode == 'navigation' and self.taught_repo.available) or taught_route)
                 await asyncio.sleep(0.3)
                 await self.refresh_procs()
                 n.event('INFO', f"启动{self.MODE_NAME[mode]}{'（地图 ' + map_name + '）' if map_name else ''}，"
@@ -3770,12 +3812,15 @@ class Server:
             used[self.cont['base']] = '续建正在拿它当基准'
         if self.route_running():
             used[self.route['record']['map']] = '正在执行它上面的任务'
+        if self.taught_open():
+            used[self._taught_capture['map']] = '有未结束的示教采集草稿'
         return used
 
     @staticmethod
     def trash_map(maps_dir, name, dest, routes, view):
         """把 <name>.* 挪进 dest（同一个文件系统，rename 不拷数据）。返回挪走的字节数。"""
-        files = [f for f in os.listdir(maps_dir) if f.startswith(name + '.') and os.path.isfile(os.path.join(maps_dir, f))]
+        files = [f for f in os.listdir(maps_dir) if f.startswith(name + '.') and
+                 (os.path.isfile(os.path.join(maps_dir, f)) or f == name + '.taught')]
         os.makedirs(dest)
         with open(os.path.join(dest, 'deleted.json'), 'w', encoding='utf-8') as f:
             json.dump({'map': name, 'deleted': time.strftime('%Y-%m-%d %H:%M:%S'), 'files': sorted(files),
@@ -3784,7 +3829,11 @@ class Server:
         # yaml 先挪：中途出错时 list_maps 就不再列这张图，不会留下「有 yaml 没 pgm」的坏图
         for fn in sorted(files, key=lambda f: not f.endswith('.yaml')):
             src = os.path.join(maps_dir, fn)
-            size += os.path.getsize(src)
+            if os.path.isdir(src) and not os.path.islink(src):
+                size += sum(os.path.getsize(os.path.join(root, child)) for root, _, children in os.walk(src)
+                            for child in children if not os.path.islink(os.path.join(root, child)))
+            else:
+                size += os.lstat(src).st_size
             os.replace(src, os.path.join(dest, fn))
         return size
 
@@ -3870,6 +3919,9 @@ class Server:
         n = self.node
         if name not in [m['name'] for m in self.maps]:
             return False, f'data/maps 里没有 {name}'
+        if self.taught_recording():
+            await self.disarm_and_cancel('地图切换，示教草稿已保留')
+        self.taught_invalidate('地图已切换，请重新定位并自检')
         if not n.loadmap_cli.service_is_ready():
             self.map_choice = name
             self.save_last_map(name)
@@ -3887,6 +3939,7 @@ class Server:
             if r.result != 0:
                 return False, f'map_server 加载失败（错误码 {r.result}）'
             n.map_current = n.map_loaded = name
+            await self.sync_taught_map(name)
         finally:
             self.map_loading = False
         n.event('WARN', f'已切换到地图 {name}：请重新设置初始位姿')
@@ -4007,7 +4060,11 @@ class Server:
     def on_teleop(self, ws, d):
         """网页按住按键时每 0.1 s 发一次；后端 0.3 s 收不到就发零速并停止发布。"""
         n, now = self.node, time.monotonic()
-        if self.route_running() or self.checking_route:
+        if self._taught_job is not None:
+            refuse = '示教正在定位自检，请保持静止'
+        elif self.taught_open() and self.taught_owner is not None and self.taught_owner is not ws:
+            refuse = '另一个网页正在进行示教采集'
+        elif self.route_running() or self.checking_route:
             refuse = '多点任务或路线检查进行中，请先结束'
         else:
             refuse = '急停中' if self.estop else '底盘锁定中，先解锁' if not n.is_armed() else None
@@ -4061,6 +4118,10 @@ class Server:
         try:
             self.tx_put(ws, self.routes_message(), 'routes')
             self.tx_put(ws, self.views_message(), 'views')
+            taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
+            if taught_map:
+                c['taught_map'] = taught_map
+                self.tx_put(ws, json.dumps({'t':'taught', **await self.taught_document(taught_map)}), 'taught')
             if self.node.map_blob:
                 self.tx_put(ws, self.node.map_blob, 'map')
             if self.node.plan:
@@ -4109,13 +4170,17 @@ class Server:
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
             if ws is self.owner:
                 self.owner = None
-                await self.lose_owner(f'控制方网页断开（{remote}）')
+                await self.lose_owner(f'控制方网页断开（{remote}）', owner=ws)
+            else:
+                await self.taught_owner_lost(ws, f'采集页面断开（{remote}），草稿已保留')
         return ws
 
-    async def lose_owner(self, reason):
+    async def lose_owner(self, reason, owner=None):
         n = self.node
         if self.route_running() or n.is_armed() or n.nav_active():
             await self.disarm_and_cancel(reason)
+        if owner is not None:
+            await self.taught_owner_lost(owner, reason)
 
     def wants(self, layer):
         return any(layer in c['layers'] for c in list(self.clients.values()))
@@ -4194,7 +4259,7 @@ class Server:
                     gap = time.monotonic() - self.clients[o]['last_ping']
                     if gap > self.heartbeat:
                         self.owner = None
-                        await self.lose_owner(f"控制方网页心跳丢失 {gap:.1f} s（{self.clients[o]['remote']}）")
+                        await self.lose_owner(f"控制方网页心跳丢失 {gap:.1f} s（{self.clients[o]['remote']}）", owner=o)
                 if self.route and self.route['status'] == 'active':
                     reason = self.route_blocker(self.owner, self.route['record'])
                     if reason:
@@ -4263,6 +4328,8 @@ class Server:
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
                               cont=self.cont_state(), autosave=self.autosave_view(), webVersion=self.version)
+                    st.update(taughtAvailable=self.taught_repo.available,
+                              taughtNavigation='taught_route' in n.get_node_names())
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
@@ -4286,15 +4353,19 @@ class Server:
         app.router.add_get('/', self.index)
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
+        self.taught_routes(app)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):
                 app.router.add_static(f'/{sub}/', os.path.join(self.static_dir, sub))
 
         async def start(a):
             a['tasks'] = [asyncio.create_task(self.broadcast()), asyncio.create_task(self.safety()),
-                          asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor())]
+                          asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor()),
+                          asyncio.create_task(self.taught_loop())]
 
         async def stop(a):
+            if self.taught_recording():
+                await self.disarm_and_cancel('网页服务关闭，示教草稿已保留')
             if self.route_running():
                 await self.disarm_and_cancel('网页服务关闭')
                 await asyncio.gather(self.route_job, return_exceptions=True)
@@ -4303,6 +4374,7 @@ class Server:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.to_thread(self.captures.close)
             await self.procs.close()
             if self.ctrl is not None:
                 self.ctrl.close()

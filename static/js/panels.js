@@ -36,10 +36,18 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   function renderLayers(){
     $('#layers').innerHTML = LAYERS.map(l => { const na = ros && !l.ros, topic = ros ? (l.ros || l.topic) : l.topic;
       return `<div class="layer ${na?'na':''}" title="${na ? l.note : ''}"><span class="sw" style="background:${l.c==='grad'?'linear-gradient(135deg,#ff4fa3,#6fb6ff)':l.c}"></span>
-      <div class="nm">${l.name}<small>${topic}${na ? ' · 真机上没有' : ''}</small></div>
+      <div class="nm">${l.name}${l.id === 'taught' ? '<a class="taught-layer-edit" id="taughtLayerEdit" href="/taught-editor" target="_blank" rel="noopener">编辑</a><small id="taughtLayerMeta">每张地图一条参考</small>' : `<small>${topic}${na ? ' · 真机上没有' : ''}</small>`}</div>
       <button class="tg" role="switch" aria-label="${l.name}" aria-checked="${l.on}" data-l="${l.id}"></button></div>`; }).join('');
     $('#layerCount').textContent = `${LAYERS.filter(l => l.on).length}/${LAYERS.length}`;
     if (src.setLayers) src.setLayers(LAYERS.filter(l => l.on && l.heavy).map(l => l.id));
+    renderTaughtLayer();
+  }
+  function renderTaughtLayer(){
+    const map = store.mapCurrent, d = store.taughtByMap[map], el = $('#taughtLayerMeta');
+    if (!el) return;
+    el.textContent = map ? `${map} · ${d ? `${d.points?.length || 0} 点 / ${Number(d.length || 0).toFixed(1)} m` : '未读取'}` : '先选一张已保存的地图';
+    el.title = el.textContent;
+    $('#taughtLayerEdit').href = map ? `/taught-editor?map=${encodeURIComponent(map)}` : '/taught-editor';
   }
   $('#layers').addEventListener('click', e => { const b = e.target.closest('[data-l]'); if (!b) return;
     const l = L[b.dataset.l];
@@ -739,7 +747,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
 
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
-    medium(){ renderVersion(); renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
+    medium(){ renderVersion(); renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); renderTaughtLayer(); },  // 4 Hz
     slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,
