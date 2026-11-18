@@ -31,9 +31,13 @@ class FakeObjectStore:
 class FakeArchiveStore:
     def __init__(self):
         self.objects = []
+        self.snapshots = []
 
     async def add_object(self, meta):
         self.objects.append(meta)
+
+    async def set_incident_snapshot(self, robot_id, incident_id, bucket, key):
+        self.snapshots.append((robot_id, incident_id, bucket, key))
 
 
 async def test_spool_and_worker():
@@ -73,6 +77,13 @@ async def test_spool_and_worker():
             data=frame,
             message_seq=3,
         )
+        jpeg = b'\xff\xd8\xff\xe0' + b'snapshot' + b'\xff\xd9'
+        spool.append_snapshot(
+            robot_id='go2w-01',
+            session_id='session-1',
+            incident_id='incident-1',
+            data=jpeg,
+        )
         spool.close_all()
 
         pending = list((Path(tmp) / 'spool' / 'pending').rglob('*'))
@@ -82,9 +93,9 @@ async def test_spool_and_worker():
         tos = FakeObjectStore()
         store = FakeArchiveStore()
         worker = ArchiveWorker(settings, tos, store)
-        assert await worker.process_once() == 3
+        assert await worker.process_once() == 4
         assert await worker.process_once() == 0
-        assert len(store.objects) == 3
+        assert len(store.objects) == 4
         assert all(item['tos_bucket'] == 'test-bucket' for item in store.objects)
 
         text_objects = [
@@ -108,6 +119,14 @@ async def test_spool_and_worker():
         assert length == len(frame)
         assert binary['data'][4:] == frame
         assert '/stream_type=binary-scan/' in binary_key
+        snapshot_key, snapshot = next(
+            item for item in tos.objects.items() if item[0].endswith('.jpg')
+        )
+        assert snapshot['data'] == jpeg
+        assert snapshot['content_type'] == 'image/jpeg'
+        assert '/stream_type=incident-snapshot/' in snapshot_key
+        assert store.snapshots and store.snapshots[0][:2] == (
+            'go2w-01', 'incident-1')
         assert worker.touch_heartbeat(3) is None
         assert (Path(tmp) / 'worker.heartbeat').is_file()
 

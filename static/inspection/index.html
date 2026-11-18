@@ -175,6 +175,7 @@
                   <th>异常类型</th>
                   <th>发生节点</th>
                   <th>持续 / 数据</th>
+                  <th>查看</th>
                 </tr>
               </thead>
               <tbody id="exceptionRows"></tbody>
@@ -224,6 +225,7 @@
                 <th>发生节点</th>
                 <th>持续</th>
                 <th>录包</th>
+                <th>查看</th>
               </tr>
             </thead>
             <tbody id="historyRows"></tbody>
@@ -233,6 +235,32 @@
         <div class="history-foot">
           <span class="mono" id="historySummary">0 条</span>
           <button id="historyMore" type="button">加载更多</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="incident-modal" id="incidentPlayback" hidden>
+      <div class="playback-dialog" role="dialog" aria-modal="true" aria-labelledby="playbackTitle">
+        <div class="incident-dialog-head">
+          <div>
+            <span class="eyebrow">INCIDENT SNAPSHOT</span>
+            <h2 id="playbackTitle">异常数据</h2>
+          </div>
+          <button class="dialog-close" id="playbackClose" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="playback-stage">
+          <img id="incidentSnapshot" alt="异常发生时的机器狗视频截图">
+          <canvas id="playbackMap" width="400" height="240" hidden></canvas>
+          <div class="snapshot-placeholder" id="snapshotPlaceholder">
+            <b>截图生成中</b>
+            <span>正在等待云端 RTC 视频帧</span>
+          </div>
+        </div>
+        <div class="playback-meta">
+          <span id="playbackType">--</span>
+          <span id="playbackTime">--</span>
+          <span id="playbackPoint">--</span>
+          <span id="playbackBag">--</span>
         </div>
       </div>
     </div>

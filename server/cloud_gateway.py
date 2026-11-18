@@ -140,6 +140,10 @@ class CloudGateway:
         self.command_seq = 0
         self.incidents = {}
         self.incident_tasks = set()
+        self.snapshot_requests = {}
+        self.snapshot_dir = self.archive_spool.root / 'snapshots'
+        if self.archive_enabled:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def clean_robot_id(value):
@@ -401,10 +405,17 @@ class CloudGateway:
             item = self.normalize_incident(raw, robot_id)
             if item is None:
                 continue
+            existing = by_id.get(item['id'])
+            if existing and existing.get('snapshot') and not item.get('snapshot'):
+                item['snapshot'] = existing['snapshot']
             by_id[item['id']] = item
             changed.append(item)
         merged = sorted(by_id.values(), key=lambda item: int(item['ts']), reverse=True)[:1000]
         self.incidents[robot_id] = merged
+        for item in changed:
+            if not item.get('snapshot'):
+                requests = self.snapshot_requests.setdefault(robot_id, {})
+                requests.setdefault(item['id'], archive_iso_utc())
         if changed and self.archive_enabled:
             self.archive_background(self.persist_incidents(robot_id, changed))
         return changed
@@ -1164,6 +1175,76 @@ class CloudGateway:
             'items': items,
         }, headers={'Access-Control-Allow-Origin': '*'})
 
+    def incident_snapshot_path(self, robot_id, incident_id):
+        safe_robot = self.clean_robot_id(robot_id)
+        safe_incident = re.sub(r'[^A-Za-z0-9_.-]', '-', str(incident_id))[:128]
+        return self.snapshot_dir / safe_robot / f'{safe_incident}.jpg'
+
+    async def incident_snapshot_upload(self, req):
+        robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
+        incident_id = str(req.match_info.get('incident_id'))
+        if not robot_id or not incident_id:
+            raise web.HTTPBadRequest(text='robot_id and incident_id are required')
+        length = req.content_length
+        if length is not None and length > 8 * 1024 * 1024:
+            raise web.HTTPRequestEntityTooLarge(max_size=8 * 1024 * 1024)
+        data = await req.read()
+        if len(data) < 4 or not data.startswith(b'\xff\xd8\xff'):
+            raise web.HTTPBadRequest(text='JPEG snapshot required')
+        path = self.incident_snapshot_path(robot_id, incident_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix('.jpg.tmp')
+        temp.write_bytes(data)
+        os.replace(temp, path)
+
+        local_url = (
+            f'/quadruped/api/incidents/{robot_id}/'
+            f'{incident_id}/snapshot'
+        )
+        snapshot = {
+            'state': 'saved',
+            'local_url': local_url,
+            'content_type': 'image/jpeg',
+            'captured_at': archive_iso_utc(),
+        }
+        item = next(
+            (entry for entry in self.incidents.get(robot_id, [])
+             if str(entry.get('id')) == incident_id),
+            None,
+        )
+        if item is not None:
+            updated = {**item, 'snapshot': snapshot}
+            self.incidents[robot_id] = [
+                updated if str(entry.get('id')) == incident_id else entry
+                for entry in self.incidents[robot_id]
+            ]
+            self.broadcast_text(robot_id, json.dumps({
+                't': 'incident', 'item': updated,
+            }, ensure_ascii=False, separators=(',', ':')))
+            self.archive_background(self.persist_incidents(robot_id, [updated]))
+
+        session = self.robots.get(robot_id)
+        session_id = session.session_id if session is not None else f'snapshot-{incident_id}'
+        try:
+            self.archive_spool.append_snapshot(
+                robot_id=robot_id,
+                session_id=session_id,
+                incident_id=incident_id,
+                data=data,
+            )
+        except Exception:
+            LOG.exception('archive snapshot spool failed: %s/%s', robot_id, incident_id)
+        self.snapshot_requests.get(robot_id, {}).pop(incident_id, None)
+        return web.json_response({'ok': True, 'url': local_url})
+
+    async def incident_snapshot_get(self, req):
+        robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
+        incident_id = str(req.match_info.get('incident_id'))
+        path = self.incident_snapshot_path(robot_id, incident_id)
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(path, headers={'Content-Type': 'image/jpeg'})
+
     async def robot_camera_api(self, req):
         robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
         if robot_id not in self.robot_records:
@@ -1255,7 +1336,12 @@ class CloudGateway:
                 state['updated_at'] = int(time.time())
                 self.rtc_publisher_states[robot_id] = state
         state = self.rtc_publisher_states.get(robot_id, {'robot_id': robot_id, 'state': 'unknown'})
-        return web.json_response(state, headers={'Access-Control-Allow-Origin': '*'})
+        payload = dict(state)
+        payload['snapshot_requests'] = [
+            {'incident_id': incident_id, 'requested_at': requested_at}
+            for incident_id, requested_at in self.snapshot_requests.get(robot_id, {}).items()
+        ]
+        return web.json_response(payload, headers={'Access-Control-Allow-Origin': '*'})
 
     async def cleanup(self, _app):
         self.archive_spool.close_all()
@@ -1293,6 +1379,14 @@ class CloudGateway:
             '/internal/v1/robots/{device_id}/ssh-binding', self.internal_robot_unbind)
         app.router.add_get('/quadruped/api/robots', self.robots_api)
         app.router.add_get('/quadruped/api/incidents', self.incidents_api)
+        app.router.add_get(
+            '/quadruped/api/incidents/{robot_id}/{incident_id}/snapshot',
+            self.incident_snapshot_get,
+        )
+        app.router.add_post(
+            '/internal/v1/incidents/{robot_id}/{incident_id}/snapshot',
+            self.incident_snapshot_upload,
+        )
         app.router.add_route(
             '*', '/quadruped/api/robots/{robot_id}/camera', self.robot_camera_api)
         app.router.add_get('/quadruped/rtc/config', self.rtc_config)

@@ -152,6 +152,7 @@ class FakeArchiveStore:
         self.commands = {}
         self.objects = []
         self.incidents = {}
+        self.incident_snapshots = []
 
     async def close(self):
         pass
@@ -204,6 +205,9 @@ class FakeArchiveStore:
             and (before_ms is None or int(item['ts']) < before_ms)
         ]
         return sorted(items, key=lambda item: int(item['ts']), reverse=True)[:limit]
+
+    async def set_incident_snapshot(self, robot_id, incident_id, bucket, key):
+        self.incident_snapshots.append((robot_id, incident_id, bucket, key))
 
 
 async def start_app(app):
@@ -537,6 +541,27 @@ async def test_archive_gateway():
                 }, ensure_ascii=False))
                 await browser_reader.text(
                     lambda m: m.get('t') == 'incident')
+                publisher = await session.post(
+                    base + '/quadruped/rtc/publisher-status?robot_id=go2w-01',
+                    data='{}',
+                )
+                requests = (await publisher.json())['snapshot_requests']
+                assert requests[0]['incident_id'] == 'archive-incident'
+                jpeg = b'\xff\xd8\xff\xe0snapshot\xff\xd9'
+                uploaded_snapshot = await session.post(
+                    base + '/internal/v1/incidents/go2w-01/archive-incident/snapshot',
+                    data=jpeg,
+                    headers={'Content-Type': 'image/jpeg'},
+                )
+                assert uploaded_snapshot.status == 200
+                snapshot_payload = await uploaded_snapshot.json()
+                snapshot_response = await session.get(
+                    base + snapshot_payload['url'])
+                assert snapshot_response.status == 200
+                assert await snapshot_response.read() == jpeg
+                await browser_reader.text(
+                    lambda m: m.get('t') == 'incident'
+                    and m.get('item', {}).get('snapshot', {}).get('local_url'))
                 await robot.send_bytes(bytes([2, 1, 2, 3]))
                 await browser_reader.binary(2)
 
@@ -560,6 +585,8 @@ async def test_archive_gateway():
                 assert archived_command['operation'] == 'arm'
                 assert archived_command['response']['msg'] == 'locked'
                 assert ('go2w-01', 'archive-incident') in store.incidents
+                assert store.incidents[('go2w-01', 'archive-incident')]['snapshot'][
+                    'local_url'].endswith('/snapshot')
 
                 pending = list((Path(tmp, 'archive') / 'spool' / 'pending').rglob('*'))
                 text_files = [path for path in pending if path.suffix == '.jsonl']

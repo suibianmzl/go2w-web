@@ -63,6 +63,16 @@ const els = {
   historySummary: $('#historySummary'),
   historyMore: $('#historyMore'),
   historyClose: $('#historyClose'),
+  incidentPlayback: $('#incidentPlayback'),
+  playbackTitle: $('#playbackTitle'),
+  playbackType: $('#playbackType'),
+  playbackTime: $('#playbackTime'),
+  playbackPoint: $('#playbackPoint'),
+  playbackBag: $('#playbackBag'),
+  incidentSnapshot: $('#incidentSnapshot'),
+  playbackMap: $('#playbackMap'),
+  snapshotPlaceholder: $('#snapshotPlaceholder'),
+  playbackClose: $('#playbackClose'),
   toast: $('#toast'),
 };
 
@@ -86,6 +96,7 @@ const state = {
   selectedRouteId: '',
   incidents: [],
   history: { items: new Map(), before: null, loading: false, hasMore: true },
+  playbackId: null,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -376,6 +387,11 @@ function mergeIncidents(items, replace = false){
     .sort((left, right) => right.ts - left.ts)
     .slice(0, 1000);
   renderExceptions();
+  if (state.playbackId){
+    const current = state.incidents.find(item => item.id === state.playbackId)
+      || state.history.items.get(state.playbackId);
+    if (current) renderPlayback(current);
+  }
 }
 
 function renderExceptions(){
@@ -398,6 +414,7 @@ function renderExceptions(){
           <span class="bag-state" data-s="${esc(item.bag?.state || '')}">${esc(bagLabel(item))}</span>
         </div>
       </td>
+      <td><button class="view-button" type="button" data-view-index="${index}">查看</button></td>
     </tr>
   `).join('');
 }
@@ -435,8 +452,93 @@ function renderHistory(){
       <td>${esc(item.task?.pointName || '--')}</td>
       <td class="mono">${esc(incidentDuration(item))}</td>
       <td><span class="bag-state" data-s="${esc(item.bag?.state || '')}">${esc(bagLabel(item))}</span></td>
+      <td><button class="view-button" type="button" data-history-view="${esc(item.id)}">查看</button></td>
     </tr>
   `).join('');
+}
+
+function renderPlayback(item){
+  if (!item) return;
+  state.playbackId = item.id;
+  els.playbackTitle.textContent = `异常数据 · ${formatIncidentTime(item.ts)} · ${item.label}`;
+  els.playbackType.textContent = item.label;
+  els.playbackTime.textContent = formatIncidentTime(item.ts);
+  els.playbackPoint.textContent = item.task?.pointName || '无任务节点';
+  els.playbackBag.textContent = bagLabel(item);
+  const url = item.snapshot?.local_url || item.snapshot?.url;
+  if (url){
+    els.incidentSnapshot.src = url;
+    els.incidentSnapshot.hidden = false;
+    els.snapshotPlaceholder.hidden = true;
+  } else {
+    els.incidentSnapshot.removeAttribute('src');
+    els.incidentSnapshot.hidden = true;
+    els.snapshotPlaceholder.hidden = false;
+  }
+  drawPlaybackMap(item);
+}
+
+function drawPlaybackMap(item){
+  const canvas = els.playbackMap;
+  const pose = item.pose;
+  const map = state.map;
+  if (!map || !Number.isFinite(pose?.x) || !Number.isFinite(pose?.y)
+    || (item.map && state.machine?.mapCurrent && item.map !== state.machine.mapCurrent)){
+    canvas.hidden = true;
+    return;
+  }
+  canvas.hidden = false;
+  const context = canvas.getContext('2d');
+  const width = canvas.width, height = canvas.height;
+  const rangeX = 16, rangeY = rangeX * height / width;
+  const scale = Math.min(width / rangeX, height / rangeY);
+  const sx = x => width / 2 + (x - pose.x) * scale;
+  const sy = y => height / 2 - (y - pose.y) * scale;
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = '#030910';
+  context.fillRect(0, 0, width, height);
+  context.save();
+  context.globalAlpha = .78;
+  if (Math.abs(map.yaw || 0) < 1e-5){
+    context.drawImage(map.img, sx(map.ox), sy(map.oy + map.h), map.w * scale, map.h * scale);
+  } else {
+    context.translate(sx(map.ox), sy(map.oy));
+    context.rotate(-map.yaw);
+    context.drawImage(map.img, 0, -map.h * scale, map.w * scale, map.h * scale);
+  }
+  context.restore();
+
+  const x = sx(pose.x), y = sy(pose.y);
+  context.save();
+  context.strokeStyle = '#f3b13f';
+  context.fillStyle = 'rgba(243,177,63,.28)';
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(x, y, 9, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+  context.beginPath();
+  context.moveTo(x, y);
+  context.lineTo(x + Math.cos(-pose.th) * 22, y + Math.sin(-pose.th) * 22);
+  context.stroke();
+  context.restore();
+  context.fillStyle = 'rgba(8,15,22,.8)';
+  context.fillRect(0, 0, width, 30);
+  context.fillStyle = '#9eb0c4';
+  context.font = '12px "JetBrains Mono", monospace';
+  context.fillText(`异常位置  ${item.map || state.machine?.mapCurrent || 'map'}`, 10, 20);
+}
+
+function openIncidentPlayback(item){
+  if (!item) return;
+  els.incidentPlayback.hidden = false;
+  renderPlayback(item);
+}
+
+function closeIncidentPlayback(){
+  state.playbackId = null;
+  els.incidentPlayback.hidden = true;
+  els.incidentSnapshot.removeAttribute('src');
 }
 
 async function loadHistory(reset = false){
@@ -987,6 +1089,11 @@ els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
 els.expandMap.addEventListener('click', () => setMapCollapsed(false));
 els.exceptionMore.addEventListener('click', openHistory);
 els.exceptionRows.addEventListener('click', event => {
+  const view = event.target.closest('[data-view-index]');
+  if (view){
+    openIncidentPlayback(state.incidents[Number(view.dataset.viewIndex)]);
+    return;
+  }
   const row = event.target.closest('tr[data-index]');
   if (row) showException(Number(row.dataset.index));
 });
@@ -999,6 +1106,12 @@ els.exceptionRows.addEventListener('keydown', event => {
   }
 });
 els.historyRows.addEventListener('click', event => {
+  const view = event.target.closest('[data-history-view]');
+  if (view){
+    openIncidentPlayback(state.history.items.get(view.dataset.historyView));
+    closeHistory();
+    return;
+  }
   const row = event.target.closest('tr[data-history-id]');
   if (!row) return;
   showIncident(state.history.items.get(row.dataset.historyId));
@@ -1018,8 +1131,18 @@ els.incidentHistory.addEventListener('click', event => {
   if (event.target === els.incidentHistory) closeHistory();
 });
 els.detailClose.addEventListener('click', () => { els.exceptionDetail.hidden = true; });
+els.playbackClose.addEventListener('click', closeIncidentPlayback);
+els.incidentPlayback.addEventListener('click', event => {
+  if (event.target === els.incidentPlayback) closeIncidentPlayback();
+});
+els.incidentSnapshot.addEventListener('error', () => {
+  els.incidentSnapshot.hidden = true;
+  els.snapshotPlaceholder.hidden = false;
+});
 window.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && !els.incidentHistory.hidden) closeHistory();
+  if (event.key !== 'Escape') return;
+  if (!els.incidentPlayback.hidden) closeIncidentPlayback();
+  else if (!els.incidentHistory.hidden) closeHistory();
 });
 new ResizeObserver(resizeCanvas).observe(canvas);
 window.addEventListener('beforeunload', () => state.heartbeat?.terminate());

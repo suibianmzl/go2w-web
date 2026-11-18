@@ -490,10 +490,31 @@ class ArchiveStore:
                 items.append(payload)
         return items
 
+    async def set_incident_snapshot(self, robot_id, incident_id, bucket, key):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    '''
+                    UPDATE robot_incident
+                    SET payload=JSON_SET(
+                            COALESCE(payload, JSON_OBJECT()),
+                            '$.snapshot.state', 'saved',
+                            '$.snapshot.tos_bucket', %s,
+                            '$.snapshot.tos_key', %s,
+                            '$.snapshot.stored_at', %s
+                        ),
+                        updated_at=UTC_TIMESTAMP(3)
+                    WHERE robot_id=%s AND incident_id=%s
+                    ''',
+                    (bucket, key, iso_utc(), robot_id, str(incident_id)),
+                )
+            await connection.commit()
+
 
 class _SegmentWriter:
     def __init__(self, root, robot_id, session_id, direction, stream_type,
-                 source_format, target_format, extension):
+                 source_format, target_format, extension, extra=None):
         self.root = root
         self.robot_id = robot_id
         self.session_id = session_id
@@ -502,6 +523,7 @@ class _SegmentWriter:
         self.source_format = source_format
         self.target_format = target_format
         self.extension = extension
+        self.extra = dict(extra or {})
         self.object_id = uuid.uuid4().hex
         self.started_at = utc_now()
         self.opened_monotonic = time.monotonic()
@@ -546,6 +568,7 @@ class _SegmentWriter:
             'period_end': iso_utc() if closed else iso_utc(self.started_at),
             'message_count': self.message_count,
             'byte_size': self.byte_size,
+            **self.extra,
         }
 
     def _write_meta(self, meta):
@@ -625,14 +648,26 @@ class ArchiveSpool:
         writer.append(struct.pack('<I', len(data)) + data)
         self._rotate_if_needed(key, writer)
 
+    def append_snapshot(self, *, robot_id, session_id, incident_id, data):
+        if not self.enabled or not data:
+            return
+        stream_type = 'incident-snapshot'
+        key = (session_id, 'up', stream_type, incident_id)
+        writer = self._writer(
+            key, robot_id, session_id, 'up', stream_type,
+            'jpeg', 'jpg', '.jpg', extra={'incident_id': str(incident_id)},
+        )
+        writer.append(data)
+        self.close_writer(key)
+
     def _writer(self, key, robot_id, session_id, direction, stream_type,
-                source_format, target_format, extension):
+                source_format, target_format, extension, extra=None):
         writer = self._writers.get(key)
         if writer is not None:
             return writer
         writer = _SegmentWriter(
             self.root, robot_id, session_id, direction, stream_type,
-            source_format, target_format, extension,
+            source_format, target_format, extension, extra,
         )
         self._writers[key] = writer
         return writer
@@ -736,7 +771,7 @@ class ArchiveWorker:
             return []
         return sorted(
             (path for path in pending.rglob('*')
-             if path.is_file() and path.suffix in {TEXT_EXT, BINARY_EXT}),
+             if path.is_file() and path.suffix in {TEXT_EXT, BINARY_EXT, '.jpg'}),
             key=lambda path: path.stat().st_mtime,
         )
 
@@ -762,6 +797,10 @@ class ArchiveWorker:
             'status': 'uploaded',
         })
         await self.store.add_object(meta)
+        if meta.get('incident_id'):
+            await self.store.set_incident_snapshot(
+                meta['robot_id'], meta['incident_id'],
+                meta['tos_bucket'], meta['tos_key'])
 
         completed = self.root / 'spool' / 'completed'
         completed.mkdir(parents=True, exist_ok=True)
@@ -780,6 +819,9 @@ class ArchiveWorker:
                     shutil.copyfileobj(src, dst)
             meta['format'] = 'jsonl.gz'
             content_type = 'application/gzip'
+        elif uploading.suffix == '.jpg':
+            meta['format'] = 'jpg'
+            content_type = 'image/jpeg'
         else:
             meta['format'] = 'bin'
             content_type = 'application/octet-stream'
@@ -789,7 +831,10 @@ class ArchiveWorker:
             for chunk in iter(lambda: handle.read(1024 * 1024), b''):
                 digest.update(chunk)
 
-        key_suffix = '.jsonl.gz' if meta['format'] == 'jsonl.gz' else '.bin'
+        key_suffix = {
+            'jsonl.gz': '.jsonl.gz',
+            'jpg': '.jpg',
+        }.get(meta['format'], '.bin')
         key = self._object_key(meta, key_suffix)
         self.object_store.upload_file(key, upload_path, content_type=content_type)
         meta['sha256'] = digest.hexdigest()

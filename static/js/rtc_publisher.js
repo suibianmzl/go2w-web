@@ -8,6 +8,7 @@ const canvas = document.querySelector('#frame');
 const canvasContext = canvas.getContext('2d', { alpha: false });
 const status = document.querySelector('#status');
 let engine = null, muxer = null, ws = null, config = null, pingTimer = null;
+const snapshotBusy = new Set();
 window.__go2wRtcState = { phase: 'starting', events: [] };
 
 function withRobot(value){
@@ -16,18 +17,48 @@ function withRobot(value){
   return url.toString();
 }
 
-function report(){
+async function captureSnapshot(incidentId){
+  if (snapshotBusy.has(incidentId) || !canvas.width || !canvas.height) return;
+  snapshotBusy.add(incidentId);
+  try {
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+    if (!blob) throw new Error('snapshot encode failed');
+    const url = new URL(
+      `/internal/v1/incidents/${encodeURIComponent(robotId)}/${encodeURIComponent(incidentId)}/snapshot`,
+      cloudBase,
+    );
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+      body: blob,
+    });
+    if (!response.ok) throw new Error(`snapshot HTTP ${response.status}`);
+  } catch (error){
+    log(`snapshot ${incidentId} failed: ${error?.message || error}`);
+  } finally {
+    snapshotBusy.delete(incidentId);
+  }
+}
+
+async function report(){
   const body = {
     ...window.__go2wRtcState,
     videoWidth: video.videoWidth,
     videoHeight: video.videoHeight,
     readyState: video.readyState,
   };
-  fetch(withRobot(`${cloudBase}/rtc/publisher-status`), {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-    body: JSON.stringify(body),
-  }).catch(() => {});
+  try {
+    const response = await fetch(withRobot(`${cloudBase}/rtc/publisher-status`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    for (const request of payload.snapshot_requests || []){
+      if (request?.incident_id) captureSnapshot(request.incident_id);
+    }
+  } catch {}
 }
 
 function log(message){
