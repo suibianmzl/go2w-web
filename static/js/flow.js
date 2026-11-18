@@ -89,6 +89,7 @@ export function setupFlow(store, src, actions, setTool, reloc){
   const mapSel = $('#navMapSel');
   const pickMap = () => { const v = mapSel.value; if (v && v !== store.mapCurrent) actions.loadMap(v); };
   $('#navMapLoad').onclick = pickMap;
+  $('#navMapMgr').onclick = () => actions.manageMaps();
   mapSel.onchange = () => { if (!up('navigation') && !up('localization')) pickMap(); };
   // 定位（出发流程里定位失败时手动补救）
   $('#navInitBtn').onclick = () => setTool('init');
@@ -336,9 +337,12 @@ export function setupFlow(store, src, actions, setTool, reloc){
       // 1 地图
       // 11-09 修：原来每次刷新只要下拉框没焦点就改回当前地图，点「加载」时焦点移到按钮，选择被冲掉，点了没反应。
       // 现在只在当前地图变化时同步；列表刷新时保留用户的选择
-      if (store.maps !== lastMaps){
+      // 11-18 修：store.maps 每条 state（2 Hz）都是新数组，原来按引用比较 → 每 0.5 s 重建一次选项，
+      // 下拉框刚展开就被关掉 / 选择被冲掉（「选不上地图」）。现在按地图名比较，名单真的变了才重建
+      const mapKey = mapNames().join('\n');
+      if (mapKey !== lastMaps){
         const keep = mapSel.value;
-        lastMaps = store.maps;
+        lastMaps = mapKey;
         mapSel.replaceChildren(...mapNames().map(n => new Option(n, n)));
         if (keep && mapNames().includes(keep)) mapSel.value = keep;
         else if (store.mapCurrent) mapSel.value = store.mapCurrent;

@@ -28,7 +28,9 @@ kbd{font-family:var(--f-mono);font-size:10px;padding:1px 5px;border:1px solid va
 .brand{display:flex;align-items:center;gap:10px;flex:none}
 .brand svg{width:30px;height:30px}
 .brand-name{font-family:var(--f-display);font-weight:700;font-size:17px;letter-spacing:.06em;line-height:1}
-.brand-name span{font-family:var(--f-body);font-weight:500;font-size:14px;letter-spacing:.02em;margin-left:8px;color:var(--fg-2)}
+.brand-name > span:not(.evox){font-family:var(--f-body);font-weight:500;font-size:14px;letter-spacing:.02em;margin-left:8px;color:var(--fg-2)}
+.brand-name .evox{font-family:"Inter","Helvetica Neue",Arial,sans-serif;font-weight:700;font-size:20px;letter-spacing:-.01em;margin:0;color:#f2f5f8}
+.brand-name .evox i{font-style:normal;color:#5ccb8f}
 .brand-sub{font-family:var(--f-display);font-size:10px;letter-spacing:.18em;color:var(--muted);margin-top:4px}
 .brand-sub b{font-weight:600}
 .brand-sub b[data-s="mock"]{color:var(--warn)}
@@ -614,3 +616,46 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .alert-body li[data-s="warn"] b{color:var(--warn)}
 .has-alert .toast{top:calc(14px + var(--alert-h,80px))}
 .pose-txt b.crit{color:var(--crit);font-weight:700}
+
+/* 地图编辑面板（v1.0.2）：地图右上角，运行状态牌下面 */
+.medit{top:62px;right:66px;width:min(330px,calc(100% - 100px));padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;z-index:5;font-size:12px}
+.medit-head{display:flex;align-items:center;gap:8px}
+.medit-head b{font-family:var(--f-display);font-size:13px;letter-spacing:.04em}
+.medit-head .mono{color:var(--fg-2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.medit-head .ib{width:26px;height:26px;margin:-4px -6px -4px 0}
+.medit .sp{flex:1}
+.medit-tools{flex-wrap:wrap}
+.medit-tools button{flex:1;padding:5px 6px;white-space:nowrap}
+.medit-hint{color:var(--muted);font-size:11px;line-height:1.5;min-height:16px}
+.medit-row{display:flex;align-items:center;gap:8px}
+.medit-row .k{color:var(--muted);flex:none;width:30px}
+.medit-row input[type=range]{flex:1;min-width:0}
+.medit-row b{flex:none;min-width:44px;text-align:right;font-weight:500;color:var(--fg)}
+.medit-row.off{opacity:.4}
+.medit-sec{display:flex;flex-direction:column;gap:6px;padding:8px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.medit-chk{display:flex;align-items:center;gap:6px;flex:1;min-width:0;color:var(--fg-2);font-size:11.5px;cursor:pointer}
+.medit-chk input{accent-color:var(--crit);flex:none}
+.medit-dirty{color:var(--fg-2);font-family:var(--f-mono);font-size:11px;white-space:nowrap}
+.medit .btn:disabled{opacity:.45;cursor:default}
+.medit #meditCompare.on{color:var(--accent);border-color:var(--accent-line)}
+.medit-save{width:100%}
+.modal input.modal-select{font:12px var(--f-mono)}
+
+/* 管理地图（删除）弹窗 */
+.modal.modal-wide{width:min(560px,calc(100vw - 32px))}
+.mapdel-bar{display:flex;gap:6px;align-items:center;margin:0 0 8px}
+.mapdel-bar .modal-select{flex:1;margin:0;min-width:0}
+.mapdel-bar .btn{flex:none}
+.mapdel-list{max-height:min(46vh,380px);overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel);margin:0 0 10px}
+.mapdel-it{display:grid;grid-template-columns:auto 1fr auto;grid-template-rows:auto auto;column-gap:8px;align-items:center;padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;font-size:12px}
+.mapdel-it:last-child{border-bottom:0}
+.mapdel-it[hidden]{display:none}
+.mapdel-it:hover{background:var(--raise)}
+.mapdel-it input{grid-row:1 / 3;accent-color:var(--crit,#e5484d);margin:0}
+.mapdel-it .n{font-family:var(--f-mono);color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mapdel-it .m{grid-column:2 / 4;color:var(--muted);font-size:11px}
+.mapdel-it .m b{font-weight:500;color:var(--warn)}
+.mapdel-it .tag{font-style:normal;font-size:10px;padding:1px 6px;border-radius:9px;background:var(--raise);color:var(--accent);white-space:nowrap}
+.mapdel-it .tag.dim{color:var(--muted)}
+.mapdel-it.locked{cursor:not-allowed;opacity:.6}
+.mapdel-sum{font-size:12px;color:var(--fg-2);line-height:1.6;margin:0 0 12px;min-height:19px}

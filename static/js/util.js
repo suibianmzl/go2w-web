@@ -50,16 +50,18 @@ export function costToCanvas(grid, w, h){
 }
 
 // OccupancyGrid（uint8：0..100 占用，255 未知，行 0 在 origin 一侧）→ 画布；颜色和原型一致
+// 一格画成什么颜色，写进 ImageData（行 0 在 origin 一侧 = 图片最下面）。gridToCanvas 和地图编辑共用
+export function paintCell(data, v, x, y, w, h){
+  const p = ((h-1-y)*w+x)*4, n = ((x*7+y*13)%5);
+  // 未知区域透明：只画扫到的地面和墙，对齐预览旋转时不会出现整张图片的斜框
+  if (v === 255){ data[p+3] = 0; return; }
+  const col = v>=65 ? [90,206,214] : v>25 ? [40,90,100] : [22+n,36+n,50+n];
+  data[p]=col[0]; data[p+1]=col[1]; data[p+2]=col[2]; data[p+3]=255;
+}
 export function gridToCanvas(grid, w, h){
   const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
   const c = cv.getContext('2d'), im = c.createImageData(w, h);
-  for (let y=0;y<h;y++) for (let x=0;x<w;x++){
-    const v = grid[y*w+x], p = ((h-1-y)*w+x)*4, n = ((x*7+y*13)%5);
-    // 未知区域透明：只画扫到的地面和墙，对齐预览旋转时不会出现整张图片的斜框
-    if (v === 255) continue;
-    const col = v>=65 ? [90,206,214] : v>25 ? [40,90,100] : [22+n,36+n,50+n];
-    im.data[p]=col[0]; im.data[p+1]=col[1]; im.data[p+2]=col[2]; im.data[p+3]=255;
-  }
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) paintCell(im.data, grid[y*w+x], x, y, w, h);
   c.putImageData(im, 0, 0);
   return cv;
 }

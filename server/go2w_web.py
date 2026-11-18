@@ -79,6 +79,7 @@ from geometry_msgs.msg import Pose2D
 import camera as C
 import mapcontinue as MC
 import mapmeta as MM
+import mapedit as ME
 import mapfile
 import procs as P
 import robot_ctrl as R
@@ -1366,7 +1367,7 @@ class Server:
 
     async def handle_cmd(self, ws, d):
         n, op = self.node, d.get('op')
-        if self.map_busy and op in ('set_mode', 'load_map', 'save_map', 'align_map'):
+        if self.map_busy and op in ('set_mode', 'load_map', 'save_map', 'align_map', 'edit_map', 'map_delete'):
             return False, '地图正在保存或对齐，请稍等'
         if ws.closed or ws not in self.clients:
             return False, '网页已断开'
@@ -1520,8 +1521,16 @@ class Server:
                 return await self.save_map(d.get('name', ''))
             if op == 'align_map':
                 return await self.align_map(d.get('source'), d.get('name'), d.get('angle'))
+            if op == 'edit_map':
+                return await self.edit_map(d, self.remote(ws))
             if op == 'load_map':
                 return await self.load_map(d.get('name', ''))
+            if op == 'map_delete':
+                result = await self.map_delete(d.get('names'), self.remote(ws))
+                if result[0]:
+                    await self.send_all(self.routes_message(), key='routes')
+                    await self.send_all(self.views_message(), key='views')
+                return result
             if op == 'cont_preflight':
                 return self.cont_preflight(d.get('base'))
             if op == 'cont_start':
@@ -3703,6 +3712,159 @@ class Server:
             return True, f'已保存 {name}（PGM / YAML / PNG），原图 {source} 保留用于续建'
         finally:
             self.map_busy = False
+
+    async def edit_map(self, d, who):
+        """网页地图编辑（v1.0.2）：在 source 上应用网页发来的修改，另存为 name（mapedit.py）。不覆盖任何已有地图。"""
+        source, name = d.get('source'), d.get('name')
+        if self.busy or self.map_loading:
+            return False, '档位或地图正在切换，请稍等'
+        if not all(isinstance(v, str) and P.SAFE_NAME.fullmatch(v) for v in (source, name)):
+            return False, '地图名只能用字母、数字、下划线和减号（最多 48 个字符）'
+        if source == name:
+            return False, '新地图要换个名字：编辑不覆盖原图'
+        if self.prof('mapping') != 'stop':
+            return False, '建图运行中不能保存编辑（地图还在变），先停止建图'
+        crc, w, h = d.get('crc'), d.get('w'), d.get('h')
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (crc, w, h)):
+            return False, '指令格式不对（缺少底图校验）'
+        maps_dir = os.path.join(DATA, 'maps')
+        self.map_busy = True
+        try:
+            changed, _ = await asyncio.to_thread(ME.save, maps_dir, source, name, d.get('runs'), crc, w, h,
+                                                 d.get('summary'), self.version)
+            self.maps = P.list_maps(maps_dir)
+        except (ValueError, OSError) as e:
+            return False, f'没有保存：{e}'
+        finally:
+            self.map_busy = False
+        moved, note = 0, ''
+        if d.get('routes'):
+            if self.route_running():
+                note = '；有任务正在执行，路线没有改到新图'
+            else:
+                routes = {k: (dict(r, map=name) if r.get('map') == source else r) for k, r in self.routes.items()}
+                moved = sum(1 for k in routes if routes[k].get('map') != self.routes[k].get('map'))
+                if moved:
+                    try:
+                        self.write_routes(routes)
+                        await self.send_all(self.routes_message(), key='routes')
+                    except OSError as e:
+                        moved, note = 0, f'；路线没能改到新图（{e}）'
+        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务改到新图" if moved else ""}；{who}）')
+        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已改到新图' if moved else '') + note
+
+    # ---------- 删除地图（11-18） ----------
+    # 不是真删：<名字>.* 整套文件挪进 data/maps/.trash/<时间>_<名字>/，绑在这张图上的任务（routes.json）
+    # 和显示方向（map_views.json）也一起存进去，要恢复就把文件挪回 data/maps、任务手动并回 routes.json。
+    # 回收站里超过 MAP_TRASH_DAYS 天的在下次删除时清掉
+    MAP_TRASH_DAYS = 14
+
+    def map_in_use(self):
+        """正在用、不能删的地图 → 原因。"""
+        n, used = self.node, {}
+        if any(self.prof(m) != 'stop' for m in ('localization', 'navigation')) or self.busy:
+            for x in (n.map_current, n.map_loaded):
+                if x:
+                    used[x] = '导航 / 定位正在用'
+        if self.cont and self.cont.get('base'):
+            used[self.cont['base']] = '续建正在拿它当基准'
+        if self.route_running():
+            used[self.route['record']['map']] = '正在执行它上面的任务'
+        return used
+
+    @staticmethod
+    def trash_map(maps_dir, name, dest, routes, view):
+        """把 <name>.* 挪进 dest（同一个文件系统，rename 不拷数据）。返回挪走的字节数。"""
+        files = [f for f in os.listdir(maps_dir) if f.startswith(name + '.') and os.path.isfile(os.path.join(maps_dir, f))]
+        os.makedirs(dest)
+        with open(os.path.join(dest, 'deleted.json'), 'w', encoding='utf-8') as f:
+            json.dump({'map': name, 'deleted': time.strftime('%Y-%m-%d %H:%M:%S'), 'files': sorted(files),
+                       'routes': routes, 'view': view}, f, ensure_ascii=False, indent=2)
+        size = 0
+        # yaml 先挪：中途出错时 list_maps 就不再列这张图，不会留下「有 yaml 没 pgm」的坏图
+        for fn in sorted(files, key=lambda f: not f.endswith('.yaml')):
+            src = os.path.join(maps_dir, fn)
+            size += os.path.getsize(src)
+            os.replace(src, os.path.join(dest, fn))
+        return size
+
+    @staticmethod
+    def purge_trash(trash, days):
+        cut = time.time() - days * 86400
+        try:
+            items = os.listdir(trash)
+        except OSError:
+            return
+        for d in items:
+            path = os.path.join(trash, d)
+            try:
+                if os.path.isdir(path) and os.path.getmtime(path) < cut:
+                    shutil.rmtree(path)
+            except OSError:
+                pass
+
+    async def map_delete(self, names, who):
+        if not isinstance(names, list) or not names:
+            return False, '没有选要删除的地图'
+        if len(names) > 200 or len(set(names)) != len(names) or not all(isinstance(x, str) and P.SAFE_NAME.fullmatch(x) for x in names):
+            return False, '地图名不对'
+        if self.map_loading or self.map_busy:
+            return False, '地图正在切换或保存，请稍等'
+        if self.autosave.get('running'):
+            return False, '正在自动保存地图，请几秒后再删'
+        if self.routes_error:
+            return False, '任务文件读取失败，没法同时处理这些地图上的任务，请检查后端日志'
+        maps_dir = os.path.join(DATA, 'maps')
+        self.maps = P.list_maps(maps_dir)
+        have = {m['name'] for m in self.maps}
+        missing = [x for x in names if x not in have]
+        if missing:
+            return False, f"data/maps 里没有 {'、'.join(missing)}"
+        used = self.map_in_use()
+        busy = [f'{x}（{used[x]}）' for x in names if x in used]
+        if busy:
+            return False, '不能删除：' + '；'.join(busy)
+        self.map_busy = True
+        trash, stamp = os.path.join(maps_dir, '.trash'), time.strftime('%Y%m%d_%H%M%S')
+        routes, views = dict(self.routes), dict(self.map_views)
+        done, size, err = [], 0, None
+        try:
+            await asyncio.to_thread(self.purge_trash, trash, self.MAP_TRASH_DAYS)
+            for x in names:
+                mine = {k: r for k, r in routes.items() if r.get('map') == x}
+                dest = os.path.join(trash, f'{stamp}_{x}')
+                try:
+                    size += await asyncio.to_thread(self.trash_map, maps_dir, x, dest, list(mine.values()), views.get(x))
+                except OSError as e:
+                    err = f'{x}：{e.strerror or e}'
+                    break
+                for k in mine:
+                    routes.pop(k)
+                views.pop(x, None)
+                done.append((x, len(mine)))
+            if routes != self.routes:
+                self.write_routes(routes)
+            if views != self.map_views:
+                self.write_views(views)
+        except OSError as e:
+            err = err or f'更新任务 / 显示方向失败：{e.strerror or e}'
+        finally:
+            self.map_busy = False
+            self.maps = P.list_maps(maps_dir)
+            gone = {x for x, _ in done}
+            if self.map_choice in gone:
+                self.map_choice = None
+            if self.last_map in gone:
+                self.last_map = None
+            self.preview_key = None   # 正在显示的文件地图可能刚被删，下一拍按 default_map 重读
+        n_routes = sum(k for _, k in done)
+        if done:
+            self.node.event('WARN', f"已删除地图 {'、'.join(x for x, _ in done)}（{size / 1048576:.1f} MB"
+                                    f"{'，连同 ' + str(n_routes) + ' 个任务' if n_routes else ''}；挪到 data/maps/.trash，"
+                                    f"{self.MAP_TRASH_DAYS} 天后自动清掉；{who}）")
+        if err:
+            return False, (f"删了 {len(done)} 张后出错，" if done else '删除失败：') + err
+        return True, f"已删除 {len(done)} 张地图" + (f'和 {n_routes} 个任务' if n_routes else '')
 
     async def load_map(self, name):
         n = self.node

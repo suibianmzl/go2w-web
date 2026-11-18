@@ -6,6 +6,7 @@ export function createStore(){
     videoUploadEnabled: null,       // 机器狗是否采集并上传视频
     link: { ok: false, ms: null },  // 浏览器 ↔ 后端
     robotOnline: null,              // 云端 ↔ 机器狗
+    mapGrid: null,                  // 网页收到的原始地图格子 { grid: Uint8Array（0..100，255 未知，行 0 在 origin 一侧）, w, h, res, ox, oy, oyaw }；地图编辑用
     webVersion: null,               // 机器人上（后端所在 release）的网页版本；和页面自己的 version.json 比
     fixed: 'map',                   // 位姿和 scan 所在坐标系（没有 map TF 时后端退回 odom）
     // 地图：img 画布覆盖世界坐标 [ox, ox+w] × [oy, oy+h]（米）

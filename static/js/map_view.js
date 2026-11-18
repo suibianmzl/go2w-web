@@ -3,6 +3,7 @@ import { $, $$, clamp, ACC, TRAJ, CLOUD } from './util.js';
 import { on } from './layers.js';
 import { toast } from './ui.js';
 import { rotatePoint, wallAngle, screenToWorld } from './map_alignment.js';
+import { createMapEditor } from './map_edit.js';
 
 export function createMapView(store, actions){
   const cv = $('#map'), ctx = cv.getContext('2d'), stage = $('#stage');
@@ -30,7 +31,10 @@ export function createMapView(store, actions){
   const V = { tool: 'pan', measure: [], drag: null, aim: null };
   const POSE_TOOLS = { init: '初始位姿' };
   const hint = $('#aimHint');
+  // 地图编辑（v1.0.2）：编辑模式下地图图层换成编辑中的那份，指针交给编辑器
+  const editor = createMapEditor(store, actions, { exit: () => setTool('pan') });
   function showHint(){
+    if (V.tool === 'edit'){ hint.hidden = !editor.hint; hint.textContent = editor.hint; return; }
     if (V.tool === 'align'){
       hint.hidden = false;
       hint.textContent = alignment().points.length ? '再选墙上的第二点 · 优先选取至少 1 米的长直墙' : '沿同一段长直墙点两下 · 选择至少 0.5 米的墙段';
@@ -224,7 +228,11 @@ export function createMapView(store, actions){
     }
     ctx.save(); ctx.translate(W/2,H/2); ctx.rotate(-alignment().angle); ctx.translate(-W/2,-H/2);
     ctx.imageSmoothingEnabled = false;
-    if (m && on('map')){
+    editor.tick();
+    const edl = editor.layer();
+    if (edl){
+      ctx.save(); ctx.shadowColor = 'rgba(56,225,220,.25)'; ctx.shadowBlur = 18; drawGridImg(edl.rect, edl.img); ctx.restore();
+    } else if (m && on('map')){
       ctx.save(); ctx.shadowColor = 'rgba(56,225,220,.25)'; ctx.shadowBlur = 18; drawGridImg(m, m.img); ctx.restore();
     }
     const cm = store.costmap;
@@ -286,6 +294,7 @@ export function createMapView(store, actions){
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();
     if (on('tf')) drawTF();
+    editor.overlay(ctx, sx, sy, drawGridImg, view.s);
     const wall = alignment().points;
     if (wall.length){
       ctx.save(); ctx.strokeStyle = ctx.fillStyle = '#ffe08a'; ctx.lineWidth = 2;
@@ -319,10 +328,14 @@ export function createMapView(store, actions){
   }
 
   /* ---------- 工具与指针 ---------- */
-  // 数字键 1–5 按工具栏从左到右的顺序
-  const TOOLS = ['pan','init','route','measure','align'];
+  // 数字键 1–6 按工具栏从左到右的顺序
+  const TOOLS = ['pan','init','route','measure','align','edit'];
   function setTool(tool, onTeleop){
-    if ((store.mapSaving || store.mapBusy) && tool === 'align') return;
+    if ((store.mapSaving || store.mapBusy) && (tool === 'align' || tool === 'edit')) return;
+    // 地图编辑：再点一次「编辑」= 退出；离开时有没保存的修改先确认
+    if (tool === 'edit' && V.tool === 'edit') tool = 'pan';
+    if (V.tool === 'edit' && tool !== 'edit' && !editor.close(() => setTool(tool, onTeleop))) return;
+    if (tool === 'edit' && V.tool !== 'edit' && !editor.open()) return;
     if (tool === 'align'){
       if (!store.map) return toast('地图尚未加载', 'warn');
       // 重新选墙：只清掉上次选的两个点，不动这张地图已保存的显示方向
@@ -361,7 +374,8 @@ export function createMapView(store, actions){
       if (Math.hypot(x - (RP.x + Math.cos(RP.th)*kl), y - (RP.y + Math.sin(RP.th)*kl)) < 14/view.s){ V.drag = { tool:'relocRot' }; cv.style.cursor = 'grabbing'; return; }
       if (Math.hypot(x - RP.x, y - RP.y) < Math.max(.45, 16/view.s)){ V.drag = { tool:'relocMove', dx: RP.x - x, dy: RP.y - y }; cv.style.cursor = 'grabbing'; return; }
     }
-    if (V.tool==='pan' || V.tool==='teleop' || e.button===1){ V.drag = { tool:'pan', px, py, cx:view.cx, cy:view.cy }; cv.style.cursor = 'grabbing'; stopFollow(); return; }
+    if (V.tool === 'edit' && e.button === 0){ const p = world(px, py); if (editor.down(p.x, p.y)){ V.drag = { tool: 'edit' }; return; } }
+    if (V.tool==='pan' || V.tool==='teleop' || V.tool==='edit' || e.button===1){ V.drag = { tool:'pan', px, py, cx:view.cx, cy:view.cy }; cv.style.cursor = 'grabbing'; stopFollow(); return; }
     const {x,y} = world(px,py);
     if (V.tool === 'align'){
       if (!inMap(x,y)) return toast('请在地图范围内选墙', 'warn');
@@ -384,6 +398,7 @@ export function createMapView(store, actions){
     const c = store.costAt && inMap(x, y) ? store.costAt(x, y) : '--';
     $('#cursor').innerHTML = inMap(x, y) ? `x <b>${x.toFixed(2)}</b>  y <b>${y.toFixed(2)}</b>  cost <b>${c}</b>` : 'x <b>--</b>  y <b>--</b>  cost <b>--</b>';
     if (V.aim){ V.aim.x1 = x; V.aim.y1 = y; }
+    if (V.tool === 'edit') editor.move(x, y);
     const d = V.drag; if (!d) return;
     if (d.tool === 'relocMove' || d.tool === 'relocRot'){
       const D = store.reloc.begin(); if (!D) return;
@@ -407,13 +422,14 @@ export function createMapView(store, actions){
   });
   cv.addEventListener('pointerup', () => {
     const d = V.drag; if (!d) return; V.drag = null;
+    if (d.tool === 'edit') return editor.up();
     if (d.tool === 'relocMove' || d.tool === 'relocRot'){ cv.style.cursor = 'grab'; return; }
     if (d.tool === 'rot'){
       cv.style.cursor = V.tool==='pan' ? 'grab' : 'default';
       if (Math.abs(wrapPi(alignment().angle - d.start)) > 1e-4) setAngle(alignment().angle, true);
       return;
     }
-    if (d.tool==='pan'){ cv.style.cursor = V.tool==='pan' ? 'grab' : 'default'; return; }
+    if (d.tool==='pan'){ cv.style.cursor = V.tool==='pan' ? 'grab' : V.tool==='edit' ? 'crosshair' : 'default'; return; }
     if (d.tool === 'route'){
       if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
       const th = d.moved ? Math.atan2(d.y1 - d.y0, d.x1 - d.x0) : 0;
@@ -446,5 +462,6 @@ export function createMapView(store, actions){
   new ResizeObserver(() => { resize(); if (!touched) fit(); }).observe(stage);
   // 屏幕方向（像素，y 向下）→ 地图里的单位向量：地图可能转了显示角度
   const screenDir = (dx, dy) => rotatePoint({ x: dx, y: -dy }, -alignment().angle);
-  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, TOOLS, view, get tool(){ return V.tool; } };
+  cv.addEventListener('pointerleave', () => editor.leave());
+  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
 }
