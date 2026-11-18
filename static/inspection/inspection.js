@@ -33,11 +33,16 @@ const els = {
   rtcBadge: $('#rtcBadge'),
   rtcMessage: $('#rtcMessage'),
   rtcVideo: $('#rtcVideo'),
+  mapOverlay: $('#mapOverlay'),
   mapCanvas: $('#inspectionMap'),
   mapTitle: $('#mapTitle'),
   mapEmpty: $('#mapEmpty'),
   poseValue: $('#poseValue'),
+  zoomOutMap: $('#zoomOutMap'),
+  zoomInMap: $('#zoomInMap'),
   fitMap: $('#fitMap'),
+  collapseMap: $('#collapseMap'),
+  expandMap: $('#expandMap'),
   exceptionRows: $('#exceptionRows'),
   exceptionEmpty: $('#exceptionEmpty'),
   exceptionCount: $('#exceptionCount'),
@@ -643,7 +648,7 @@ function rotatePoint(x, y, angle){
 }
 
 function fitView(){
-  if (!state.map && !selectedRoute()?.points?.length) return;
+  if ((!state.map && !selectedRoute()?.points?.length) || view.width <= 0 || view.height <= 0) return;
   const corners = [];
   if (state.map){
     for (const [x, y] of [[0, 0], [state.map.w, 0], [0, state.map.h], [state.map.w, state.map.h]]){
@@ -661,6 +666,12 @@ function fitView(){
   view.scale = Math.max(4, Math.min((view.width - 64) / width, (view.height - 90) / height));
   view.cx = (left + right) / 2;
   view.cy = (bottom + top) / 2 - 8 / view.scale;
+}
+
+function zoomMap(factor){
+  if (!state.map) return;
+  view.scale = Math.max(4, Math.min(240, view.scale * factor));
+  drawMap();
 }
 
 function sx(x){
@@ -777,6 +788,7 @@ function drawRobot(){
 }
 
 function drawMap(){
+  if (els.mapOverlay.hidden) return;
   const dpr = window.devicePixelRatio || 1;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, view.width, view.height);
@@ -806,6 +818,17 @@ function renderRealtime(){
   drawMap();
 }
 
+function setMapCollapsed(collapsed){
+  els.mapOverlay.hidden = collapsed;
+  els.expandMap.hidden = !collapsed;
+  if (!collapsed){
+    requestAnimationFrame(() => {
+      resizeCanvas();
+      drawMap();
+    });
+  }
+}
+
 async function init(){
   state.robotId = await resolveRobotId();
   if (state.robotId) setRobotQuery(state.robotId);
@@ -826,7 +849,11 @@ els.routeSelect.addEventListener('change', () => {
 });
 els.startBtn.addEventListener('click', startInspection);
 els.stopBtn.addEventListener('click', stopInspection);
+els.zoomOutMap.addEventListener('click', () => zoomMap(0.8));
+els.zoomInMap.addEventListener('click', () => zoomMap(1.25));
 els.fitMap.addEventListener('click', () => { fitView(); drawMap(); });
+els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
+els.expandMap.addEventListener('click', () => setMapCollapsed(false));
 els.exceptionRows.addEventListener('click', event => {
   const row = event.target.closest('tr[data-index]');
   if (row) showException(Number(row.dataset.index));

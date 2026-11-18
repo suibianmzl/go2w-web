@@ -114,28 +114,42 @@
             <div class="video-message" id="rtcMessage">正在连接 RTC 视频…</div>
             <div class="video-corner tl"></div>
             <div class="video-corner br"></div>
-          </div>
-        </section>
 
-        <section class="panel map-panel">
-          <canvas id="inspectionMap"></canvas>
-          <div class="map-head">
-            <div>
-              <span class="eyebrow">NAVIGATION MAP</span>
-              <h2 id="mapTitle">巡检坐标线路</h2>
-            </div>
-            <button id="fitMap" class="icon-button" type="button" title="适配地图">适配</button>
+            <section class="map-overlay" id="mapOverlay" aria-label="巡检地图">
+              <div class="map-overlay-head">
+                <div class="map-overlay-title">
+                  <span class="eyebrow">NAVIGATION MAP</span>
+                  <h2 id="mapTitle">巡检坐标线路</h2>
+                </div>
+                <div class="map-tools" role="group" aria-label="地图控制">
+                  <button id="zoomOutMap" type="button" title="缩小地图" aria-label="缩小地图">−</button>
+                  <button id="zoomInMap" type="button" title="放大地图" aria-label="放大地图">＋</button>
+                  <button id="fitMap" type="button" title="适配地图">适配</button>
+                  <button id="collapseMap" type="button" title="收起地图" aria-label="收起地图">⌄</button>
+                </div>
+              </div>
+              <div class="map-canvas-wrap">
+                <canvas id="inspectionMap"></canvas>
+                <div class="map-empty" id="mapEmpty">等待机器狗上报地图和巡检路线</div>
+                <div class="map-hud">
+                  <span>位置</span>
+                  <b class="mono" id="poseValue">x -- · y -- · θ --</b>
+                </div>
+                <div class="map-legend">
+                  <span><i class="legend-route"></i>规划路线</span>
+                  <span><i class="legend-done"></i>已完成</span>
+                  <span><i class="legend-trail"></i>实际轨迹</span>
+                </div>
+              </div>
+            </section>
+
+            <button class="map-expand" id="expandMap" type="button" hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>
+              </svg>
+              展开地图
+            </button>
           </div>
-          <div class="map-hud">
-            <span>位置</span>
-            <b class="mono" id="poseValue">x -- · y -- · θ --</b>
-          </div>
-          <div class="map-legend">
-            <span><i class="legend-route"></i>规划路线</span>
-            <span><i class="legend-done"></i>已完成</span>
-            <span><i class="legend-trail"></i>实际轨迹</span>
-          </div>
-          <div class="map-empty" id="mapEmpty">等待机器狗上报地图和巡检路线</div>
         </section>
       </section>
 
