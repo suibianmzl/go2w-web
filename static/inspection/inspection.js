@@ -7,6 +7,44 @@ const POSE_RENDER_MS = 1000;
 const TRAIL_MIN_MOVE = 0.04;
 const HEARTBEAT_MS = 500;
 
+const FIXED_INSPECTION_NODES = [
+  {
+    code:'A',
+    name:'大厅门禁',
+    aliases:['大厅门禁', '门禁', '起点'],
+  },
+  {
+    code:'B',
+    name:'进入室外',
+    aliases:['进入室外', '室外区域'],
+  },
+  {
+    code:'C',
+    name:'下台阶',
+    aliases:['下台阶', '台阶'],
+  },
+  {
+    code:'D',
+    name:'定点拍照-1',
+    aliases:['定点拍照-1', '定点拍照1', '电动车存放处'],
+  },
+  {
+    code:'E',
+    name:'通过闸机-2',
+    aliases:['通过闸机-2', '通过闸机2', '通过闸机', '闸机', '电动车棚'],
+  },
+  {
+    code:'F',
+    name:'定点拍照-2',
+    aliases:['定点拍照-2', '定点拍照2', '门前步道', '人行步道'],
+  },
+  {
+    code:'↩',
+    name:'返回待机位置',
+    aliases:['返回待机位置', '返回待机', '返回起点', '待机位置'],
+  },
+];
+
 const els = {
   robotChip: $('#robotChip'),
   linkChip: $('#linkChip'),
@@ -97,6 +135,7 @@ const state = {
   incidents: [],
   history: { items: new Map(), before: null, loading: false, hasMore: true },
   playbackId: null,
+  lastFixedNodeIndex: null,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -134,6 +173,26 @@ function taskActive(){
 
 function taskForSelectedRoute(){
   return state.task?.type !== 'idle' && state.task?.routeId === state.selectedRouteId;
+}
+
+function normalizePointName(value){
+  return String(value || '')
+    .replace(/\s+/g, '')
+    .replace(/[【】\[\]（）()·,，。:：-]/g, '')
+    .toLowerCase();
+}
+
+function fixedNodeIndex(pointName){
+  const name = normalizePointName(pointName);
+  if (!name) return -1;
+  return FIXED_INSPECTION_NODES.findIndex(node =>
+    node.aliases.some(alias => name.includes(normalizePointName(alias))));
+}
+
+function fixedNodeIncidents(index){
+  return state.incidents
+    .filter(item => fixedNodeIndex(item.task?.pointName) === index)
+    .sort((left, right) => right.ts - left.ts);
 }
 
 function formatIncidentTime(value){
@@ -208,10 +267,9 @@ function renderRouteOptions(){
 
 function renderSelectedRoute(){
   const route = selectedRoute();
-  const points = route?.points || [];
   els.routeSelect.disabled = !state.routes.length || taskActive();
   els.routeMap.textContent = route?.map ? `地图 ${route.map}` : '地图 --';
-  els.routeCount.textContent = `${points.length} 个节点`;
+  els.routeCount.textContent = `固定 ${FIXED_INSPECTION_NODES.length} 个节点`;
   els.startBtn.disabled = !route || !state.wsOpen || !state.online || taskActive();
   els.stopBtn.disabled = !state.wsOpen || !taskActive();
   renderTask();
@@ -222,7 +280,13 @@ function taskStateLabel(){
   const route = selectedRoute();
   if (!route) return '选择任务后开始巡检';
   if (!taskForSelectedRoute()) return taskActive() ? '其他任务执行中' : '等待下发任务';
-  if (task.status === 'active') return task.phase === 'checking' ? '出发准备中' : `前往第 ${task.point || 1} 站`;
+  if (task.status === 'active') {
+    if (task.phase === 'checking') return '出发准备中';
+    if (task.back) return '返回待机位置';
+    const index = fixedNodeIndex(task.pointName);
+    const node = FIXED_INSPECTION_NODES[index];
+    return node ? `${node.code} · ${node.name}` : (task.pointName || `第 ${task.point || 1} 站`);
+  }
   if (task.status === 'succeeded') return '巡检已完成';
   if (task.status === 'canceled') return '巡检已中止';
   if (task.status === 'aborted') return `巡检失败：${task.message || '导航异常'}`;
@@ -230,7 +294,6 @@ function taskStateLabel(){
 }
 
 function renderTask(){
-  const route = selectedRoute();
   const task = state.task || {};
   const related = taskForSelectedRoute();
   const status = related ? task.status : 'idle';
@@ -249,52 +312,68 @@ function renderTask(){
   els.taskStateText.textContent = taskStateLabel();
   els.taskPercent.textContent = `${Math.round(progress * 100)}%`;
   els.taskProgress.style.width = `${progress * 100}%`;
-  els.currentPoint.textContent = related && task.point
-    ? `${task.point}/${task.count || route?.points?.length || 0} · ${task.pointName || ''}`
-    : '--';
-  renderSteps(route, task, related);
-  renderHint(route);
+  const currentIndex = related
+    ? (task.back ? FIXED_INSPECTION_NODES.length - 1 : fixedNodeIndex(task.pointName))
+    : -1;
+  const currentNode = FIXED_INSPECTION_NODES[currentIndex];
+  els.currentPoint.textContent = currentNode
+    ? `${currentNode.code} · ${currentNode.name}`
+    : (task.pointName || '--');
+  renderSteps(task, related, currentIndex);
+  renderHint(selectedRoute());
 }
 
-function renderSteps(route, task, related){
-  const points = route?.points || [];
-  if (!points.length){
-    els.steps.innerHTML = '<li class="empty-step">选择任务后显示巡检节点</li>';
-    return;
-  }
-
-  const current = related && Number.isFinite(task.point) ? task.point : 0;
-  els.steps.innerHTML = points.map((point, index) => {
-    const no = index + 1;
+function renderSteps(task, related, currentIndex){
+  els.steps.innerHTML = FIXED_INSPECTION_NODES.map((node, index) => {
     let stepState = 'pending';
     let label = '待执行';
     if (related && task.status === 'succeeded'){
       stepState = 'done';
       label = '已完成';
-    } else if (related && task.status === 'aborted' && no === current){
+    } else if (related && task.status === 'aborted' && index === currentIndex){
       stepState = 'failed';
       label = '失败';
-    } else if (related && task.status === 'canceled' && no === current){
+    } else if (related && task.status === 'canceled' && index === currentIndex){
       stepState = 'failed';
       label = '已中止';
     } else if (related && task.status === 'active'){
-      if (task.back){
-        stepState = no === 1 ? 'active' : 'done';
-        label = no === 1 ? '返回中' : '已完成';
-      } else if (no < current){
+      if (currentIndex >= 0 && index < currentIndex){
         stepState = 'done';
         label = '已完成';
-      } else if (no === current){
+      } else if (index === currentIndex){
         stepState = 'active';
-        label = task.back ? '返回中' : '前往中';
+        label = task.back ? '返回中' : '当前节点';
       }
     }
+    const incidents = fixedNodeIncidents(index);
+    const incidentHtml = incidents.length ? `
+      <div class="node-incidents">
+        ${incidents.slice(0, 3).map(item => `
+          <button class="node-incident" type="button" data-step-incident="${esc(item.id)}">
+            <i></i>
+            <span>${esc(item.label)} · ${esc(incidentDuration(item))}</span>
+            <b>${item.ongoing ? '持续中' : '已归档'}</b>
+          </button>
+        `).join('')}
+        ${incidents.length > 3 ? `<small>另有 ${incidents.length - 3} 条异常</small>` : ''}
+      </div>
+    ` : '';
     return `<li data-s="${stepState}">
-      <span class="index">${stepState === 'done' ? '✓' : String(no).padStart(2, '0')}</span>
-      <span class="name" title="${esc(point.name || `第 ${no} 站`)}">${esc(point.name || `第 ${no} 站`)}</span>
+      <span class="index">${esc(node.code)}</span>
+      <span class="name" title="${esc(node.name)}">${esc(node.name)}</span>
       <span class="state">${label}</span>
+      ${incidentHtml}
     </li>`;
   }).join('');
+  if (currentIndex !== state.lastFixedNodeIndex){
+    state.lastFixedNodeIndex = currentIndex;
+    if (currentIndex >= 0){
+      requestAnimationFrame(() => {
+        els.steps.querySelector('li[data-s="active"]')
+          ?.scrollIntoView({ block:'center', behavior:'smooth' });
+      });
+    }
+  }
 }
 
 function preflightReason(route){
@@ -387,6 +466,7 @@ function mergeIncidents(items, replace = false){
     .sort((left, right) => right.ts - left.ts)
     .slice(0, 1000);
   renderExceptions();
+  renderTask();
   if (state.playbackId){
     const current = state.incidents.find(item => item.id === state.playbackId)
       || state.history.items.get(state.playbackId);
@@ -1087,6 +1167,12 @@ els.zoomInMap.addEventListener('click', () => zoomMap(1.25));
 els.fitMap.addEventListener('click', () => { fitView(); drawMap(); });
 els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
 els.expandMap.addEventListener('click', () => setMapCollapsed(false));
+els.steps.addEventListener('click', event => {
+  const button = event.target.closest('[data-step-incident]');
+  if (!button) return;
+  const incident = state.incidents.find(item => item.id === button.dataset.stepIncident);
+  if (incident) openIncidentPlayback(incident);
+});
 els.exceptionMore.addEventListener('click', openHistory);
 els.exceptionRows.addEventListener('click', event => {
   const view = event.target.closest('[data-view-index]');

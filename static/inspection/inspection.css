@@ -114,6 +114,13 @@ select:disabled{opacity:.55;cursor:not-allowed}
 .steps li[data-s="active"] .index{border-color:var(--accent);color:var(--accent);box-shadow:0 0 12px rgba(56,225,220,.15)}
 .steps li[data-s="active"] .state{color:var(--accent)}
 .steps li[data-s="failed"] .index,.steps li[data-s="failed"] .state{color:var(--danger);border-color:rgba(255,93,108,.5)}
+.node-incidents{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;margin:2px 0 2px 39px;padding-left:8px;border-left:1px solid rgba(243,177,63,.25)}
+.node-incident{display:grid;grid-template-columns:7px 1fr auto;gap:6px;align-items:center;width:100%;padding:6px 7px;border:1px solid rgba(243,177,63,.22);border-radius:6px;background:rgba(243,177,63,.05);color:var(--fg-2);font-size:9px;text-align:left}
+.node-incident:hover{border-color:rgba(243,177,63,.5);background:rgba(243,177,63,.09)}
+.node-incident i{width:6px;height:6px;border-radius:50%;background:var(--warn);box-shadow:0 0 7px rgba(243,177,63,.65)}
+.node-incident span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-incident b{color:var(--muted);font-size:8px;font-weight:500}
+.node-incidents>small{padding-left:7px;color:var(--muted);font-size:8px}
 .empty-step{display:block!important;padding:28px 12px!important;text-align:center;color:var(--muted);font-size:11px}
 .empty-step::before{display:none}
 
