@@ -140,6 +140,7 @@ export function createRosSource(store, bus){
         store.autoLoc = m.autoLoc || null;
         store.cont = m.cont || null;
         store.autosave = m.autosave || null;
+        store.webVersion = m.webVersion || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));

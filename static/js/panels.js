@@ -692,11 +692,54 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   })(['jpg', 'png', 'webp']);
 
   const badge = $('#srcBadge'); badge.dataset.s = src.name; badge.textContent = ros ? '实时 · ROS 2' : '模拟数据';
+
+  // 版本号（11-18）：页面自己的 static/version.json；后端推来的 webVersion 是机器人上装的版本，
+  // 不一样 = 机器人升级了但这个页面没刷新（或者页面来自别的服务器）
+  const verBtn = $('#verBadge'); let verInfo = null;
+  fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => {
+    if (!v?.version) return;
+    verInfo = v; verBtn.hidden = false; renderVersion();
+  }).catch(() => {});
+  function verStale(){ return !!(verInfo && ros && store.webVersion && store.webVersion !== verInfo.version); }
+  function renderVersion(){
+    if (!verInfo) return;
+    const stale = verStale();
+    const txt = stale ? `${verInfo.version} · 有新版本，请刷新` : verInfo.version;
+    if (verBtn.textContent !== txt) verBtn.textContent = txt;
+    const st = stale ? 'warn' : '';
+    if (verBtn.dataset.s !== st) verBtn.dataset.s = st;
+  }
+  verBtn.onclick = () => {
+    if (!verInfo) return;
+    const s = document.createElement('div'); s.className = 'scrim';
+    s.innerHTML = `<div class="modal ver-modal" role="dialog" aria-modal="true"><h3></h3><div class="ver-warn" hidden></div><div class="ver-log"></div>
+      <div class="btn-row"><button class="btn ghost" data-a="r" hidden>刷新页面</button><button class="btn pri" data-a="c">关闭</button></div></div>`;
+    s.querySelector('h3').textContent = `网页版本 ${verInfo.version}` + (verInfo.date ? `（${verInfo.date}）` : '');
+    if (verStale()){
+      const w = s.querySelector('.ver-warn'); w.hidden = false;
+      w.textContent = `机器人上已经是 ${store.webVersion}，这个页面还是 ${verInfo.version}。刷新一下就是新版本。`;
+      s.querySelector('[data-a=r]').hidden = false;
+    }
+    const log = s.querySelector('.ver-log');
+    for (const n of verInfo.notes || []){
+      const sec = document.createElement('section');
+      const h = document.createElement('h4'); h.textContent = n.version;
+      if (n.date){ const d = document.createElement('small'); d.textContent = n.date; h.appendChild(d); }
+      const ul = document.createElement('ul');
+      for (const it of n.items || []){ const li = document.createElement('li'); li.textContent = it; ul.appendChild(li); }
+      sec.append(h, ul); log.appendChild(sec);
+    }
+    const close = () => { s.remove(); document.removeEventListener('keydown', esc); };
+    const esc = e => { if (e.key === 'Escape') close(); };
+    s.addEventListener('click', e => { const a = e.target.dataset.a; if (e.target === s || a === 'c') close(); if (a === 'r') location.reload(); });
+    document.addEventListener('keydown', esc);
+    document.body.appendChild(s); s.querySelector('[data-a=c]').focus();
+  };
   renderLayers();
 
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
-    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
+    medium(){ renderVersion(); renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
     slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,
