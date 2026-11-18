@@ -139,10 +139,10 @@ select:disabled{opacity:.55;cursor:not-allowed}
 .preflight div[data-s="warn"] i{background:var(--warn)}
 .preflight div[data-s="off"] i{background:var(--danger)}
 
-.video-panel{flex:1;min-height:300px;display:flex;flex-direction:column;overflow:hidden}
+.video-panel{flex:1;min-height:420px;display:flex;flex-direction:column;overflow:hidden}
 .live-badge{display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid rgba(255,93,108,.35);border-radius:999px;color:#ff9aa4;background:rgba(255,93,108,.07);font:9px var(--display);letter-spacing:.1em}
 .live-badge i{width:6px;height:6px;border-radius:50%;background:var(--danger);box-shadow:0 0 8px var(--danger)}
-.video-stage{position:relative;flex:1;min-height:0;margin:12px;border:1px solid #1c2936;border-radius:9px;overflow:hidden;background:#020407}
+.video-stage{position:relative;flex:none;align-self:center;min-height:0;margin:12px auto;border:1px solid #1c2936;border-radius:9px;overflow:hidden;background:#020407}
 #rtcVideo,#rtcVideo>div,#rtcVideo video{width:100%!important;height:100%!important}
 #rtcVideo{position:absolute;inset:0}
 #rtcVideo video{display:block;object-fit:cover}
@@ -175,9 +175,9 @@ select:disabled{opacity:.55;cursor:not-allowed}
 .map-expand svg{width:15px;height:15px}
 .map-expand:hover{background:rgba(56,225,220,.12);border-color:rgba(56,225,220,.6)}
 
-.exception-panel{height:300px;flex:none;display:flex;flex-direction:column;overflow:hidden}
+.exception-panel{height:220px;flex:none;display:flex;flex-direction:column;overflow:hidden}
 .panel-note{padding:14px 18px 0;color:var(--muted);font-size:11px;line-height:1.65}
-.exception-table-wrap{position:relative;flex:1;min-height:0;margin:14px 12px 12px;border:1px solid var(--line);border-radius:9px;overflow:auto;background:#081019}
+.exception-table-wrap{position:relative;flex:1;min-height:0;margin:10px 12px 10px;border:1px solid var(--line);border-radius:9px;overflow:auto;background:#081019}
 .exception-table{width:100%;border-collapse:collapse;table-layout:fixed}
 .exception-table th{padding:10px 8px;text-align:left;border-bottom:1px solid var(--line);color:var(--muted);font-size:9px;font-weight:500;background:#0a131d}
 .exception-table td{padding:11px 8px;border-bottom:1px solid rgba(29,43,58,.7);color:var(--fg-2);font-size:10px;vertical-align:top}
