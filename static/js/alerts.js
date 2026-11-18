@@ -77,7 +77,13 @@ export function setupAlerts(store, bus){
     const MT = store.motorTemp;
     if (MT){
       const hot = MT.map((v, i) => [v, i]).filter(([v]) => v >= MOTOR_WARN).sort((a, b) => b[0] - a[0]);
-      if (hot.length){
+      // 后端到 hotLie（默认 68 ℃）会自动趴下、不让站起（11-18）
+      const lie = store.ctrl?.hotLie > 0 ? store.ctrl.hotLie : null;
+      if (hot.length && lie != null && hot[0][0] >= lie){
+        add('motor_temp', 'crit', store.ctrl?.state === 'Passive' ? '电机过热，已自动趴下' : '电机过热，正在自动趴下',
+          `${hot.slice(0, 4).map(([v, i]) => `${motorName(i)} ${v} ℃`).join('、')}${hot.length > 4 ? ` 等 ${hot.length} 个` : ''}。（≥${lie} ℃ 自动趴下）`,
+          `降到 ${lie} ℃ 以下才能再站起；左侧机器人卡片里点「电机温度」看全部。`, 10);
+      } else if (hot.length){
         const crit = hot[0][0] >= MOTOR_CRIT;
         add('motor_temp', crit ? 'crit' : 'warn', crit ? '电机过热' : '电机温度偏高',
           `${hot.slice(0, 4).map(([v, i]) => `${motorName(i)} ${v} ℃`).join('、')}${hot.length > 4 ? ` 等 ${hot.length} 个` : ''}。（≥${MOTOR_WARN} ℃ 算偏高，≥${MOTOR_CRIT} ℃ 算过热）`,

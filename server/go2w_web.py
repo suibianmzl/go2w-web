@@ -110,8 +110,29 @@ UPLOAD_LABEL = os.environ.get('GO2W_UPLOAD_LABEL', '166:~/go2w_bags')
 BAG_LIMIT_GB = float(os.environ.get('GO2W_BAG_LIMIT_GB', '100'))
 BAG_MIN_FREE_GB = float(os.environ.get('GO2W_BAG_MIN_FREE_GB', '10'))
 ROLLBACK_SECONDS = 20         # 手动「保存刚才 N 秒」的长度
-# 包名 = <狗编号>_<月日>_<时分秒>（11-12：原来是 go2w_，改成带狗编号，多狗时能区分；环境变量 GO2W_ROBOT_ID 可改）
-BAG_PREFIX = os.environ.get('GO2W_ROBOT_ID', 'go2w-01')
+# 包名 = <狗编号>_<月日>_<时分秒>（11-12：原来是 go2w_，改成带狗编号，多狗时能区分）
+# 狗编号（11-18，用户：「robot id 写到机器狗自己的环境变量，不写到镜像里」）按这个顺序取：
+#   1. 狗硬盘上的 runtime.env（/opt/go2w/config/runtime.env，容器里是 /etc/go2w/runtime.env）的 GO2W_ROBOT_ID
+#   2. 进程环境变量 GO2W_ROBOT_ID（本地调试用；runtime.env 优先，镜像里就算写了也盖不过狗自己的）
+#   3. ROBOT_ID_DEFAULT
+# 每次录包 / 存回溯时现读，改了 runtime.env 不用重启
+ROBOT_ID_DEFAULT = 'go2w-01'
+
+
+def robot_id():
+    """(狗编号, 来源)。"""
+    env_file = os.environ.get('GO2W_RUNTIME_ENV')
+    for path in ((env_file,) if env_file else ()) + MM.RUNTIME_ENV_FILES:
+        v = (MM.read_env_file(path, 'GO2W_ROBOT_ID') or '').strip()
+        if v:
+            if P.SAFE_PREFIX.fullmatch(v):
+                return v, path
+            # 写了但格式不对：不悄悄换成别处的值，用默认并在来源里说明（启动日志会打出来）
+            return ROBOT_ID_DEFAULT, f'默认值；{path} 里的 {v!r} 不合规（字母数字开头，只能有字母数字_-，最多 30 个字符）'
+    v = os.environ.get('GO2W_ROBOT_ID', '').strip()
+    if v and P.SAFE_PREFIX.fullmatch(v):
+        return v, 'env'
+    return ROBOT_ID_DEFAULT, 'default'
 ROLLBACK_BUFFER = 30          # 回溯进程缓存的长度，要装得下卡住自动保存的 前 + 后
 ROLLBACK_RETRY = 30.0         # 回溯进程退出后，隔多久再拉起来
 ROLLBACK_SAVE_TIMEOUT = 20.0  # 等存包完成的最长时间
@@ -147,6 +168,11 @@ MOTOR_TEMP_OFFSET, MOTOR_STRIDE, MOTOR_N = 4 + 108, 48, 16
 # motor_state[i].reserve[0]（uint32）当错误标志（同 app「狗腿信息 → 错误标志」），在元素内 +39 = temperature 后 8 字节。
 # 11-17 用 go2w-01_1116_172503 录包核对（14772 帧）：16 个电机全程 0（= 正常）；reserve[1] 一直 507/508，不是错误码
 MOTOR_ERR_OFFSET = MOTOR_TEMP_OFFSET + 8
+# motor_state[i].tau_est（float32，N·m，估计力矩）：元素内 q +0 / dq +4 / ddq +8 / tau_est +12 → temperature 前 16 字节。
+# 11-17 用 go2w-01_1116_172503 核对：站着时小腿约 +7、左右髋符号相反（±4~7），轮子 ±2 以内
+MOTOR_TAU_OFFSET = MOTOR_TEMP_OFFSET - 16
+# 网页打开「力矩」视图时 lowstate 改成每 MOTOR_FAST_PERIOD 秒读一次（= 状态推送 2 Hz），关掉后回到 BAT_PERIOD
+MOTOR_FAST_PERIOD = 0.5
 # 建图自动保存（11-17，用户：「报错自动保存地图」「两分钟太长，三十秒」）：建图时每 AUTOSAVE_PERIOD 秒、
 # 停止建图前、雷达 / FAST-LIO / 里程计出问题时，把当前地图存成 data/maps/autosave_<建图开始时间>，
 # 同一次建图覆盖同一份。只在地图有变化时存；单次存图耗时超过周期的 1/10 就自动拉长间隔，免得拖慢 slam。
@@ -207,6 +233,13 @@ POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到
 CTRL_RESEND = 0.5      # s：请求还没被接受就重发（运控 0.2 s 后作废没取走的请求，DDS 也可能丢）
 # 网页站起来（或跑过任务）的机器狗，空闲这么久就原地趴下；0 = 不自动趴下
 IDLE_LIE = float(os.environ.get('GO2W_IDLE_LIE', '30'))
+# 电机过热自动趴下（11-18，用户：「有关节到 68 度就自动趴下」）：16 个电机（12 个腿关节 + 4 个轮子）任何一个
+# ≥ 这个温度，站着就趴下（先取消任务、上锁、等停稳，和手动趴下同一流程），不管是不是「保持站立」、有没有任务；
+# 还在这个温度以上时不让站起。温度每 BAT_PERIOD 秒读一次，超过 MOTOR_STALE 没读到就不判断。0 = 关掉
+MOTOR_HOT_LIE = float(os.environ.get('GO2W_MOTOR_HOT_LIE', '68'))
+MOTOR_HOT_RETRY = 5.0  # s：趴下失败（运控没响应等）隔这么久再试
+MOTOR_NAMES = [f'{leg}{j}' for leg in ('右前', '左前', '右后', '左后') for j in ('髋', '大腿', '小腿')] + \
+              [f'{leg}轮' for leg in ('右前', '左前', '右后', '左后')]   # 顺序同 LowState.motor_state
 PREP_HOLD_TTL = 5.0    # s：网页自检进行中每 2 s 发一次 prep_hold，期间不算空闲
 STILL_V, STILL_W = 0.05, 0.1   # 趴下前要求里程计速度低于这些（m/s、rad/s）
 # 行为树里表示「在做恢复」的节点
@@ -409,8 +442,10 @@ class Bridge(Node):
         # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
         self.battery, self.battery_t, self.bat_sub = None, 0.0, None
         self.motor_temp, self.motor_temp_t = None, 0.0   # 16 个电机温度 ℃（顺序见 MOTOR_TEMP_OFFSET）
-        self.motor_info = None   # 同一帧的错误标志，和 motor_temp 一起更新、一起过期
-        self.create_timer(BAT_PERIOD, self.poll_battery)
+        self.motor_info = None   # 同一帧的错误标志 / 力矩，和 motor_temp 一起更新、一起过期
+        self.motor_fast = False  # 有网页在看力矩：读得勤一点（WebApp 维护）
+        self.bat_poll_t = 0.0
+        self.create_timer(MOTOR_FAST_PERIOD, self.poll_tick)
         self.poll_battery()
 
         self.map_blob, self.map_ver = None, 0
@@ -823,7 +858,14 @@ class Bridge(Node):
         self.rates['/odom_healthy'].tick()
         self.healthy, self.healthy_t = m.data, time.monotonic()
 
+    def poll_tick(self):
+        # 上一个临时订阅还在等第一帧（DDS 发现可能要几百 ms）就别重建，等满 BAT_PERIOD 还没收到才重订
+        due = time.monotonic() - self.bat_poll_t >= BAT_PERIOD - 0.01
+        if due or (self.motor_fast and self.bat_sub is None):
+            self.poll_battery()
+
     def poll_battery(self):
+        self.bat_poll_t = time.monotonic()
         if self.bat_sub is not None:
             self.destroy_subscription(self.bat_sub)   # 上一轮没收到（话题不在），这轮重订
             self.bat_sub = None
@@ -851,7 +893,9 @@ class Bridge(Node):
     def _parse_motor_info(self, data, now):
         if len(data) < MOTOR_ERR_OFFSET + 4 + MOTOR_STRIDE * (MOTOR_N - 1):
             return None
-        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]}
+        tau = [struct.unpack_from('<f', data, MOTOR_TAU_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]
+        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)],
+                'tau': [round(v, 2) if math.isfinite(v) else None for v in tau]}
 
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
@@ -1136,6 +1180,13 @@ class Bridge(Node):
 class Server:
     def __init__(self, node, static_dir, heartbeat):
         self.node, self.static_dir, self.heartbeat = node, static_dir, heartbeat
+        # 版本号（11-18）：static/version.json，跟着 release 走；推给网页，和页面自己加载的版本比，不一样就提示刷新
+        try:
+            with open(os.path.join(static_dir, 'version.json'), encoding='utf-8') as f:
+                self.version = str(json.load(f).get('version') or '') or None
+        except (OSError, ValueError, AttributeError):
+            self.version = None
+        node.get_logger().info(f'网页版本 {self.version or "未知（没有 version.json）"}')
         self.clients = {}       # ws → {'remote', 'last_ping'}
         self.owner = None       # 控制方：最近一个发过运动相关指令的网页
         self.estop, self.estop_t = False, 0.0
@@ -1143,6 +1194,8 @@ class Server:
         node.wants = self.wants   # 点云、粒子没人看就不算，省扩展坞的 CPU
         self.camera = C.Camera(pack, T_CAM, node.event)
         self.sys = SysStats()
+        rid, src = robot_id()
+        node.get_logger().info(f'狗编号 {rid}（来自 {src}），录包名 = {rid}_MMDD_HHMMSS')
         # P3：进程管理。本地调试（GO2W_FAKE_PROCS=1）换成假模拟器里的进程
         self.simulated = bool(os.environ.get('GO2W_FAKE_PROCS'))
         if self.simulated:
@@ -1237,6 +1290,7 @@ class Server:
         self.ctrl_abort = False    # 站起过程中被要求趴下
         self.ctrl_msg = ''         # 最近一次站起 / 趴下的结果
         self.stood_seq = 0         # 从趴着站起来的次数：网页据此作废定位（站起来时雷达位姿变了，要重新定位）
+        self.hot_lie_t = -1e9      # 上次因电机过热发起趴下的时间（失败了隔 MOTOR_HOT_RETRY 再试）
         self.auto_lie = False      # 空闲自动趴下生效（网页站起来过或跑过任务；遥控器站起来的不管）
         self.stand_hold = False    # 网页点了「保持站立」：不自动趴下，直到下次出发或手动趴下
         self.idle_since = None     # 开始空闲的时间
@@ -1551,6 +1605,9 @@ class Server:
         s, ready, _ = self.ctrl_get()
         if s is None:
             return False, '收不到运控状态（/go2w_ctrl/state），请检查运行容器的 control 组和域 0 通信'
+        hot = self.motor_hot()
+        if hot and s == 'Passive':
+            return False, f'{MOTOR_NAMES[hot[1]]} {hot[0]} ℃，电机过热（≥{MOTOR_HOT_LIE:.0f} ℃），降温后再站起'
         self.auto_lie, self.stand_hold, self.idle_since = True, False, None   # 网页站起来的：空闲了自动趴下
         if s == 'Velocity' and ready:
             return True, '已经站好（策略运行中）'
@@ -1614,7 +1671,7 @@ class Server:
                 return self.ctrl_done(False, f'趴下失败：{err}')
             self.auto_lie = self.stand_hold = False
             self.idle_since = None
-            return self.ctrl_done(True, '已趴下' + ('（空闲自动）' if auto else ''))
+            return self.ctrl_done(True, '已趴下' + ('（电机过热自动）' if auto == 'hot' else '（空闲自动）' if auto else ''))
         finally:
             self.ctrl_op, self.ctrl_abort = None, False
 
@@ -1718,6 +1775,30 @@ class Server:
             self.idle_since = None
             self.background(self.lie_down(f'空闲 {IDLE_LIE:.0f} s 自动', auto=True))
 
+    def motor_hot(self):
+        """最热的过热电机 (℃, 序号)；没有过热 / 温度读不到 / 功能关掉 = None。"""
+        n = self.node
+        t = n.motor_temp
+        if MOTOR_HOT_LIE <= 0 or t is None or time.monotonic() - n.motor_temp_t > MOTOR_STALE:
+            return None
+        return max(((v, i) for i, v in enumerate(t) if v >= MOTOR_HOT_LIE), default=None)
+
+    def hot_tick(self):
+        """电机过热：站着就自动趴下。"""
+        if self.ctrl is None:
+            return
+        hot = self.motor_hot()
+        if not hot:
+            return
+        s, _, _ = self.ctrl_get()
+        now = time.monotonic()
+        if s not in ('FixStand', 'Velocity') or self.ctrl_op == 'down' or now - self.hot_lie_t < MOTOR_HOT_RETRY:
+            return
+        self.hot_lie_t = now
+        v, i = hot
+        self.node.event('ERROR', f'电机过热：{MOTOR_NAMES[i]} {v} ℃（≥{MOTOR_HOT_LIE:.0f} ℃），自动趴下')
+        self.background(self.lie_down(f'{MOTOR_NAMES[i]} {v} ℃ 过热，自动', auto='hot'))
+
     def ctrl_watch(self):
         """运控在线 / 离线变化时记一条日志（网页上同时有横幅和提示）。后端启动 10 s 内还没收到不算离线。"""
         if self.ctrl is None or self.ctrl_op == 'policy':   # 切策略时运控本来就要重启一下
@@ -1749,7 +1830,7 @@ class Server:
         return {'on': True, 'state': s, 'ready': ready, 'seq': seq, 'op': self.ctrl_op, 'msg': self.ctrl_msg,
                 'age': None if rx is None else round(time.monotonic() - rx, 1),   # 距最后一次收到运控状态多少秒；从没收到 = None
                 'stood': self.stood_seq, 'auto': self.auto_lie and IDLE_LIE > 0, 'hold': self.stand_hold,
-                'lieIn': None if left is None else round(left, 1),
+                'lieIn': None if left is None else round(left, 1), 'hotLie': MOTOR_HOT_LIE,
                 'policy': self.policy_now()[0], 'policies': self.policies()}
 
     # ---------- 多点导航 ----------
@@ -2615,15 +2696,19 @@ class Server:
                 if mode != 'mapping':
                     self.map_choice = None
         except Exception as e:
-            self.transitions.pop(mode, None)
-            self.starting.pop(mode, None)
+            # 停档位时出错（例如 supervisor 10 s 内没等到导航组退出）也要清掉这些档位的「停止中」，
+            # 否则界面一直卡在停止中、按钮全灰；之后档位状态按真实进程状态显示
+            for m in {mode, *cur} - {None}:
+                self.transitions.pop(m, None)
+                self.starting.pop(m, None)
+            await self.refresh_procs()
             n.event('ERROR', f'启停失败：{e!r}')
         finally:
             self.busy = False
 
     async def bag_start(self, name, topics):
-        """分段录包：每 BAG_SEGMENT 秒一个包，包名 = 前缀_MMDD_HHMMSS。name 是前缀，不填用 BAG_PREFIX。"""
-        name = name or BAG_PREFIX
+        """分段录包：每 BAG_SEGMENT 秒一个包，包名 = 前缀_MMDD_HHMMSS。name 是前缀，不填用狗编号（robot_id）。"""
+        name = name or robot_id()[0]
         if not P.SAFE_NAME.match(name) or len(name) > 30:
             return False, '包名前缀只能用字母、数字、下划线和减号，最多 30 个字符'
         bad = [t for t in topics if t != P.ALL_TOPICS and not P.SAFE_TOPIC.match(t)]
@@ -2831,7 +2916,7 @@ class Server:
         bags_dir = os.path.join(DATA, 'bags')
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
-        base = time.strftime(f'{BAG_PREFIX}_%m%d_%H%M%S')
+        base = time.strftime(f'{robot_id()[0]}_%m%d_%H%M%S')
         name, k = base, 1
         while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))):
             k += 1
@@ -3844,6 +3929,9 @@ class Server:
                     self.tx_put(ws, json.dumps({'t': 'cam', **r}))
                 elif d.get('t') == 'inspect' and isinstance(d.get('topic'), str):
                     self.set_inspect(ws, d['topic'], bool(d.get('on')))
+                elif d.get('t') == 'motor_fast':   # 网页在看电机力矩：lowstate 读得勤一点
+                    self.clients[ws]['mfast'] = bool(d.get('on'))
+                    self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
                 elif d.get('t') == 'cmd':
                     # 指令可能要等几秒（Nav2 接受目标、服务回复），单独跑，不耽误这条连接上的心跳
                     t = asyncio.create_task(self.run_cmd(ws, d))
@@ -3855,6 +3943,7 @@ class Server:
                 self.set_inspect(ws, topic, False)
             await self.camera.release(ws)
             self.clients.pop(ws, None)
+            self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
             if ws is self.owner:
                 self.owner = None
@@ -3954,6 +4043,7 @@ class Server:
                     if s is not None and s != 'Velocity':
                         await self.disarm_and_cancel(f'机器狗不在行走状态（运控状态 {s}）')
                 if k % 5 == 0:
+                    self.hot_tick()
                     self.idle_tick()
                     self.ctrl_watch()
                 # 急停期间底盘被其他客户端解锁 → 再次上锁。
@@ -4010,7 +4100,7 @@ class Server:
                               autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
-                              cont=self.cont_state(), autosave=self.autosave_view())
+                              cont=self.cont_state(), autosave=self.autosave_view(), webVersion=self.version)
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
@@ -4032,6 +4122,7 @@ class Server:
 
         app = web.Application(middlewares=[no_cache])
         app.router.add_get('/', self.index)
+        app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):

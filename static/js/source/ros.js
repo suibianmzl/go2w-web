@@ -28,6 +28,7 @@ export function createRosSource(store, bus){
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${basePath}/ws${query}`;
   let ws = null, lastMsg = 0, mapGrid = null, rateWarned = -Infinity, seq = 0, pingPausedUntil = 0, lastTask = null;
   let camWanted = false;                            // 摄像头标签页开着：断线重连后要重新申请
+  let motorFast = false;                            // 电机表开着「力矩」视图：后端每 0.5 s 读一次 lowstate，重连后要重新申请
   let layers = [], gcost = null, rawPlan = null;   // rawPlan：后端最近一次的 /plan（任务结束后不再显示）
   let teleCmd = null, teleTimer = null;             // 键盘遥控：按住时每 0.1 s 发一次，后端 0.3 s 收不到就停
   const watchers = new Map();                       // topic 查看器：topic → Set(回调)
@@ -51,7 +52,7 @@ export function createRosSource(store, bus){
   function connect(){
     ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { store.link.ok = true; store.robotOnline = null; lastMsg = performance.now(); log('INFO', 'go2w_web', `connected to ${url}`); sendLayers(); sendWatches(); if (camWanted) ws.send(JSON.stringify({ t: 'cam', on: true })); };
+    ws.onopen = () => { store.link.ok = true; store.robotOnline = null; lastMsg = performance.now(); log('INFO', 'go2w_web', `connected to ${url}`); sendLayers(); sendWatches(); if (motorFast) ws.send(JSON.stringify({ t: 'motor_fast', on: true })); if (camWanted) ws.send(JSON.stringify({ t: 'cam', on: true })); };
     ws.onmessage = e => { lastMsg = performance.now(); typeof e.data === 'string' ? onJson(JSON.parse(e.data)) : onBinary(e.data); };
     ws.onclose = () => {
       if (store.link.ok) log('WARN', 'go2w_web', 'connection lost, retrying');
@@ -172,6 +173,7 @@ export function createRosSource(store, bus){
         store.autoLoc = m.autoLoc || null;
         store.cont = m.cont || null;
         store.autosave = m.autosave || null;
+        store.webVersion = m.webVersion || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
@@ -295,6 +297,7 @@ export function createRosSource(store, bus){
     steps: [['plan', '规划路径', 'Theta*'], ['follow', '跟随路径', 'RotationShim · MPPI'], ['recover', '恢复行为', '需要时'], ['arrive', '到达', 'goal checker']],
     inspect: () => null,
     // 摄像头：on = 要看 / 不看了（后端最多 3 人同时看）
+    motorFast(on){ on = !!on; if (on === motorFast) return; motorFast = on; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'motor_fast', on })); },
     camera: { set(on){ camWanted = on; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'cam', on })); } },
     // topic 查看器：订阅一个 topic 的消息内容（后端最多 2 Hz），返回取消函数
     watch(topic, cb){

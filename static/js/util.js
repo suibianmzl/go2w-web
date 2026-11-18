@@ -22,7 +22,8 @@ export const motorName = i => i < 12 ? `${MOTOR_LEG_CN[MOTOR_LEGS[i/3|0]]}${MOTO
 export const motorLevel = t => t >= MOTOR_CRIT ? 'crit' : t >= MOTOR_WARN ? 'warn' : 'ok';
 // 电机表的下拉（11-17，照 app「机身信息 → 狗腿信息」，用户只要温度和错误标志）：后端 motorInfo = { err }，
 // err = LowState.motor_state[i].reserve[0]（当错误标志；11-17 录包核对过平时 16 个全是 0），0 = 正常
-export const MOTOR_VIEWS = [['temp', '温度'], ['err', '错误标志']];
+// tau = motor_state[i].tau_est（估计力矩 N·m，带正负；11-17 加，看这个视图时后端 2 Hz 刷新）
+export const MOTOR_VIEWS = [['temp', '温度'], ['err', '错误标志'], ['tau', '力矩']];
 export const motorErrCount = info => info?.err ? info.err.filter(v => v).length : 0;
 export const CLOUD = ['#ff4fa3','#e95ab9','#c964d6','#a86bff','#8a8fff','#6fb6ff'];
 

@@ -33,6 +33,16 @@ kbd{font-family:var(--f-mono);font-size:10px;padding:1px 5px;border:1px solid va
 .brand-sub b{font-weight:600}
 .brand-sub b[data-s="mock"]{color:var(--warn)}
 .brand-sub b[data-s="ros"]{color:var(--accent)}
+.brand-sub .ver{margin-left:8px;padding:1px 6px;border-radius:5px;border:1px solid var(--line-2);background:transparent;color:var(--fg-2);font:inherit;font-family:var(--f-mono);letter-spacing:.04em;cursor:pointer}
+.brand-sub .ver:hover{border-color:var(--accent-line);color:var(--fg)}
+.brand-sub .ver[data-s="warn"]{color:var(--warn);border-color:rgba(243,177,63,.5)}
+.ver-modal{width:min(480px,calc(100vw - 32px))}
+.ver-modal .ver-warn{color:var(--warn);font-size:12px;margin:0 0 12px;line-height:1.6}
+.ver-log{max-height:min(55vh,420px);overflow:auto;margin:0 0 14px}
+.ver-log section+section{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.ver-log h4{margin:0 0 6px;font-size:13px;font-family:var(--f-mono);font-weight:600}
+.ver-log h4 small{margin-left:8px;color:var(--muted);font-weight:400}
+.ver-log ul{margin:0;padding-left:18px;color:var(--fg-2);line-height:1.65;font-size:12.5px}
 .chips{display:flex;gap:6px;flex:1;min-width:0;overflow:hidden}
 .chip{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:7px;background:var(--panel);border:1px solid var(--line);white-space:nowrap;flex:none}
 .chip i{width:7px;height:7px;border-radius:50%;background:var(--muted)}
@@ -93,10 +103,10 @@ body.left-off #leftToggle svg,body.right-off #rightToggle svg{transform:rotate(1
 .robot-ico{width:64px;height:64px;border-radius:10px;background:radial-gradient(circle at 50% 60%,rgba(56,225,220,.18),transparent 70%),var(--panel);border:1px solid var(--line);display:grid;place-items:center}
 /* 有照片（web/static/img/go2w.jpg）时：卡片换成横向照片，标题旁换成方形照片 */
 .robot-ico{overflow:hidden}
-.robot-photo{width:100%;height:100%;object-fit:cover;display:block}
+.robot-photo{width:100%;height:100%;object-fit:contain;padding:4px;display:block}   /* 透明底照片（11-18）：整只显示，不裁 */
 body.has-photo .robot{grid-template-columns:104px 1fr}
 body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
-.brand-photo{width:30px;height:30px;border-radius:8px;object-fit:cover;border:1px solid var(--line-2);display:block}
+.brand-photo{width:30px;height:30px;border-radius:8px;object-fit:contain;padding:2px;background:var(--panel);border:1px solid var(--line-2);display:block}
 .robot-name{font-family:var(--f-display);font-weight:700;font-size:18px;letter-spacing:.04em}
 .robot-sub{color:var(--muted);font-size:11px;margin-top:2px}
 .pose-row{display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap}

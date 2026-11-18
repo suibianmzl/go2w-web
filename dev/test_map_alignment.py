@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/calib'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from align_map import export_map
 from map_to_png import read_pgm
 

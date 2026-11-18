@@ -286,22 +286,23 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     else off.hidden = true;
   }
   // 电机温度：一行显示最热的电机（超过阈值变黄 / 红），点开是 4 条腿 × 髋 / 大腿 / 小腿 / 轮 的表，展开状态记在本机浏览器。
-  // 表上面的下拉切换看 温度 / 错误标志（选的哪个也记在本机）
+  // 表上面的下拉切换看 温度 / 错误标志 / 力矩（选的哪个也记在本机）；表开着且看力矩时让后端读得勤一点
   const mtRow = $('#mtRow'), mtGrid = $('#mtGrid'), mtBox = $('#mtBox'), mtSel = $('#mtView'), mtCells = [];
   let mtView = 'temp';
   {
     mtSel.innerHTML = MOTOR_VIEWS.map(([k, cn]) => `<option value="${k}">${cn}</option>`).join('');
     try { const v = localStorage.getItem('go2w.mtView'); if (MOTOR_VIEWS.some(([k]) => k === v)) mtView = v; } catch {}
     mtSel.value = mtView;
-    mtSel.onchange = () => { mtView = mtSel.value; try { localStorage.setItem('go2w.mtView', mtView); } catch {} renderMotorTemp(); };
+    mtSel.onchange = () => { mtView = mtSel.value; try { localStorage.setItem('go2w.mtView', mtView); } catch {} syncFast(); renderMotorTemp(); };
     mtGrid.innerHTML = '<span></span>' + MOTOR_JOINTS.map(j => `<span>${j}</span>`).join('')
       + MOTOR_LEGS.map((l, li) => `<span class="lg">${MOTOR_LEG_CN[l]}</span>` + MOTOR_JOINTS.map((_, j) => `<b data-i="${motorIdx(li, j)}">--</b>`).join('')).join('');
     mtGrid.querySelectorAll('b').forEach(b => { mtCells[+b.dataset.i] = b; b.title = motorName(+b.dataset.i); });
     let open = false; try { open = localStorage.getItem('go2w.mtOpen') === '1'; } catch {}
-    const setOpen = v => { open = v; mtBox.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} };
+    const syncFast = () => src.motorFast?.(open && mtView === 'tau');
+    const setOpen = v => { open = v; mtBox.hidden = !v; mtRow.setAttribute('aria-expanded', String(v)); try { localStorage.setItem('go2w.mtOpen', v ? '1' : '0'); } catch {} syncFast(); };
     setOpen(open);
     mtRow.onclick = () => setOpen(!open);
-    mtRow.title = `点开看全部电机温度和错误标志（温度 ≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
+    mtRow.title = `点开看全部电机温度、错误标志和力矩（温度 ≥${MOTOR_WARN} ℃ 黄，≥${MOTOR_CRIT} ℃ 红）`;
   }
   const hex = v => '0x' + v.toString(16).toUpperCase();
   // 每种视图：单元格文字、颜色等级、鼠标悬停说明
@@ -313,13 +314,19 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const e = I.err[i];
       return [e ? hex(e) : '0', e ? 'crit' : 'dim', `${name} 错误标志 ${e}（${hex(e)}）${e ? '' : '：正常'}`];
     }
+    if (view === 'tau'){
+      const v = I.tau?.[i];
+      if (v == null) return ['--', '', name];
+      const s = Math.abs(v) < 0.05 ? '0.0' : (v > 0 ? '+' : '') + v.toFixed(1);   // 别显示 -0.0
+      return [s, Math.abs(v) < 0.5 ? 'dim' : '', `${name} 估计力矩 ${v.toFixed(2)} N·m（正负 = 方向）`];
+    }
     return ['--', '', name];
   }
   // 只在内容变了才写 DOM：这里 4 Hz 重绘，下拉框展开时改它的选项（哪怕文字一样）Chrome 会重建弹出列表 → 闪、点不中
   const setTxt = (el, v) => { v = String(v); if (el.textContent !== v) el.textContent = v; };
   const setAttr = (el, k, v) => { if (el.getAttribute(k) !== v) el.setAttribute(k, v); };
   let mtSumHtml = null;
-  const MT_NOTE = { temp: '℃', err: '0 = 正常' };
+  const MT_NOTE = { temp: '℃', err: '0 = 正常', tau: 'N·m · 估计值' };
   function renderMotorTemp(){
     const T = store.motorTemp, I = store.motorInfo, nErr = motorErrCount(I);
     setTxt($('#mtNote'), MT_NOTE[mtView]);
@@ -685,11 +692,54 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   })(['jpg', 'png', 'webp']);
 
   const badge = $('#srcBadge'); badge.dataset.s = src.name; badge.textContent = ros ? '实时 · ROS 2' : '模拟数据';
+
+  // 版本号（11-18）：页面自己的 static/version.json；后端推来的 webVersion 是机器人上装的版本，
+  // 不一样 = 机器人升级了但这个页面没刷新（或者页面来自别的服务器）
+  const verBtn = $('#verBadge'); let verInfo = null;
+  fetch('version.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(v => {
+    if (!v?.version) return;
+    verInfo = v; verBtn.hidden = false; renderVersion();
+  }).catch(() => {});
+  function verStale(){ return !!(verInfo && ros && store.webVersion && store.webVersion !== verInfo.version); }
+  function renderVersion(){
+    if (!verInfo) return;
+    const stale = verStale();
+    const txt = stale ? `${verInfo.version} · 有新版本，请刷新` : verInfo.version;
+    if (verBtn.textContent !== txt) verBtn.textContent = txt;
+    const st = stale ? 'warn' : '';
+    if (verBtn.dataset.s !== st) verBtn.dataset.s = st;
+  }
+  verBtn.onclick = () => {
+    if (!verInfo) return;
+    const s = document.createElement('div'); s.className = 'scrim';
+    s.innerHTML = `<div class="modal ver-modal" role="dialog" aria-modal="true"><h3></h3><div class="ver-warn" hidden></div><div class="ver-log"></div>
+      <div class="btn-row"><button class="btn ghost" data-a="r" hidden>刷新页面</button><button class="btn pri" data-a="c">关闭</button></div></div>`;
+    s.querySelector('h3').textContent = `网页版本 ${verInfo.version}` + (verInfo.date ? `（${verInfo.date}）` : '');
+    if (verStale()){
+      const w = s.querySelector('.ver-warn'); w.hidden = false;
+      w.textContent = `机器人上已经是 ${store.webVersion}，这个页面还是 ${verInfo.version}。刷新一下就是新版本。`;
+      s.querySelector('[data-a=r]').hidden = false;
+    }
+    const log = s.querySelector('.ver-log');
+    for (const n of verInfo.notes || []){
+      const sec = document.createElement('section');
+      const h = document.createElement('h4'); h.textContent = n.version;
+      if (n.date){ const d = document.createElement('small'); d.textContent = n.date; h.appendChild(d); }
+      const ul = document.createElement('ul');
+      for (const it of n.items || []){ const li = document.createElement('li'); li.textContent = it; ul.appendChild(li); }
+      sec.append(h, ul); log.appendChild(sec);
+    }
+    const close = () => { s.remove(); document.removeEventListener('keydown', esc); };
+    const esc = e => { if (e.key === 'Escape') close(); };
+    s.addEventListener('click', e => { const a = e.target.dataset.a; if (e.target === s || a === 'c') close(); if (a === 'r') location.reload(); });
+    document.addEventListener('keydown', esc);
+    document.body.appendChild(s); s.querySelector('[data-a=c]').focus();
+  };
   renderLayers();
 
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
-    medium(){ renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
+    medium(){ renderVersion(); renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); },  // 4 Hz
     slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,

@@ -61,7 +61,9 @@ export function createMockSource(store, bus){
   store.motorTemp = mtBase.slice();
   // 电机错误标志（下拉里的 错误标志）：?mock&err 让右前大腿、左后轮报错
   const mtErr = /[?&]err\b/.test(location.search) ? [0, 0x4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20] : Array(16).fill(0);
-  store.motorInfo = { err: mtErr };
+  // 力矩：取 11-16 录包站立时的中位数（小腿约 +7、左右髋相反）
+  const mtTau = [5.9, -1.8, 7.2, -6.8, 0.2, 8.1, 3.8, 0.6, 6.8, -3.8, 0.8, 7.1, -0.4, -0.3, 0.1, 0];
+  store.motorInfo = { err: mtErr, tau: mtTau };
   store.ctrl = { on: false };   // 纯前端模拟没有运控：自检跳过「站立」
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';
@@ -204,6 +206,7 @@ export function createMockSource(store, bus){
     R.th = wrap(R.th + R.w*dt);
     store.odo += Math.hypot(R.v, R.vy)*dt;
     if (Math.random() < dt/5) store.motorTemp = mtBase.map(v => v + Math.round(Math.random()*2 - 1));
+    if (Math.random() < dt/0.5) store.motorInfo = { ...store.motorInfo, tau: mtTau.map(v => +(v + Math.random()*0.6 - 0.3).toFixed(2)) };
     store.imu = { pitch: .9 + (tv - R.v)*3 + Math.sin(S.t*7)*.08, roll: -.4 + R.w*.6 + Math.sin(S.t*5.3)*.06 };
     const tr = store.trail, last = tr[tr.length-1];
     if (!last || Math.hypot(last[0]-R.x, last[1]-R.y) > .08){ tr.push([R.x, R.y]); if (tr.length > 900) tr.shift(); }
