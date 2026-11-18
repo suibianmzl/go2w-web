@@ -143,10 +143,10 @@ select:disabled{opacity:.55;cursor:not-allowed}
 .video-panel{flex:1;min-height:420px;display:flex;flex-direction:column;overflow:hidden}
 .live-badge{display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid rgba(255,93,108,.35);border-radius:999px;color:#ff9aa4;background:rgba(255,93,108,.07);font:9px var(--display);letter-spacing:.1em}
 .live-badge i{width:6px;height:6px;border-radius:50%;background:var(--danger);box-shadow:0 0 8px var(--danger)}
-.video-stage{position:relative;flex:none;align-self:center;min-height:0;margin:12px auto;border:1px solid #1c2936;border-radius:9px;overflow:hidden;background:#020407}
+.video-stage{position:relative;flex:1;align-self:stretch;min-height:0;margin:12px;border:1px solid #1c2936;border-radius:9px;overflow:hidden;background:#020407}
 #rtcVideo,#rtcVideo>div,#rtcVideo video{width:100%!important;height:100%!important}
 #rtcVideo{position:absolute;inset:0}
-#rtcVideo video{display:block;object-fit:cover}
+#rtcVideo video{display:block;object-fit:cover;object-position:center}
 .video-message{position:absolute;inset:0;display:grid;place-items:center;padding:20px;text-align:center;color:var(--muted);font-size:12px;background:radial-gradient(circle at 50% 50%,rgba(56,225,220,.05),transparent 55%)}
 .video-corner{position:absolute;width:22px;height:22px;border-color:rgba(56,225,220,.45);pointer-events:none}
 .video-corner.tl{left:10px;top:10px;border-left:1px solid;border-top:1px solid}

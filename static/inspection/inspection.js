@@ -71,8 +71,6 @@ const els = {
   rtcBadge: $('#rtcBadge'),
   rtcMessage: $('#rtcMessage'),
   rtcVideo: $('#rtcVideo'),
-  videoPanel: $('#videoPanel'),
-  videoStage: $('#videoStage'),
   mapOverlay: $('#mapOverlay'),
   mapCanvas: $('#inspectionMap'),
   mapTitle: $('#mapTitle'),
@@ -946,21 +944,6 @@ const canvas = els.mapCanvas;
 const ctx = canvas.getContext('2d');
 const view = { scale:40, cx:0, cy:0, width:0, height:0 };
 
-function fitVideoStage(){
-  const panel = els.videoPanel.getBoundingClientRect();
-  const header = els.videoPanel.querySelector('.panel-head')?.getBoundingClientRect().height || 44;
-  const availableWidth = Math.max(1, panel.width - 24);
-  const availableHeight = Math.max(1, panel.height - header - 24);
-  let width = availableWidth;
-  let height = width * 9 / 16;
-  if (height > availableHeight){
-    height = availableHeight;
-    width = height * 16 / 9;
-  }
-  els.videoStage.style.width = `${Math.floor(width)}px`;
-  els.videoStage.style.height = `${Math.floor(height)}px`;
-}
-
 function resizeCanvas(){
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -1254,5 +1237,3 @@ resizeCanvas();
 init().catch(error => {
   toast(`巡检页面初始化失败：${error?.message || error}`, 'err');
 });
-new ResizeObserver(fitVideoStage).observe(els.videoPanel);
-fitVideoStage();
