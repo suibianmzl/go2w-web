@@ -53,6 +53,7 @@ export function createMockSource(store, bus){
   store.costmap = { img: costImg, w: MW, h: MH, ox: 0, oy: 0 };
   store.costAt = costAt;
   store.wallAt = wallMask(grid, GW, GH, RES, 0, 0);
+  store.mapGrid = { grid, w: GW, h: GH, res: RES, ox: 0, oy: 0, oyaw: 0 };
   store.link = { ok: true, ms: 23 };
   store.armed = true; store.battery = 76; store.odo = 1284;
   // 电机温度：取 11-16 真机录包的典型值（髋关节明显比别的热）；?mock&hot 让左前髋 / 右后髋过热，测提醒
@@ -445,6 +446,11 @@ export function createMockSource(store, bus){
       if (store.maps.some(map => map.name === name)) return { ok: false, msg: '目标地图已存在' };
       store.maps.unshift({ name, meta:`${GW}×${GH} · 0.05 m` });
       return { ok: true, msg: `模拟保存 ${name}，实际文件请在本地后端模式中验证` };
+    },
+    editMap({ name, runs }){
+      if (store.maps.some(map => map.name === name)) return { ok: false, msg: '已经有同名地图' };
+      store.maps.unshift({ name, meta:`${GW}×${GH} · 0.05 m` });
+      return { ok: true, msg: `模拟保存 ${name}（${runs.length} 段修改），实际文件请在本地后端模式中验证` };
     },
     loadMap(name){ store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
     // 续建：模拟模式只走流程，不碰真文件（基准检查、起点位姿、自检的门限在 test_mapmeta / test_mapcontinue 里测）

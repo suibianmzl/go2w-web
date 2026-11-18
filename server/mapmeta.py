@@ -185,6 +185,21 @@ def _close(a, b, tol=0.005):
     return abs(float(a) - float(b)) <= tol
 
 
+def edited_children(maps_dir, name):
+    """网页上从 name 编辑出来的图（meta.json 里 tool = web-edit、parent = name）。"""
+    try:
+        files = os.listdir(maps_dir)
+    except OSError:
+        return []
+    out = []
+    for fn in files:
+        if fn.endswith('.meta.json'):
+            meta = read(maps_dir, fn[:-len('.meta.json')]) or {}
+            if meta.get('tool') == 'web-edit' and meta.get('parent') == name:
+                out.append(meta.get('name') or fn[:-len('.meta.json')])
+    return out
+
+
 def preflight(maps_dir, base, *, policy=None, slice_now=None, target=None):
     """续建前能不能开始。返回 (ok, reasons, warnings)：reasons 非空就别开始。
 
@@ -195,6 +210,12 @@ def preflight(maps_dir, base, *, policy=None, slice_now=None, target=None):
         return False, ['没有指定基准图'], warns
     if not os.path.isfile(map_path(maps_dir, base)):
         return False, [f'data/maps 里没有基准图 {base}.yaml'], warns
+    meta0 = read(maps_dir, base) or {}
+    if meta0.get('tool') == 'web-edit':
+        # 网页编辑（mapedit.py）存的图只有 pgm / yaml，没有 slam 数据
+        src = meta0.get('parent') or '原图'
+        return False, [f'{base} 是网页上编辑过的地图（从 {src} 改来），没有 slam 数据，不能续建。'
+                       f'请用 {src} 续建，续建完再重新编辑（去噪 / 擦除）'], warns
     if not has_posegraph(maps_dir, base):
         return False, [f'基准图 {base} 没有完整的 .posegraph + .data，slam_toolbox 无法从它恢复——'
                        f'这张图不能当续建基准，只能重建'], warns
@@ -203,6 +224,11 @@ def preflight(maps_dir, base, *, policy=None, slice_now=None, target=None):
             reasons.append(f'已经有同名地图 {target}：续建必须另存新名字，不覆盖')
         if os.path.isfile(os.path.join(maps_dir, f'{target}.posegraph')):
             reasons.append(f'已经有同名 posegraph {target}：换个名字')
+
+    edited = sorted(n for n in edited_children(maps_dir, base))
+    if edited:
+        warns.append(f'{base} 有网页编辑过的版本（{"、".join(edited)}）：续建是从 {base} 的 slam 数据重建，'
+                     f'那些编辑不会带到新图上，续建完需要重新去噪 / 擦除')
 
     chain = lineage(maps_dir, base)
     if len(chain) >= MAX_CHAIN:

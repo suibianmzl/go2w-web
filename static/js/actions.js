@@ -294,11 +294,20 @@ export function createActions(store, src){
         return result;
       } finally { store.mapSaving = false; }
     },
-    loadMap(name){
+    // 地图编辑另存（v1.0.2）：p = { source, name, crc, w, h, runs, summary, routes }
+    saveEditedMap(p){
+      if (!ready('editMap')) return Promise.resolve({ ok: false });
+      if (store.mapSaving || store.mapBusy){ toast('地图正在保存，请稍等', 'warn'); return Promise.resolve({ ok: false }); }
+      store.mapSaving = true;
+      return exec(src.cmd.editMap(p), null).finally(() => { store.mapSaving = false; });
+    },
+    loadMap(name, { confirmed = false } = {}){
       if (store.mapSaving || store.mapBusy) return toast('地图正在保存，请稍等', 'warn');
       if (!ready('loadMap')) return;
       const live = run('localization') || run('navigation');
       if (src.name === 'ros' && !live) return exec(src.cmd.loadMap(name), null);   // 没在跑：只是选好下次启动用的地图
+      // 调用方已经把后果说清楚并让用户勾选过（地图编辑「保存后切换」）：不再弹第二个确认框
+      if (confirmed) return exec(src.cmd.loadMap(name), src.name === 'mock' ? `已加载 ${name}（模拟模式仍显示示例地图）` : null);
       confirmBox({ title: `切换到地图 ${name}`, body: 'map_server 会立即加载这张地图，正在执行的导航会取消。切换后要重新设置初始位姿。', ok: '切换',
         onOk: () => exec(src.cmd.loadMap(name), src.name === 'mock' ? `已加载 ${name}（模拟模式仍显示示例地图）` : null) });
     },

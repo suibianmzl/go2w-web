@@ -79,6 +79,7 @@ from geometry_msgs.msg import Pose2D
 import camera as C
 import mapcontinue as MC
 import mapmeta as MM
+import mapedit as ME
 import mapfile
 import procs as P
 import robot_ctrl as R
@@ -1366,7 +1367,7 @@ class Server:
 
     async def handle_cmd(self, ws, d):
         n, op = self.node, d.get('op')
-        if self.map_busy and op in ('set_mode', 'load_map', 'save_map', 'align_map'):
+        if self.map_busy and op in ('set_mode', 'load_map', 'save_map', 'align_map', 'edit_map'):
             return False, '地图正在保存或对齐，请稍等'
         if ws.closed or ws not in self.clients:
             return False, '网页已断开'
@@ -1520,6 +1521,8 @@ class Server:
                 return await self.save_map(d.get('name', ''))
             if op == 'align_map':
                 return await self.align_map(d.get('source'), d.get('name'), d.get('angle'))
+            if op == 'edit_map':
+                return await self.edit_map(d, self.remote(ws))
             if op == 'load_map':
                 return await self.load_map(d.get('name', ''))
             if op == 'cont_preflight':
@@ -3703,6 +3706,46 @@ class Server:
             return True, f'已保存 {name}（PGM / YAML / PNG），原图 {source} 保留用于续建'
         finally:
             self.map_busy = False
+
+    async def edit_map(self, d, who):
+        """网页地图编辑（v1.0.2）：在 source 上应用网页发来的修改，另存为 name（mapedit.py）。不覆盖任何已有地图。"""
+        source, name = d.get('source'), d.get('name')
+        if self.busy or self.map_loading:
+            return False, '档位或地图正在切换，请稍等'
+        if not all(isinstance(v, str) and P.SAFE_NAME.fullmatch(v) for v in (source, name)):
+            return False, '地图名只能用字母、数字、下划线和减号（最多 48 个字符）'
+        if source == name:
+            return False, '新地图要换个名字：编辑不覆盖原图'
+        if self.prof('mapping') != 'stop':
+            return False, '建图运行中不能保存编辑（地图还在变），先停止建图'
+        crc, w, h = d.get('crc'), d.get('w'), d.get('h')
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (crc, w, h)):
+            return False, '指令格式不对（缺少底图校验）'
+        maps_dir = os.path.join(DATA, 'maps')
+        self.map_busy = True
+        try:
+            changed, _ = await asyncio.to_thread(ME.save, maps_dir, source, name, d.get('runs'), crc, w, h,
+                                                 d.get('summary'), self.version)
+            self.maps = P.list_maps(maps_dir)
+        except (ValueError, OSError) as e:
+            return False, f'没有保存：{e}'
+        finally:
+            self.map_busy = False
+        moved, note = 0, ''
+        if d.get('routes'):
+            if self.route_running():
+                note = '；有任务正在执行，路线没有改到新图'
+            else:
+                routes = {k: (dict(r, map=name) if r.get('map') == source else r) for k, r in self.routes.items()}
+                moved = sum(1 for k in routes if routes[k].get('map') != self.routes[k].get('map'))
+                if moved:
+                    try:
+                        self.write_routes(routes)
+                        await self.send_all(self.routes_message(), key='routes')
+                    except OSError as e:
+                        moved, note = 0, f'；路线没能改到新图（{e}）'
+        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务改到新图" if moved else ""}；{who}）')
+        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已改到新图' if moved else '') + note
 
     async def load_map(self, name):
         n = self.node

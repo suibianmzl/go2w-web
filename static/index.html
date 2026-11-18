@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Go2W 导航控制台</title>
+<title>EvoX 导航控制台</title>
 <link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
 <link rel="icon" type="image/png" sizes="64x64" href="img/favicon-64.png">
 <link rel="apple-touch-icon" href="img/favicon-180.png">
@@ -19,7 +19,7 @@
       <img class="brand-photo robot-img" alt="Go2W" hidden>
       <svg class="robot-fallback" viewBox="0 0 32 32" aria-hidden="true"><rect x="1" y="1" width="30" height="30" rx="8" fill="#0f1b28" stroke="#22334a"/><path d="M8 19h16l-2-6H11z" fill="none" stroke="#38e1dc" stroke-width="1.8" stroke-linejoin="round"/><circle cx="10" cy="22.5" r="2.2" fill="#38e1dc"/><circle cx="22" cy="22.5" r="2.2" fill="#38e1dc"/><path d="M22 13l3-4" stroke="#38e1dc" stroke-width="1.8" stroke-linecap="round"/></svg>
       <div>
-        <div class="brand-name">GO2W<span>导航控制台</span></div>
+        <div class="brand-name"><span class="evox" aria-label="EvoX">Evo<i>X</i></span><span>导航控制台</span></div>
         <div class="brand-sub">NAV CONSOLE · <b id="srcBadge">--</b><button class="ver" id="verBadge" type="button" title="版本和更新说明" hidden></button></div>
       </div>
     </div>
@@ -124,6 +124,20 @@
           <div class="cam-bar"><span id="camInfo">最多 3 人同时观看</span></div>
           <div class="cam-grip" id="camGrip" title="拖动调整大小（保持比例），双击恢复默认"></div>
         </div>
+        <div class="hud medit" id="medit" hidden>
+          <div class="medit-head"><b>地图编辑</b><span class="mono" id="meditName"></span><span class="sp"></span><button class="ib" id="meditClose" title="退出编辑" aria-label="退出地图编辑"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+          <div class="seg medit-tools" id="meditTools" role="group" aria-label="编辑工具">
+            <button data-et="pan">平移</button><button data-et="free">擦成空地</button><button data-et="occ">画墙</button><button data-et="unknown">擦成未知</button><button data-et="crop">裁剪</button>
+          </div>
+          <div class="medit-hint" id="meditHint"></div>
+          <label class="medit-row" id="meditBrushRow"><span class="k">笔刷</span><input type="range" id="meditBrush" min="0" max="20" step="1"><b class="mono" id="meditBrushTxt"></b></label>
+          <div class="medit-sec">
+            <label class="medit-row"><span class="k">去噪</span><input type="range" id="meditSpeck" min="1" max="40" step="1" title="不超过这么多格的孤立障碍算噪点（1 格 = 5×5 cm）"><b class="mono" id="meditSpeckTxt"></b></label>
+            <div class="medit-row"><label class="medit-chk"><input type="checkbox" id="meditShow"><span id="meditSpeckInfo"></span></label><button class="btn sm" id="meditDenoise">去掉</button></div>
+          </div>
+          <div class="medit-row"><button class="btn sm ghost" id="meditUndo" title="撤销（Ctrl/⌘+Z）">撤销</button><button class="btn sm ghost" id="meditRedo" title="重做（Ctrl/⌘+Shift+Z）">重做</button><button class="btn sm ghost" id="meditCompare" title="按住看原图">按住看原图</button><span class="sp"></span><span class="medit-dirty" id="meditDirty"></span></div>
+          <button class="btn pri medit-save" id="meditSave">另存为新地图…</button>
+        </div>
         <div class="mode-tag" id="mapTag" hidden>建图中 · slam_toolbox</div>
         <div class="tele" id="teleHint" hidden>
           <div class="keys"><kbd data-k="q">Q</kbd><kbd data-k="w">W</kbd><kbd data-k="e">E</kbd><kbd data-k="a">A</kbd><kbd data-k="s">S</kbd><kbd data-k="d">D</kbd></div>
@@ -136,6 +150,7 @@
           <button class="tool" data-tool="route" title="连续点击添加导航点"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 17l5-10 7 8"/><circle cx="6" cy="17" r="2"/><circle cx="11" cy="7" r="2"/><circle cx="18" cy="15" r="2"/></svg><span>导航点</span><kbd>3</kbd></button>
           <button class="tool" data-tool="measure" title="测距"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/></svg><span>测距</span><kbd>4</kbd></button>
           <button class="tool" data-tool="align" title="沿墙选两点，对齐地图方向"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4v16h16M7 14l12-5M7 17h12"/></svg><span>地图对齐</span><kbd>5</kbd></button>
+          <button class="tool" data-tool="edit" title="地图编辑：去噪、擦除、裁剪，另存为新地图"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg><span>编辑</span><kbd>6</kbd></button>
           <div class="tsep"></div>
           <button class="tool" data-tool="teleop" title="键盘遥控"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 10.5v4M5 12.5h4"/><circle cx="16" cy="11.5" r="1"/><circle cx="18" cy="13.5" r="1"/></svg><span>遥控</span><kbd>T</kbd></button>
         </div>
