@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Go2W 设备管理</title>
+  <link rel="stylesheet" href="fleet.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/quadruped/fleet/">
+      <strong>Evo<span>X</span></strong>
+      <small>FLEET CONSOLE</small>
+    </a>
+    <div class="environment"><i></i><span>云端设备中心</span></div>
+  </header>
+
+  <main>
+    <div class="heading">
+      <div>
+        <div class="eyebrow">FLEET OVERVIEW</div>
+        <h1>设备管理 <span id="device-count">0</span></h1>
+        <p>查看机器狗在线状态，进入对应控制台。</p>
+      </div>
+      <button id="refresh" type="button">刷新设备</button>
+    </div>
+
+    <section class="summary">
+      <div><span>接入设备</span><strong id="total">0</strong></div>
+      <div><span>当前在线</span><strong id="online" class="ok">0</strong></div>
+      <div><span>执行任务</span><strong id="tasks">0</strong></div>
+      <aside><b>Go2W Fleet</b><small>按 robot_id 独立路由控制与视频</small></aside>
+    </section>
+
+    <div class="section-head">
+      <h2>我的设备</h2>
+      <span>每 5 秒自动更新</span>
+    </div>
+    <section id="devices" class="devices" aria-live="polite"></section>
+  </main>
+
+  <script src="fleet.js" type="module"></script>
+</body>
+</html>

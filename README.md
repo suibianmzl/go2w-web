@@ -6,27 +6,32 @@
 server/go2w_web.py   后端：rclpy 节点（域 43）+ aiohttp，HTTP 和 WebSocket 同一端口
 server/procs.py      运行档位的进程管理（经运行容器 supervisor 的 socket 启停进程组）
 server/camera.py     前置摄像头 RTP 组播接收、拼帧
-<<<<<<< HEAD
 server/cloud_gateway.py  云端无 ROS WebSocket 网关（浏览器与机器狗消息路由）
 server/rtc_token.py      火山 RTC 短期 Token 生成
-=======
 server/mapmeta.py    地图续建：<name>.meta.json 读写、血缘、续建前置检查
 server/mapcontinue.py 地图续建：起点位姿三级降级、图外检查、自检时的「还在起点吗」
 tools/              随网页包部署的工具脚本（map_overlap_check.py 续建自检等；源在主仓库 scripts/calib）
->>>>>>> upstream/main
 static/              前端：原生 JS 模块，不需要构建
   js/source/mock.js  模拟数据源（示例地图 + 机器人仿真）
   js/source/ros.js   ROS 数据源（连后端 /ws）
+  fleet/             多机器狗设备列表页
 dev/                 本地调试：假 ROS、假摄像头、协议测试
 prototype/           最早的单文件原型和右栏原型，留作对照
 tools/go2w_edge_gateway.py  机器狗到云端的 WebSocket 长连接转发
+tools/ssh_portbroker_agent.py  机器狗反向 SSH 注册、心跳与重连 Agent
+tools/ssh_portbroker/  运维提供的 reverse-register.sh
 static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行）
 ```
 
 云端 Demo 由 `server/cloud_gateway.py` 直接监听 8080，提供 `/quadruped/`、
-`/quadruped/ws` 和 `/quadruped/robot/ws`。机器狗运行
+`/quadruped/fleet/`、`/quadruped/ws` 和 `/quadruped/robot/ws`。机器狗运行
 `tools/go2w_edge_gateway.py` 连接本地 `go2w_web`，再主动连接云端机器人入口；
 本地 ROS 后端本身不需要修改。
+
+云端按 `robot_id` 保存多台机器狗会话。`/quadruped/` 保持原控制台，
+`/quadruped/?robot_id=go2w-01` 选择指定机器狗；`/quadruped/fleet/` 显示在线设备列表。
+边缘网关会给上行文本和二进制元数据以及下行指令补充 `robot_id`。
+摄像头浮窗可单独开启或关闭机器狗视频采集上传；关闭浮窗只停止当前浏览器观看。
 
 为降低机器狗 CPU，RTC 转码默认在云端执行：机器狗只转发原始 H.264 到
 `/quadruped/camera/ws`，云端 Chrome 以 1280×720、15 FPS 发布

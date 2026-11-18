@@ -23,7 +23,9 @@ export function createRosSource(store, bus){
   const log = (lv, node, msg) => bus.emit('log', lv, node, msg);
   const t0 = performance.now(), now = () => (performance.now() - t0) / 1000;
   const basePath = location.pathname.startsWith('/quadruped/') ? '/quadruped' : '';
-  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${basePath}/ws`;
+  const robotId = new URLSearchParams(location.search).get('robot_id') || '';
+  const query = robotId ? `?robot_id=${encodeURIComponent(robotId)}` : '';
+  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${basePath}/ws${query}`;
   let ws = null, lastMsg = 0, mapGrid = null, rateWarned = -Infinity, seq = 0, pingPausedUntil = 0, lastTask = null;
   let camWanted = false;                            // 摄像头标签页开着：断线重连后要重新申请
   let layers = [], gcost = null, rawPlan = null;   // rawPlan：后端最近一次的 /plan（任务结束后不再显示）
@@ -34,6 +36,7 @@ export function createRosSource(store, bus){
   const pending = new Map();
 
   store.source = 'ros';
+  store.robotId = robotId || null;
   store.link = { ok: false, ms: null };
   store.robotOnline = null;
   store.robot.valid = false;
@@ -91,6 +94,8 @@ export function createRosSource(store, bus){
       case 'robot_status': {
         const was = store.robotOnline, online = !!m.online;
         store.robotOnline = online;
+        if (typeof m.video_upload_enabled === 'boolean') store.videoUploadEnabled = m.video_upload_enabled;
+        bus.emit('cameraUpload', store.videoUploadEnabled);
         if (!online){
           store.robot.valid = false; store.odomOk = false; store.armed = null;
           store.scan = new Float32Array(0); store.cloud = [];
@@ -105,6 +110,12 @@ export function createRosSource(store, bus){
           log('INFO', 'go2w_cloud', `机器狗 ${m.robot_id || ''} 已重新连接`);
           bus.emit('toast', '机器狗已重新连接到云端', 'ok');
         }
+        break;
+      }
+      case 'camera_upload': {
+        if (m.robot_id && store.robotId && m.robot_id !== store.robotId) break;
+        store.videoUploadEnabled = !!m.enabled;
+        bus.emit('cameraUpload', store.videoUploadEnabled);
         break;
       }
       case 'cam': bus.emit('cam', m); break;

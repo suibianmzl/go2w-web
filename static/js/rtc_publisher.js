@@ -10,6 +10,12 @@ const status = document.querySelector('#status');
 let engine = null, muxer = null, ws = null, config = null, pingTimer = null;
 window.__go2wRtcState = { phase: 'starting', events: [] };
 
+function withRobot(value){
+  const url = new URL(value, location.href);
+  url.searchParams.set('robot_id', robotId);
+  return url.toString();
+}
+
 function report(){
   const body = {
     ...window.__go2wRtcState,
@@ -17,7 +23,7 @@ function report(){
     videoHeight: video.videoHeight,
     readyState: video.readyState,
   };
-  fetch(`${cloudBase}/rtc/publisher-status`, {
+  fetch(withRobot(`${cloudBase}/rtc/publisher-status`), {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
     body: JSON.stringify(body),
@@ -111,7 +117,7 @@ async function startRtc(){
 }
 
 function connectCamera(){
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(withRobot(wsUrl));
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     log(`camera connected ${wsUrl}`);

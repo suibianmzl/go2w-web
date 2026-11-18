@@ -2,6 +2,8 @@
 export function createStore(){
   return {
     source: 'mock',                 // 'mock' | 'ros'
+    robotId: null,                  // 当前控制台选择的机器狗
+    videoUploadEnabled: null,       // 机器狗是否采集并上传视频
     link: { ok: false, ms: null },  // 浏览器 ↔ 后端
     robotOnline: null,              // 云端 ↔ 机器狗
     fixed: 'map',                   // 位姿和 scan 所在坐标系（没有 map TF 时后端退回 odom）

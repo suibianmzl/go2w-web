@@ -1,0 +1,24 @@
+[Unit]
+Description=Go2W SSH Port Broker Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/go2w-ssh-agent
+Environment=PYTHONUNBUFFERED=1
+Environment=GO2W_FLEET_URL=https://fleet.evoxrobot.com
+Environment=GO2W_SSH_AGENT_SCRIPT=/home/unitree/go2w-ssh-agent/reverse-register.sh
+Environment=GO2W_SSH_AGENT_KEY=/home/unitree/go2w-ssh-agent/id_portbroker_rsa
+Environment=GO2W_SSH_AGENT_STATE_DIR=/home/unitree/ssh-portbroker-dog/state
+Environment=GO2W_SSH_AGENT_LOG_DIR=/home/unitree/ssh-portbroker-dog/log
+EnvironmentFile=/opt/go2w/config/runtime.env
+ExecStart=/home/unitree/go2w-edge-gateway/.venv/bin/python /home/unitree/go2w-ssh-agent/ssh_portbroker_agent.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

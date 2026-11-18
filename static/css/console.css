@@ -242,6 +242,9 @@ body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
 .cam-msg{position:absolute;inset:0;display:grid;place-items:center;padding:12px;text-align:center;color:var(--muted);font-size:12px;background:rgba(0,0,0,.55)}
 .cam-msg[hidden]{display:none}
 .cam-bar{display:flex;align-items:center;gap:8px;min-height:24px;padding:2px 22px 2px 10px;font:10.5px var(--f-mono);color:var(--muted);white-space:nowrap;overflow:hidden}
+.cam-upload{margin-left:auto;border:1px solid #37564b;border-radius:4px;background:#13251f;color:#68d5a8;padding:2px 7px;font:10.5px var(--f-ui);cursor:pointer}
+.cam-upload.off{border-color:#634044;background:#271719;color:#ee979b}
+.cam-upload:disabled{opacity:.55;cursor:wait}
 .cam-bar #camInfo{overflow:hidden;text-overflow:ellipsis}
 .cam-grip{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;touch-action:none;
   background:linear-gradient(135deg,transparent 0 50%,var(--fg-2) 50% 56%,transparent 56% 68%,var(--fg-2) 68% 74%,transparent 74%)}

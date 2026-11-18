@@ -15,6 +15,7 @@ const KEY_OFF = 'go2w.camOff'; // localStorage：'1' = 用户手动关掉了浮�
 export function setupCamera(src, bus){
   const stage = $('#stage'), win = $('#camFloat'), head = $('#camHead'), grip = $('#camGrip');
   const btn = $('#vCam'), video = $('#camVideo'), msg = $('#camMsg'), info = $('#camInfo');
+  const uploadBtn = $('#camUpload');
   const show = text => { msg.hidden = !text; if (text) msg.textContent = text; };
   let ready = false, want = false, mux = null, stats = null, frames = 0, retry = null, refresh = null;
   const IDLE_INFO = '最多 3 人同时观看';
@@ -99,8 +100,24 @@ export function setupCamera(src, bus){
     ready = true;
     video.hidden = true;
     const rtc = createRtcViewer($('#camRtc'), show);
-    const rtcVisible = () => open && !document.hidden && !document.body.classList.contains('demo');
+    const robotId = new URLSearchParams(location.search).get('robot_id') || 'go2w-01';
+    let videoUploadEnabled = null, uploadBusy = false;
+    const rtcVisible = () => open && !document.hidden && !document.body.classList.contains('demo') &&
+      videoUploadEnabled !== false;
     let rtcWant = false;
+    function renderUpload(){
+      const on = videoUploadEnabled !== false;
+      uploadBtn.hidden = false;
+      uploadBtn.classList.toggle('off', !on);
+      uploadBtn.textContent = on ? '视频上传：开' : '视频上传：关';
+      uploadBtn.setAttribute('aria-pressed', String(on));
+      uploadBtn.title = on ? '关闭机器狗视频采集和上传' : '开启机器狗视频采集和上传';
+    }
+    function setVideoUpload(enabled){
+      videoUploadEnabled = !!enabled;
+      renderUpload();
+      updateRtc();
+    }
     function updateRtc(){
       const value = rtcVisible();
       if (value === rtcWant) return;
@@ -112,12 +129,49 @@ export function setupCamera(src, bus){
       } else {
         rtc.stop();
         stats = null;
-        info.textContent = IDLE_INFO;
-        show('浏览器标签页在后台，已暂停 RTC 视频');
+        if (videoUploadEnabled === false){
+          info.textContent = '机器狗视频上传已关闭';
+          show('机器狗视频上传已关闭，可在下方按钮重新开启');
+        } else {
+          info.textContent = IDLE_INFO;
+          show('浏览器标签页在后台，已暂停 RTC 视频');
+        }
       }
     }
+    uploadBtn.onclick = async () => {
+      if (uploadBusy) return;
+      uploadBusy = true;
+      uploadBtn.disabled = true;
+      const enabled = videoUploadEnabled === false;
+      try {
+        const response = await fetch(`/quadruped/api/robots/${encodeURIComponent(robotId)}/camera`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const robot = await response.json();
+        setVideoUpload(robot.video_upload_enabled);
+        bus.emit('toast', enabled ? '机器狗视频上传已开启' : '机器狗视频上传已关闭', 'ok');
+      } catch (error){
+        show(`视频上传切换失败：${error?.message || error}`);
+      } finally {
+        uploadBusy = false;
+        uploadBtn.disabled = false;
+      }
+    };
+    bus.on('cameraUpload', enabled => {
+      if (typeof enabled === 'boolean') setVideoUpload(enabled);
+    });
+    fetch('/quadruped/api/robots', { cache: 'no-store' })
+      .then(response => response.json())
+      .then(data => {
+        const robot = (data.robots || []).find(item => item.robot_id === robotId);
+        if (robot) setVideoUpload(robot.video_upload_enabled);
+      })
+      .catch(() => {});
     refresh = updateRtc;
-    updateRtc();
+    renderUpload();
     document.addEventListener('visibilitychange', updateRtc);
     setInterval(updateRtc, 250);
     return;

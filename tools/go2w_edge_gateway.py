@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import signal
+import struct
 import sys
 from datetime import datetime
 
@@ -29,16 +30,59 @@ def drop_local_binary(data):
     return bool(data) and data[0] == T_CAM
 
 
-async def pipe(source, destination, cloud_to_local, forward_camera=False):
+def add_robot_id_text(data, robot_id):
+    try:
+        message = json.loads(data)
+    except (TypeError, ValueError):
+        return data
+    if not isinstance(message, dict):
+        return data
+    existing = message.get('robot_id')
+    if existing is not None and existing != robot_id:
+        return None
+    message['robot_id'] = robot_id
+    return json.dumps(message, ensure_ascii=False, separators=(',', ':'))
+
+
+def add_robot_id_binary(data, robot_id):
+    if len(data) < 5:
+        return data
+    metadata_length = struct.unpack_from('<I', data, 1)[0]
+    metadata_end = 5 + metadata_length
+    if metadata_end > len(data):
+        return data
+    try:
+        metadata = json.loads(data[5:metadata_end].decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return data
+    if not isinstance(metadata, dict):
+        return data
+    existing = metadata.get('robot_id')
+    if existing is not None and existing != robot_id:
+        return None
+    metadata['robot_id'] = robot_id
+    packed = json.dumps(metadata, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return bytes([data[0]]) + struct.pack('<I', len(packed)) + packed + data[metadata_end:]
+
+
+async def pipe(source, destination, cloud_to_local, robot_id, forward_camera=False):
     async for message in source:
         if message.type == aiohttp.WSMsgType.TEXT:
             if cloud_to_local and not forward_camera and drop_cloud_text(message.data):
                 continue
-            await destination.send_str(message.data)
+            data = add_robot_id_text(message.data, robot_id)
+            if data is None:
+                log(f"dropped text with mismatched robot_id={robot_id}")
+                continue
+            await destination.send_str(data)
         elif message.type == aiohttp.WSMsgType.BINARY:
             if not cloud_to_local and not forward_camera and drop_local_binary(message.data):
                 continue
-            await destination.send_bytes(message.data)
+            data = add_robot_id_binary(message.data, robot_id)
+            if data is None:
+                log(f"dropped binary with mismatched robot_id={robot_id}")
+                continue
+            await destination.send_bytes(data)
         elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
             return
         elif message.type == aiohttp.WSMsgType.ERROR:
@@ -57,8 +101,8 @@ async def run_once(local_url, cloud_url, robot_id, forward_camera=False):
                 }, separators=(',', ':')))
                 log(f"connected robot_id={robot_id}")
                 tasks = [
-                    asyncio.create_task(pipe(local, cloud, False, forward_camera), name='local-to-cloud'),
-                    asyncio.create_task(pipe(cloud, local, True, forward_camera), name='cloud-to-local'),
+                    asyncio.create_task(pipe(local, cloud, False, robot_id, forward_camera), name='local-to-cloud'),
+                    asyncio.create_task(pipe(cloud, local, True, robot_id, forward_camera), name='cloud-to-local'),
                 ]
                 try:
                     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

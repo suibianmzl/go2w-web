@@ -4,7 +4,9 @@ export function createRtcViewer(container, show, basePath = '/quadruped'){
   let reconnectTimer = null, firstFrame = false, generation = 0;
 
   async function loadConfig(){
-    const response = await fetch(`${basePath}/rtc/config?role=viewer`, { cache: 'no-store' });
+    const robotId = new URLSearchParams(location.search).get('robot_id');
+    const query = robotId ? `&robot_id=${encodeURIComponent(robotId)}` : '';
+    const response = await fetch(`${basePath}/rtc/config?role=viewer${query}`, { cache: 'no-store' });
     if (!response.ok) throw new Error(`RTC 配置失败（${response.status}）`);
     return response.json();
   }
