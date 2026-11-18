@@ -19,6 +19,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 from pymysql.err import IntegrityError
 
+from archive import ArchiveSpool, ArchiveStore, iso_utc as archive_iso_utc, utc_now as archive_utc_now
 from rtc_token import AccessToken, PRIV_PUBLISH_STREAM, PRIV_SUBSCRIBE_STREAM
 from ssh_bindings import SSHBinding, SSHBindingStore, parse_time
 from ssh_portbroker import PortBrokerClient
@@ -27,6 +28,7 @@ from ssh_registration import SSHRegistrationError, SSHRegistrationService
 
 T_MAP, T_SCAN, T_GCOST, T_LCOST, T_CLOUD, T_PART, T_CAM = range(1, 8)
 LAYER_KINDS = {T_GCOST: 'gcost', T_LCOST: 'lcost', T_CLOUD: 'cloud', T_PART: 'particles'}
+BINARY_NAMES = {T_MAP: 'map', T_SCAN: 'scan', **LAYER_KINDS}
 CACHE_TEXT = {'state', 'pose', 'task', 'routes', 'map_views', 'plan', 'inspection_exceptions'}
 TEXT_QUEUE_MAX = 500
 ROBOT_QUEUE_MAX = 500
@@ -38,6 +40,7 @@ class Browser:
     ws: web.WebSocketResponse
     number: int
     robot_id: str
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     layers: set = field(default_factory=set)
     topics: set = field(default_factory=set)
     textq: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(TEXT_QUEUE_MAX))
@@ -60,6 +63,7 @@ class Browser:
 class RobotSession:
     ws: web.WebSocketResponse
     robot_id: str | None = None
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(ROBOT_QUEUE_MAX))
     tx: asyncio.Task | None = None
     last_seen: float = 0.0
@@ -68,6 +72,18 @@ class RobotSession:
     ack_routes: dict = field(default_factory=dict)
     active_topics: set = field(default_factory=set)
     owner: Browser | None = None
+    connected_at: datetime = field(default_factory=archive_utc_now)
+    remote_info: str | None = None
+    edge_version: str | None = None
+    message_seq: int = 0
+
+
+@dataclass
+class PendingCommand:
+    client: Browser | None
+    original_id: object
+    command_id: str
+    browser_session_id: str
 
 
 class CloudGateway:
@@ -82,6 +98,8 @@ class CloudGateway:
         ssh_store=None,
         ssh_broker=None,
         ssh_registration=None,
+        archive_spool=None,
+        archive_store=None,
     ):
         self.static_dir = Path(static_dir).resolve()
         self.rtc_app_id = rtc_app_id
@@ -104,6 +122,14 @@ class CloudGateway:
                 )
             ),
         )
+        self.archive_spool = archive_spool or ArchiveSpool.from_env()
+        self.archive_enabled = self.archive_spool.enabled
+        if archive_store is not None:
+            self.archive_store = archive_store
+        elif self.archive_enabled:
+            self.archive_store = ArchiveStore.from_env()
+        else:
+            self.archive_store = ArchiveStore(None)
         self.clients = {}
         self.camera_clients = {}
         self.client_seq = 0
@@ -133,6 +159,158 @@ class CloudGateway:
     def video_upload_enabled(self, robot_id):
         record = self.robot_records.get(robot_id, {})
         return record.get('video_upload_enabled', True) is not False
+
+    # ---------- archive capture ----------
+    def archive_seq(self, session):
+        session.message_seq += 1
+        return session.message_seq
+
+    @staticmethod
+    def archive_task_id(payload):
+        if not isinstance(payload, dict):
+            return None
+        task = payload.get('task')
+        if isinstance(task, dict):
+            value = task.get('routeId') or task.get('task_id')
+            if value:
+                return str(value)
+        value = payload.get('route_id') or payload.get('task_id')
+        return str(value) if value else None
+
+    def archive_up_text(self, session, raw, payload, message_type):
+        if not self.archive_enabled or not session.robot_id:
+            return
+        try:
+            self.archive_spool.append_text(
+                robot_id=session.robot_id,
+                session_id=session.session_id,
+                direction='up',
+                message_type=message_type,
+                message_seq=self.archive_seq(session),
+                task_id=self.archive_task_id(payload),
+                payload=payload if isinstance(payload, dict) else raw,
+            )
+        except Exception:
+            LOG.exception('archive spool write failed for robot %s', session.robot_id)
+
+    def archive_down_text(self, client, session, payload, message_type,
+                          command_id=None):
+        if not self.archive_enabled:
+            return
+        try:
+            self.archive_spool.append_text(
+                robot_id=client.robot_id,
+                session_id=session.session_id,
+                direction='down',
+                message_type=message_type,
+                message_seq=self.archive_seq(session),
+                browser_session_id=client.session_id,
+                command_id=command_id,
+                task_id=self.archive_task_id(payload),
+                payload=payload,
+            )
+        except Exception:
+            LOG.exception('archive spool write failed for command %s', command_id)
+
+    def archive_system_text(self, session, payload, message_type, command_id, reason):
+        if not self.archive_enabled:
+            return
+        try:
+            self.archive_spool.append_text(
+                robot_id=session.robot_id,
+                session_id=session.session_id,
+                direction='down',
+                message_type=message_type,
+                message_seq=self.archive_seq(session),
+                browser_session_id='system',
+                command_id=command_id,
+                task_id=self.archive_task_id(payload),
+                payload=payload,
+            )
+        except Exception:
+            LOG.exception('archive spool write failed for system command %s', command_id)
+        LOG.info('archived system command %s reason=%s', command_id, reason)
+
+    def archive_up_binary(self, session, kind, data):
+        if not self.archive_enabled or not session.robot_id:
+            return
+        try:
+            self.archive_spool.append_binary(
+                robot_id=session.robot_id,
+                session_id=session.session_id,
+                kind=BINARY_NAMES.get(kind, f'kind-{kind}'),
+                data=data,
+                message_seq=self.archive_seq(session),
+            )
+        except Exception:
+            LOG.exception('archive binary spool write failed for robot %s', session.robot_id)
+
+    async def archive_session_started(self, session):
+        if not self.archive_enabled or not session.robot_id:
+            return
+        try:
+            await self.archive_store.session_started(
+                session.robot_id,
+                session.session_id,
+                session.connected_at,
+                remote_info=session.remote_info,
+                edge_version=session.edge_version,
+            )
+        except Exception:
+            LOG.exception('archive session start failed for %s', session.robot_id)
+
+    async def archive_session_ended(self, session, status='closed'):
+        if not self.archive_enabled or not session.robot_id:
+            return
+        self.archive_spool.close_session(session.session_id)
+        try:
+            await self.archive_store.session_ended(
+                session.session_id, archive_utc_now(), status)
+        except Exception:
+            LOG.exception('archive session end failed for %s', session.robot_id)
+
+    async def archive_command_issued(self, record):
+        if not self.archive_enabled:
+            return
+        try:
+            await self.archive_store.command_issued(record)
+        except Exception:
+            LOG.exception('archive command issue failed: %s', record.get('command_id'))
+
+    async def archive_command_sent(self, command_id):
+        if not self.archive_enabled:
+            return
+        try:
+            await self.archive_store.command_sent(command_id, archive_utc_now())
+        except Exception:
+            LOG.exception('archive command sent failed: %s', command_id)
+
+    async def archive_command_ack(self, command_id, message, response):
+        if not self.archive_enabled:
+            return
+        try:
+            await self.archive_store.command_ack(
+                command_id,
+                bool(message.get('ok')),
+                message.get('msg') or '',
+                response,
+                archive_utc_now(),
+            )
+        except Exception:
+            LOG.exception('archive command ack failed: %s', command_id)
+
+    async def archive_command_failed(self, command_id, status, message):
+        if not self.archive_enabled:
+            return
+        try:
+            await self.archive_store.command_failed(command_id, status, message)
+        except Exception:
+            LOG.exception('archive command failure update failed: %s', command_id)
+
+    def archive_status(self):
+        status = self.archive_spool.status()
+        status['mysql_configured'] = self.archive_store.configured
+        return status
 
     # ---------- browser output ----------
     def send_browser(self, client, data, key=None):
@@ -256,16 +434,21 @@ class CloudGateway:
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['online'] = False
             record['last_seen_at'] = time.time()
-        for key, (client, original_id) in list(session.ack_routes.items()):
-            self.send_browser(client, json.dumps({
-                't': 'ack', 'id': original_id, 'ok': False, 'msg': '机器狗连接已断开',
-            }, ensure_ascii=False, separators=(',', ':')))
+        for key, pending in list(session.ack_routes.items()):
+            await self.archive_command_failed(
+                pending.command_id, 'disconnected', '机器狗连接已断开')
+            if pending.client is not None:
+                self.send_browser(pending.client, json.dumps({
+                    't': 'ack', 'id': pending.original_id, 'ok': False,
+                    'msg': '机器狗连接已断开',
+                }, ensure_ascii=False, separators=(',', ':')))
         session.ack_routes.clear()
         if session.tx:
             session.tx.cancel()
             await asyncio.gather(session.tx, return_exceptions=True)
             session.tx = None
         if robot_id:
+            await self.archive_session_ended(session)
             self.broadcast_robot_status(robot_id)
 
     # ---------- subscriptions ----------
@@ -301,6 +484,7 @@ class CloudGateway:
             msg = json.loads(data)
         except ValueError:
             if session.robot_id:
+                self.archive_up_text(session, data, data, 'raw')
                 self.broadcast_text(session.robot_id, data)
             return
         if msg.get('type') == 'hello':
@@ -311,6 +495,11 @@ class CloudGateway:
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['name'] = msg.get('name') or record.get('name') or robot_id
             await self.register_robot(session, robot_id)
+            session.edge_version = (
+                msg.get('edge_version') or msg.get('version') or msg.get('protocol')
+            )
+            await self.archive_session_started(session)
+            self.archive_up_text(session, data, msg, 'hello')
             return
         robot_id = session.robot_id
         if not robot_id:
@@ -321,22 +510,28 @@ class CloudGateway:
             return
         if msg.get('t') == 'pong':
             return
-        if msg.get('t') == 'ack':
+        msg_type = msg.get('t') or 'unknown'
+        self.archive_up_text(session, data, msg, msg_type)
+        if msg_type == 'ack':
             key = str(msg.get('id'))
             route = session.ack_routes.pop(key, None)
             if route is not None:
-                client, original_id = route
+                await self.archive_command_ack(
+                    route.command_id, msg, dict(msg))
                 if msg.get('id') is not None:
-                    msg['id'] = original_id
-                self.send_browser(client, json.dumps(msg, ensure_ascii=False, separators=(',', ':')))
+                    msg['id'] = route.original_id
+                if route.client is not None:
+                    self.send_browser(
+                        route.client,
+                        json.dumps(msg, ensure_ascii=False, separators=(',', ':')),
+                    )
                 return
-        if msg.get('t') == 'msg':
+        if msg_type == 'msg':
             topic = msg.get('topic')
             for client in self.clients_for(robot_id):
                 if topic in client.topics:
                     self.send_browser(client, data)
             return
-        msg_type = msg.get('t')
         record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
         if msg_type == 'task':
             record['task'] = msg.get('task')
@@ -361,6 +556,7 @@ class CloudGateway:
             for client in self.camera_clients_for(robot_id):
                 self.send_browser(client, data)
             return
+        self.archive_up_binary(session, kind, data)
         if kind not in LAYER_KINDS and kind not in (T_MAP, T_SCAN):
             return
         session.binary_cache[kind] = data
@@ -370,6 +566,7 @@ class CloudGateway:
         ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
         await ws.prepare(req)
         session = RobotSession(ws)
+        session.remote_info = req.remote
         self.robot_sessions[ws] = session
         session.tx = asyncio.create_task(self.robot_tx_loop(session))
         try:
@@ -394,17 +591,52 @@ class CloudGateway:
             session.owner = client
         return session.owner is client
 
+    async def send_system_command(self, session, op, extra, reason):
+        command_id = uuid.uuid4().hex
+        upstream_id = f'cloud-{self.command_seq}'
+        self.command_seq += 1
+        message = {
+            't': 'cmd',
+            'id': upstream_id,
+            'op': op,
+            **extra,
+            'robot_id': session.robot_id,
+        }
+        self.archive_system_text(session, message, 'cmd', command_id, reason)
+        issued_at = archive_utc_now()
+        await self.archive_command_issued({
+            'command_id': command_id,
+            'robot_id': session.robot_id,
+            'session_id': session.session_id,
+            'browser_session': 'system',
+            'request_id': None,
+            'upstream_id': upstream_id,
+            'operation': op,
+            'task_id': self.archive_task_id(message),
+            'payload': message,
+            'issued_at': issued_at,
+        })
+        session.ack_routes[str(upstream_id)] = PendingCommand(
+            None, None, command_id, 'system')
+        sent = self.send_robot(
+            session.robot_id,
+            json.dumps(message, ensure_ascii=False, separators=(',', ':')),
+        )
+        if sent:
+            await self.archive_command_sent(command_id)
+        else:
+            session.ack_routes.pop(str(upstream_id), None)
+            await self.archive_command_failed(
+                command_id, 'failed', '机器人指令队列已满或连接已断开')
+        return sent
+
     async def stop_on_owner_loss(self, session):
         if session is None or session.ws.closed:
             return
-        self.send_robot(session.robot_id, json.dumps({
-            't': 'cmd', 'id': f'cloud-stop-{self.command_seq}', 'op': 'cancel',
-        }, separators=(',', ':')))
-        self.command_seq += 1
-        self.send_robot(session.robot_id, json.dumps({
-            't': 'cmd', 'id': f'cloud-lock-{self.command_seq}', 'op': 'arm', 'on': False,
-        }, separators=(',', ':')))
-        self.command_seq += 1
+        await self.send_system_command(
+            session, 'cancel', {}, '控制方页面断开，自动取消任务')
+        await self.send_system_command(
+            session, 'arm', {'on': False}, '控制方页面断开，自动锁定底盘')
 
     async def on_browser_text(self, client, data):
         try:
@@ -452,17 +684,43 @@ class CloudGateway:
                 return
             if msg_type == 'cmd':
                 original_id = msg.get('id')
+                command_id = uuid.uuid4().hex
                 upstream_id = f'cloud-{self.command_seq}'
                 self.command_seq += 1
-                session.ack_routes[str(upstream_id)] = (client, original_id)
                 msg['id'] = upstream_id
                 msg['robot_id'] = client.robot_id
                 data = json.dumps(msg, ensure_ascii=False, separators=(',', ':'))
-            if not self.send_robot(client.robot_id, data) and msg_type == 'cmd':
-                session.ack_routes.pop(str(upstream_id), None)
-                self.send_browser(client, json.dumps({
-                    't': 'ack', 'id': original_id, 'ok': False, 'msg': '机器狗未连接'
-                }, ensure_ascii=False, separators=(',', ':')))
+                self.archive_down_text(
+                    client, session, msg, 'cmd', command_id=command_id)
+                await self.archive_command_issued({
+                    'command_id': command_id,
+                    'robot_id': client.robot_id,
+                    'session_id': session.session_id,
+                    'browser_session': client.session_id,
+                    'request_id': original_id,
+                    'upstream_id': upstream_id,
+                    'operation': msg.get('op') or 'unknown',
+                    'task_id': self.archive_task_id(msg),
+                    'payload': msg,
+                    'issued_at': archive_utc_now(),
+                })
+                session.ack_routes[str(upstream_id)] = PendingCommand(
+                    client, original_id, command_id, client.session_id)
+            elif msg_type == 'teleop':
+                self.archive_down_text(
+                    client, session, msg, 'teleop')
+            sent = self.send_robot(client.robot_id, data)
+            if msg_type == 'cmd':
+                if sent:
+                    await self.archive_command_sent(command_id)
+                else:
+                    session.ack_routes.pop(str(upstream_id), None)
+                    await self.archive_command_failed(
+                        command_id, 'failed', '机器人指令队列已满或连接已断开')
+                    self.send_browser(client, json.dumps({
+                        't': 'ack', 'id': original_id, 'ok': False,
+                        'msg': '机器狗未连接',
+                    }, ensure_ascii=False, separators=(',', ':')))
             return
         session = self.robots.get(client.robot_id)
         if session is not None and session.owner is client:
@@ -495,9 +753,11 @@ class CloudGateway:
             self.clients.pop(ws, None)
             session = self.robots.get(robot_id)
             if session is not None:
-                for key, (target, _) in list(session.ack_routes.items()):
-                    if target is client:
+                for key, pending in list(session.ack_routes.items()):
+                    if pending.client is client:
                         session.ack_routes.pop(key, None)
+                        await self.archive_command_failed(
+                            pending.command_id, 'abandoned', '控制方网页已断开')
                 self.sync_layers(robot_id)
                 self.sync_topics(robot_id)
                 if session.owner is client:
@@ -855,8 +1115,15 @@ class CloudGateway:
             'last_seen_seconds': last_seen_seconds,
             'browsers': len(self.clients),
             'camera_sources': len(self.camera_clients),
+            'archive': self.archive_status(),
             'robots': robots,
         })
+
+    async def archive_status_api(self, _req):
+        return web.json_response(
+            self.archive_status(),
+            headers={'Access-Control-Allow-Origin': '*'},
+        )
 
     async def rtc_config(self, req):
         if not self.rtc_app_id or not self.rtc_app_key:
@@ -902,6 +1169,8 @@ class CloudGateway:
         return web.json_response(state, headers={'Access-Control-Allow-Origin': '*'})
 
     async def cleanup(self, _app):
+        self.archive_spool.close_all()
+        await self.archive_store.close()
         await self.ssh_registration.close()
 
     def app(self):
@@ -915,6 +1184,7 @@ class CloudGateway:
         app.on_cleanup.append(self.cleanup)
         app.router.add_get('/health', self.health)
         app.router.add_get('/quadruped/health', self.health)
+        app.router.add_get('/internal/v1/archive/status', self.archive_status_api)
         app.router.add_get('/internal/v1/ssh-bindings', self.internal_ssh_bindings)
         app.router.add_get(
             '/internal/v1/ssh-bindings/by-port/{port}', self.internal_ssh_binding_by_port)

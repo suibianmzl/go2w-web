@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / 'server'))
 sys.path.insert(0, str(ROOT / 'tools'))
 
 from cloud_gateway import CloudGateway, T_CAM, T_MAP  # noqa: E402
+from archive import ArchiveSettings, ArchiveSpool  # noqa: E402
 from rtc_token import PRIV_PUBLISH_STREAM, PRIV_SUBSCRIBE_STREAM, parse as parse_rtc_token  # noqa: E402
 import go2w_edge_gateway as edge  # noqa: E402
 from ssh_bindings import SSHBinding, row_to_binding  # noqa: E402
@@ -141,6 +142,56 @@ class FakeBroker:
     async def release(self, dog_id, port, reason='destroy'):
         self.released.append((dog_id, port, reason))
         return {'released': True, 'port': port, 'message': 'released'}
+
+
+class FakeArchiveStore:
+    configured = True
+
+    def __init__(self):
+        self.sessions = {}
+        self.commands = {}
+        self.objects = []
+
+    async def close(self):
+        pass
+
+    async def session_started(self, robot_id, session_id, connected_at,
+                              remote_info=None, edge_version=None):
+        self.sessions[session_id] = {
+            'robot_id': robot_id,
+            'status': 'active',
+            'edge_version': edge_version,
+        }
+
+    async def session_ended(self, session_id, disconnected_at=None, status='closed'):
+        self.sessions[session_id]['status'] = status
+
+    async def command_issued(self, record):
+        self.commands[record['command_id']] = {
+            **record,
+            'status': 'issued',
+        }
+
+    async def command_sent(self, command_id, sent_at=None):
+        self.commands[command_id]['status'] = 'sent'
+
+    async def command_ack(self, command_id, ok, message='', response=None,
+                          ack_at=None):
+        self.commands[command_id].update({
+            'status': 'acked' if ok else 'failed',
+            'ok': ok,
+            'message': message,
+            'response': response,
+        })
+
+    async def command_failed(self, command_id, status='failed', message=''):
+        self.commands[command_id].update({
+            'status': status,
+            'message': message,
+        })
+
+    async def add_object(self, meta):
+        self.objects.append(meta)
 
 
 async def start_app(app):
@@ -376,6 +427,87 @@ async def test_multi_robot_gateway():
                 await robot2.close()
                 for reader in (robot1_reader, robot2_reader, browser1_reader, browser2_reader):
                     await reader.close()
+        finally:
+            await runner.cleanup()
+
+
+async def test_archive_gateway():
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
+        settings = ArchiveSettings(
+            enabled=True,
+            root=Path(tmp, 'archive'),
+            segment_seconds=300,
+            segment_bytes=32 * 1024 * 1024,
+            worker_interval=1,
+            retry_max=30,
+            completed_retention_days=7,
+        )
+        spool = ArchiveSpool(settings)
+        store = FakeArchiveStore()
+        gateway = CloudGateway(tmp, archive_spool=spool, archive_store=store)
+        runner, port = await start_app(gateway.app())
+        base = f'http://127.0.0.1:{port}'
+        try:
+            async with ClientSession() as session:
+                robot = await session.ws_connect(base + '/quadruped/robot/ws')
+                robot_reader = Reader(robot)
+                await robot.send_str(json.dumps({
+                    'type': 'hello',
+                    'robot_id': 'go2w-01',
+                    'edge_version': 'test-edge',
+                    'protocol': 1,
+                }))
+
+                browser = await session.ws_connect(
+                    base + '/quadruped/ws?robot_id=go2w-01')
+                browser_reader = Reader(browser)
+                await browser_reader.text(lambda m: m.get('t') == 'robot_status')
+
+                await robot.send_str('{"t":"state","battery":88}')
+                await browser_reader.text(
+                    lambda m: m.get('t') == 'state' and m.get('battery') == 88)
+                await robot.send_bytes(bytes([2, 1, 2, 3]))
+                await browser_reader.binary(2)
+
+                await browser.send_str(
+                    '{"t":"cmd","id":17,"op":"arm","on":false}')
+                command = await robot_reader.text(lambda m: m.get('t') == 'cmd')
+                await robot.send_str(json.dumps({
+                    't': 'ack', 'id': command['id'], 'ok': True, 'msg': 'locked',
+                }))
+                await browser_reader.text(
+                    lambda m: m.get('t') == 'ack' and m.get('id') == 17)
+
+                await robot.close()
+                await asyncio.sleep(0.2)
+                assert len(store.sessions) == 1
+                assert next(iter(store.sessions.values()))['status'] == 'closed'
+                assert next(iter(store.sessions.values()))['edge_version'] == 'test-edge'
+                assert len(store.commands) == 1
+                archived_command = next(iter(store.commands.values()))
+                assert archived_command['status'] == 'acked'
+                assert archived_command['operation'] == 'arm'
+                assert archived_command['response']['msg'] == 'locked'
+
+                pending = list((Path(tmp, 'archive') / 'spool' / 'pending').rglob('*'))
+                text_files = [path for path in pending if path.suffix == '.jsonl']
+                binary_files = [path for path in pending if path.suffix == '.bin']
+                assert len(text_files) == 2, pending
+                assert len(binary_files) == 1, pending
+                records = [
+                    json.loads(line)
+                    for path in text_files
+                    for line in path.read_text(encoding='utf-8').splitlines()
+                ]
+                assert {record['message_type'] for record in records} == {
+                    'hello', 'state', 'ack', 'cmd'}
+                assert any(record['command_id'] for record in records)
+                assert binary_files[0].read_bytes()[:4] == struct.pack('<I', 4)
+
+                await browser.close()
+                await browser_reader.close()
+                await robot_reader.close()
         finally:
             await runner.cleanup()
 
@@ -620,6 +752,8 @@ async def main():
     print('PASS cloud gateway: static, cache, layers, command ack, camera filtering')
     await test_multi_robot_gateway()
     print('PASS cloud gateway: concurrent robots, isolated data, routing, fleet API')
+    await test_archive_gateway()
+    print('PASS cloud gateway: archive session, telemetry, binary and command ACK capture')
     await test_internal_ssh_bindings()
     print('PASS cloud gateway: SSH binding lookup, list and upsert')
     test_ssh_binding_online_ttl()

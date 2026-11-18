@@ -1,3 +1,4 @@
 aiohttp==3.10.11
 aiomysql==0.2.0
 redis==5.0.8
+tos==2.9.3
