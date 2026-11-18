@@ -32,6 +32,33 @@
       <aside><b>Go2W Fleet</b><small>按 robot_id 独立路由控制与视频</small></aside>
     </section>
 
+    <section class="ssh-guide">
+      <div class="guide-head">
+        <div>
+          <div class="eyebrow">REMOTE SSH</div>
+          <h2>SSH 远程登录说明</h2>
+        </div>
+        <span>当前需要使用两步登录</span>
+      </div>
+      <ol>
+        <li>
+          <div>
+            <b>第一步：在本机登录 broker</b>
+            <code id="sshGuideBroker">ssh -p 22 -i &lt;本机 broker 私钥路径&gt; root@ssh-portbroker.evoxrobot.com</code>
+          </div>
+          <button class="mini" type="button" data-copy-guide="broker">复制第一步</button>
+        </li>
+        <li>
+          <div>
+            <b>第二步：在 broker 终端登录机器狗</b>
+            <code>ssh unitree@127.0.0.1 -p &lt;设备列表中的 SSH 端口&gt;</code>
+          </div>
+          <span class="guide-note">端口见下方设备卡片</span>
+        </li>
+      </ol>
+      <p>broker 私钥不属于机器狗 SSH 凭据；第二步使用机器狗账号 <code>unitree</code>。</p>
+    </section>
+
     <div class="section-head">
       <h2>我的设备</h2>
       <span>每 5 秒自动更新</span>

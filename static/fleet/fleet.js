@@ -39,7 +39,7 @@ function render(robots){
     const consoleUrl = `/quadruped/?robot_id=${encodeURIComponent(robot.robot_id)}`;
     const binding = robot.ssh;
     const sshCommand = binding
-      ? `ssh -p ${binding.port} ${binding.username}@${binding.host}`
+      ? `ssh unitree@127.0.0.1 -p ${binding.port}`
       : '';
     card.innerHTML = `
       <div class="device-head">
@@ -55,10 +55,10 @@ function render(robots){
       </div>
       ${binding ? `
         <div class="ssh-box">
-          <div class="ssh-title">SSH 反向代理 · 端口 ${html(binding.port)}</div>
+          <div class="ssh-title">SSH 反向代理 · broker 端口 ${html(binding.port)}</div>
           <code title="${html(sshCommand)}">${html(sshCommand)}</code>
           <div class="ssh-actions">
-            <button class="mini" type="button" data-action="copy-ssh" data-device-id="${html(robot.robot_id)}">复制 SSH</button>
+            <button class="mini" type="button" data-action="copy-ssh" data-device-id="${html(robot.robot_id)}">复制第二步</button>
             <button class="mini danger" type="button" data-action="unbind" data-device-id="${html(robot.robot_id)}">手动解绑</button>
           </div>
         </div>
@@ -126,12 +126,22 @@ async function copySsh(robotId){
   const robot = currentDevices.find(item => item.robot_id === robotId);
   const binding = robot?.ssh;
   if (!binding?.port) return;
-  const command = `ssh -p ${binding.port} ${binding.username}@${binding.host}`;
+  const command = `ssh unitree@127.0.0.1 -p ${binding.port}`;
   try {
     await navigator.clipboard.writeText(command);
     window.alert('SSH 命令已复制');
   } catch {
     window.prompt('复制 SSH 命令', command);
+  }
+}
+
+async function copyGuide(){
+  const command = 'ssh -p 22 -i <本机 broker 私钥路径> root@ssh-portbroker.evoxrobot.com';
+  try {
+    await navigator.clipboard.writeText(command);
+    window.alert('第一步 SSH 命令已复制，请替换私钥路径');
+  } catch {
+    window.prompt('复制第一步 SSH 命令', command);
   }
 }
 
@@ -173,6 +183,7 @@ devices.addEventListener('click', event => {
   if (button.dataset.action === 'unbind') unbind(robotId);
 });
 
+document.querySelector('[data-copy-guide="broker"]').addEventListener('click', copyGuide);
 $('#refresh').addEventListener('click', refresh);
 refresh();
 setInterval(refresh, 5000);

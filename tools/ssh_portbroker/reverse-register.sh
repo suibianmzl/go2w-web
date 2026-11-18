@@ -27,6 +27,7 @@ VERSION="0.1.0"
 # --- defaults (overridable by env or flags) ---------------------------------
 PUBLIC_HOST="${PUBLIC_HOST:-ssh-portbroker.evoxrobot.com}"
 PUBLIC_SSH_PORT="${PUBLIC_SSH_PORT:-22}"
+REMOTE_BIND_HOST="${REMOTE_BIND_HOST:-0.0.0.0}"
 REMOTE_PORT="${REMOTE_PORT:-}"
 LOCAL_PORT="${LOCAL_PORT:-22}"
 SSH_USER="${SSH_USER:-robot}"
@@ -54,6 +55,7 @@ disconnect / reconnect; re-invoke this script with fresh args each time.
 
 Required (env or flag):
   --remote-port PORT     REMOTE_PORT   allocated remote bind port on public host
+  --remote-bind-host HOST REMOTE_BIND_HOST  default: 0.0.0.0
 
 Common:
   --public-host HOST     PUBLIC_HOST   default: ssh-portbroker.evoxrobot.com
@@ -114,6 +116,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --public-host)       PUBLIC_HOST="$2"; shift 2 ;;
     --public-ssh-port)   PUBLIC_SSH_PORT="$2"; shift 2 ;;
+    --remote-bind-host)  REMOTE_BIND_HOST="$2"; shift 2 ;;
     --remote-port)       REMOTE_PORT="$2"; shift 2 ;;
     --local-port)        LOCAL_PORT="$2"; shift 2 ;;
     --user|--ssh-user)   SSH_USER="$2"; shift 2 ;;
@@ -137,6 +140,7 @@ done
 [[ "${PUBLIC_SSH_PORT}" =~ ^[0-9]+$ ]] || die 1 "PUBLIC_SSH_PORT must be an integer"
 [[ "${LOCAL_PORT}" =~ ^[0-9]+$ ]] || die 1 "LOCAL_PORT must be an integer"
 [[ -n "${PUBLIC_HOST}" ]] || die 1 "PUBLIC_HOST is empty"
+[[ -n "${REMOTE_BIND_HOST}" ]] || die 1 "REMOTE_BIND_HOST is empty"
 [[ -n "${SSH_USER}" ]] || die 1 "SSH_USER is empty"
 
 case "${STRICT_HOST_KEY_CHECKING}" in
@@ -193,7 +197,7 @@ write_state || die 2 "failed to write state file"
 # --- build ssh argv ---------------------------------------------------------
 SSH_ARGS=(
   -N
-  -R "${REMOTE_PORT}:127.0.0.1:${LOCAL_PORT}"
+  -R "${REMOTE_BIND_HOST}:${REMOTE_PORT}:127.0.0.1:${LOCAL_PORT}"
   -p "${PUBLIC_SSH_PORT}"
   -o "BatchMode=${SSH_BATCH_MODE}"
   -o "StrictHostKeyChecking=${STRICT_HOST_KEY_CHECKING}"
