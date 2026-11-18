@@ -37,9 +37,11 @@ function render(robots){
       ? '视频上传关闭'
       : robot.camera_source ? '视频源在线' : '视频源离线';
     const consoleUrl = `/quadruped/?robot_id=${encodeURIComponent(robot.robot_id)}`;
+    const inspectionUrl = `/quadruped/inspection/?robot_id=${encodeURIComponent(robot.robot_id)}`;
     const binding = robot.ssh;
+    const sshUser = binding?.username || 'unitree';
     const sshCommand = binding
-      ? `ssh unitree@127.0.0.1 -p ${binding.port}`
+      ? `ssh ${sshUser}@127.0.0.1 -p ${binding.port}`
       : '';
     card.innerHTML = `
       <div class="device-head">
@@ -69,6 +71,7 @@ function render(robots){
         </div>
       `}
       <div class="actions">
+        <a class="console-link inspection-link" href="${inspectionUrl}">进入巡检 →</a>
         <a class="console-link" href="${consoleUrl}">进入设备控制台 →</a>
       </div>
     `;
@@ -88,7 +91,7 @@ function mergeDevices(robots, bindings){
       ...existing,
       robot_id: id,
       name: existing.name || binding.deviceName || id,
-      online: !!existing.online || !!binding.online,
+      online: Object.hasOwn(existing, 'online') ? !!existing.online : !!binding.online,
       last_seen_at: binding.lastSeenAt || existing.last_seen_at,
       video_upload_enabled: existing.video_upload_enabled,
       camera_source: existing.camera_source,
@@ -126,7 +129,7 @@ async function copySsh(robotId){
   const robot = currentDevices.find(item => item.robot_id === robotId);
   const binding = robot?.ssh;
   if (!binding?.port) return;
-  const command = `ssh unitree@127.0.0.1 -p ${binding.port}`;
+  const command = `ssh ${binding.username || 'unitree'}@127.0.0.1 -p ${binding.port}`;
   try {
     await navigator.clipboard.writeText(command);
     window.alert('SSH 命令已复制');
@@ -136,7 +139,7 @@ async function copySsh(robotId){
 }
 
 async function copyGuide(){
-  const command = 'ssh -p 22 -i <本机 broker 私钥路径> root@ssh-portbroker.evoxrobot.com';
+  const command = 'ssh -p 22 -i <本机 broker 私钥路径> <broker SSH 用户>@ssh-portbroker.evoxrobot.com';
   try {
     await navigator.clipboard.writeText(command);
     window.alert('第一步 SSH 命令已复制，请替换私钥路径');

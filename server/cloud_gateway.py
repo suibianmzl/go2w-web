@@ -27,7 +27,7 @@ from ssh_registration import SSHRegistrationError, SSHRegistrationService
 
 T_MAP, T_SCAN, T_GCOST, T_LCOST, T_CLOUD, T_PART, T_CAM = range(1, 8)
 LAYER_KINDS = {T_GCOST: 'gcost', T_LCOST: 'lcost', T_CLOUD: 'cloud', T_PART: 'particles'}
-CACHE_TEXT = {'state', 'pose', 'task', 'routes', 'map_views', 'plan'}
+CACHE_TEXT = {'state', 'pose', 'task', 'routes', 'map_views', 'plan', 'inspection_exceptions'}
 TEXT_QUEUE_MAX = 500
 ROBOT_QUEUE_MAX = 500
 LOG = logging.getLogger('go2w_cloud')
@@ -176,7 +176,7 @@ class CloudGateway:
         session = self.robots.get(client.robot_id)
         if session is None:
             return
-        for key in ('state', 'pose', 'task', 'routes', 'map_views', 'plan'):
+        for key in ('state', 'pose', 'task', 'routes', 'map_views', 'plan', 'inspection_exceptions'):
             if key in session.text_cache:
                 self.send_browser(client, session.text_cache[key], key=f't{key}')
         for kind in (T_MAP, T_SCAN):
@@ -767,6 +767,9 @@ class CloudGateway:
     async def fleet(self, _req):
         return web.FileResponse(self.static_dir / 'fleet' / 'index.html')
 
+    async def inspection(self, _req):
+        return web.FileResponse(self.static_dir / 'inspection' / 'index.html')
+
     async def static_file(self, req):
         rel = req.match_info.get('path', '')
         path = (self.static_dir / rel).resolve()
@@ -940,6 +943,11 @@ class CloudGateway:
         app.router.add_get('/quadruped', lambda _r: web.HTTPPermanentRedirect('/quadruped/'))
         app.router.add_get('/quadruped/fleet', lambda _r: web.HTTPPermanentRedirect('/quadruped/fleet/'))
         app.router.add_get('/quadruped/fleet/', self.fleet)
+        app.router.add_get(
+            '/quadruped/inspection',
+            lambda _r: web.HTTPPermanentRedirect('/quadruped/inspection/'),
+        )
+        app.router.add_get('/quadruped/inspection/', self.inspection)
         app.router.add_get('/quadruped/', self.index)
         app.router.add_get('/quadruped/{path:.*}', self.static_file)
         app.router.add_get('/', lambda _r: web.HTTPPermanentRedirect('/quadruped/'))

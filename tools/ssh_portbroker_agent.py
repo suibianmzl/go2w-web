@@ -29,7 +29,8 @@ class AgentConfig:
     robot_model: str
     serial_number: str
     firmware_version: str
-    username: str
+    broker_username: str
+    device_username: str
     local_port: int
     script: Path
     identity: Path
@@ -37,6 +38,7 @@ class AgentConfig:
     log_dir: Path
     heartbeat: float
     retry: float
+    network_check: float
 
     @classmethod
     def from_env(cls):
@@ -49,7 +51,12 @@ class AgentConfig:
             robot_model=os.environ.get('GO2W_ROBOT_MODEL', 'Unitree Go2'),
             serial_number=os.environ.get('GO2W_ROBOT_SERIAL', ''),
             firmware_version=os.environ.get('GO2W_FIRMWARE_VERSION', ''),
-            username=os.environ.get('GO2W_SSH_USER', 'robot'),
+            broker_username=(
+                os.environ.get('GO2W_PORTBROKER_USER')
+                or os.environ.get('GO2W_SSH_USER')
+                or 'root'
+            ),
+            device_username=os.environ.get('GO2W_DEVICE_SSH_USER', 'unitree'),
             local_port=int(os.environ.get('GO2W_SSH_LOCAL_PORT', '22')),
             script=Path(os.environ.get(
                 'GO2W_SSH_AGENT_SCRIPT',
@@ -69,6 +76,7 @@ class AgentConfig:
             )),
             heartbeat=float(os.environ.get('GO2W_SSH_AGENT_HEARTBEAT', '30')),
             retry=float(os.environ.get('GO2W_SSH_AGENT_RETRY', '5')),
+            network_check=float(os.environ.get('GO2W_SSH_AGENT_NETWORK_CHECK', '2')),
         )
 
 
@@ -112,7 +120,7 @@ class FleetClient:
                 'deviceModel': config.robot_model,
                 'serialNumber': config.serial_number or None,
                 'firmwareVersion': config.firmware_version or None,
-                'username': config.username,
+                'username': config.device_username,
             },
         )
 
@@ -143,7 +151,7 @@ async def run_tunnel(config, target):
         '--public-ssh-port', str(target['publicSshPort']),
         '--remote-port', str(target['remotePort']),
         '--local-port', str(config.local_port),
-        '--user', str(target.get('sshUser') or config.username),
+        '--user', str(config.broker_username),
         '--identity', str(config.identity),
         '--state-dir', str(config.state_dir),
         '--log-dir', str(config.log_dir),
@@ -169,21 +177,59 @@ async def heartbeat_loop(client, config):
                 raise
 
 
+async def network_fingerprint():
+    process = await asyncio.create_subprocess_exec(
+        'ip', '-j', 'route', 'get', '1.1.1.1',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        return None
+    try:
+        route = json.loads(stdout.decode())[0]
+    except (IndexError, ValueError):
+        return None
+    return (
+        str(route.get('dev') or ''),
+        str(route.get('gateway') or ''),
+        str(route.get('prefsrc') or ''),
+    )
+
+
+async def network_watch(config):
+    baseline = await network_fingerprint()
+    while True:
+        await asyncio.sleep(config.network_check)
+        current = await network_fingerprint()
+        if baseline is None:
+            baseline = current
+            continue
+        if current is None or current != baseline:
+            raise RuntimeError(f'network changed: {baseline} -> {current}')
+
+
 async def run_session(client, config, target):
     process = await run_tunnel(config, target)
     tunnel_wait = asyncio.create_task(process.wait())
     heartbeat = asyncio.create_task(heartbeat_loop(client, config))
+    network = asyncio.create_task(network_watch(config))
     try:
         done, _ = await asyncio.wait(
-            [tunnel_wait, heartbeat], return_when=asyncio.FIRST_COMPLETED)
+            [tunnel_wait, heartbeat, network], return_when=asyncio.FIRST_COMPLETED)
         if heartbeat in done:
             error = heartbeat.exception()
+            if error:
+                raise error
+        if network in done:
+            error = network.exception()
             if error:
                 raise error
         return await tunnel_wait
     finally:
         heartbeat.cancel()
-        await asyncio.gather(heartbeat, return_exceptions=True)
+        network.cancel()
+        await asyncio.gather(heartbeat, network, return_exceptions=True)
         await terminate(process)
         if tunnel_wait.done():
             await asyncio.gather(tunnel_wait, return_exceptions=True)

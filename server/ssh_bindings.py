@@ -3,7 +3,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiomysql
 from redis import asyncio as redis_async
@@ -11,6 +11,7 @@ from redis import asyncio as redis_async
 
 KEY_PREFIX = 'evox:ssh-binding:v1'
 DEVICE_INDEX_KEY = f'{KEY_PREFIX}:devices'
+ONLINE_TTL = timedelta(seconds=30)
 
 
 @dataclass
@@ -432,18 +433,26 @@ class SSHBindingStore:
 def row_to_binding(row):
     if row is None:
         return None
+    last_seen = row['last_seen_at']
+    if last_seen is not None and last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    online = (
+        bool(row['online'])
+        and last_seen is not None
+        and datetime.now(timezone.utc) - last_seen <= ONLINE_TTL
+    )
     return SSHBinding(
         device_id=row['device_id'],
         device_name=row['device_name'],
         device_model=row['device_model'],
         device_enabled=bool(row['device_enabled']),
-        online=bool(row['online']),
+        online=online,
         host=row['host'],
         port=row['port'],
         username=row['username'],
         status=row['status'],
         binding_version=str(row['binding_version']),
-        last_seen_at=row['last_seen_at'],
+        last_seen_at=last_seen,
         updated_at=row['updated_at'],
         serial_number=row.get('serial_number'),
         firmware_version=row.get('firmware_version'),

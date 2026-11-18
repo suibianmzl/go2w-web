@@ -6,7 +6,7 @@ import struct
 import sys
 import tempfile
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from cloud_gateway import CloudGateway, T_CAM, T_MAP  # noqa: E402
 from rtc_token import PRIV_PUBLISH_STREAM, PRIV_SUBSCRIBE_STREAM, parse as parse_rtc_token  # noqa: E402
 import go2w_edge_gateway as edge  # noqa: E402
-from ssh_bindings import SSHBinding  # noqa: E402
+from ssh_bindings import SSHBinding, row_to_binding  # noqa: E402
 
 
 def pack_frame(kind, metadata, payload=b''):
@@ -155,6 +155,9 @@ async def start_app(app):
 async def test_cloud_gateway():
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
+        Path(tmp, 'inspection').mkdir()
+        Path(tmp, 'inspection', 'index.html').write_text(
+            '<h1>Go2W Inspection</h1>', encoding='utf-8')
         rtc_app_id, rtc_app_key = '123456781234567812345678', 'test-app-key'
         gateway = CloudGateway(tmp, rtc_app_id, rtc_app_key, 'go2w-01', 3600)
         runner, port = await start_app(gateway.app())
@@ -164,6 +167,13 @@ async def test_cloud_gateway():
                 response = await session.get(base + '/quadruped/')
                 assert response.status == 200
                 assert 'Go2W' in await response.text()
+                inspection = await session.get(base + '/quadruped/inspection/')
+                assert inspection.status == 200
+                assert 'Go2W Inspection' in await inspection.text()
+                inspection_redirect = await session.get(
+                    base + '/quadruped/inspection', allow_redirects=False)
+                assert inspection_redirect.status in {301, 308}
+                assert inspection_redirect.headers['Location'].endswith('/quadruped/inspection/')
                 robot_response = await session.get(
                     base + '/quadruped/rtc/config?role=robot&robot_id=go2w-01')
                 assert robot_response.headers['Access-Control-Allow-Origin'] == '*'
@@ -197,6 +207,24 @@ async def test_cloud_gateway():
                 await robot.send_str('{"t":"state","armed":false,"booting":true}')
                 state = await browser_reader.text(lambda m: m.get('t') == 'state')
                 assert state['booting'] is True
+
+                exceptions = {
+                    't': 'inspection_exceptions',
+                    'mode': 'snapshot',
+                    'task_id': 'route-1',
+                    'items': [{
+                        'event_id': 'evt-1',
+                        'anomaly_type': 'long_blocked',
+                        'title': '长时受阻',
+                        'point_name': '人行步道',
+                        'status': 'new',
+                        'duration_s': 18.4,
+                    }],
+                }
+                await robot.send_str(json.dumps(exceptions, ensure_ascii=False))
+                live_exceptions = await browser_reader.text(
+                    lambda m: m.get('t') == 'inspection_exceptions')
+                assert live_exceptions['items'][0]['event_id'] == 'evt-1'
 
                 await robot.send_bytes(bytes([T_MAP, 9, 8, 7]))
                 assert await browser_reader.binary(T_MAP) == bytes([T_MAP, 9, 8, 7])
@@ -260,6 +288,9 @@ async def test_cloud_gateway():
                 browser2_reader = Reader(browser2)
                 status = await browser2_reader.text(lambda m: m.get('t') == 'robot_status')
                 assert status['online'] is True
+                replayed_exceptions = await browser2_reader.text(
+                    lambda m: m.get('t') == 'inspection_exceptions')
+                assert replayed_exceptions['items'][0]['title'] == '长时受阻'
                 await robot.close()
                 status = await browser2_reader.text(lambda m: m.get('t') == 'robot_status')
                 assert status['online'] is False
@@ -416,6 +447,29 @@ async def test_internal_ssh_bindings():
             await runner.cleanup()
 
 
+def test_ssh_binding_online_ttl():
+    now = datetime.now(timezone.utc)
+    base = {
+        'device_id': 'ttl-device',
+        'device_name': 'TTL',
+        'device_model': 'Unitree Go2',
+        'device_enabled': 1,
+        'online': 1,
+        'host': 'ssh-portbroker.example.com',
+        'port': 22001,
+        'username': 'unitree',
+        'status': 'bound',
+        'binding_version': '1',
+        'updated_at': now,
+        'serial_number': None,
+        'firmware_version': None,
+    }
+    assert row_to_binding({**base, 'last_seen_at': now}).online is True
+    assert row_to_binding({
+        **base, 'last_seen_at': now - timedelta(seconds=31),
+    }).online is False
+
+
 async def test_robot_ssh_registration():
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
@@ -568,6 +622,8 @@ async def main():
     print('PASS cloud gateway: concurrent robots, isolated data, routing, fleet API')
     await test_internal_ssh_bindings()
     print('PASS cloud gateway: SSH binding lookup, list and upsert')
+    test_ssh_binding_online_ttl()
+    print('PASS cloud gateway: SSH binding online heartbeat TTL')
     await test_robot_ssh_registration()
     print('PASS cloud gateway: register, heartbeat, offline and manual unbind')
     await test_edge_gateway()

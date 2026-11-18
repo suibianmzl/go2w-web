@@ -14,6 +14,8 @@ Environment=GO2W_SSH_AGENT_SCRIPT=/home/unitree/go2w-ssh-agent/reverse-register.
 Environment=GO2W_SSH_AGENT_KEY=/home/unitree/go2w-ssh-agent/id_portbroker_rsa
 Environment=GO2W_SSH_AGENT_STATE_DIR=/home/unitree/ssh-portbroker-dog/state
 Environment=GO2W_SSH_AGENT_LOG_DIR=/home/unitree/ssh-portbroker-dog/log
+Environment=GO2W_PORTBROKER_USER=root
+Environment=GO2W_DEVICE_SSH_USER=unitree
 EnvironmentFile=/opt/go2w/config/runtime.env
 ExecStart=/home/unitree/go2w-edge-gateway/.venv/bin/python /home/unitree/go2w-ssh-agent/ssh_portbroker_agent.py
 Restart=always
