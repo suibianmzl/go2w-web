@@ -142,6 +142,7 @@ export function createRosSource(store, bus){
         store.contPaused = !!m.contPaused;
         store.contBusy = !!m.contBusy;
         store.autosave = m.autosave || null;
+        store.lidar = m.lidar || null;   // 后端判定的雷达无数据：{ since, msg（含网络诊断） }
         store.webVersion = m.webVersion || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }

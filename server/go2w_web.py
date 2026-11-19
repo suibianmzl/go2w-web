@@ -33,6 +33,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import struct
 import tempfile
 import threading
@@ -252,6 +253,67 @@ AUTOLOC_TURN_CLEAR = 0.65    # 原地转：这个半径内不能有点（足迹�
 # 运控（go2w_ctrl）站起 / 趴下，见 robot_ctrl.py。GO2W_CTRL=0 关掉（不查站没站起来，也不自动趴下）
 CTRL_ON = os.environ.get('GO2W_CTRL', '1') != '0'
 CTRL_STALE = 2.0       # s：状态 topic 10 Hz，超过这么久没收到就当不知道
+# 雷达无数据（11-19：.21 雷达掉线一个多小时，web.log 里只有「里程计不可用」的间接痕迹，网页红条只在浏览器里）：
+# 建图 / 定位 / 导航跑稳 LIDAR_GRACE 秒后，/scan 连续 LIDAR_STALE 秒没数据 → ERROR 日志 + 持续异常 lidar_lost；
+# 同时探一下雷达 IP 的 ARP，区分「雷达不在网上（供电 / 网线 / IP）」和「网络通但没点云（驱动 / 配置）」
+LIDAR_GRACE = float(os.environ.get('GO2W_LIDAR_GRACE', '15'))
+LIDAR_STALE = float(os.environ.get('GO2W_LIDAR_STALE', '5'))
+LIDAR_CONFIGS = [c for c in (os.environ.get('GO2W_LIDAR_CONFIG'), '/tmp/go2w_MID360_config.json',
+                             '/opt/go2w/base/go2w_bringup/share/go2w_bringup/config/MID360_config.json') if c]
+LIDAR_ARP = os.environ.get('GO2W_LIDAR_ARP', '/proc/net/arp')
+
+
+def lidar_ips():
+    """雷达驱动配置里的雷达 IP（运行时配置优先）。读不到返回 []。"""
+    for path in LIDAR_CONFIGS:
+        try:
+            with open(path, encoding='utf-8') as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        ips = [c.get('ip') for c in cfg.get('lidar_configs', []) if isinstance(c, dict) and isinstance(c.get('ip'), str)]
+        if ips:
+            return ips
+    return []
+
+
+def arp_state(ip, path=None):
+    """True = ARP 表里有这个 IP 的网卡地址（网络上找得到它）；False = 没有；None = 读不了 ARP 表。"""
+    try:
+        with open(path or LIDAR_ARP, encoding='ascii') as f:
+            rows = f.read().splitlines()[1:]
+    except OSError:
+        return None
+    for row in rows:
+        col = row.split()
+        if len(col) >= 4 and col[0] == ip:
+            return int(col[2], 16) & 0x2 != 0 and col[3] != '00:00:00:00:00:00'
+    return False
+
+
+async def lidar_diagnose():
+    """雷达没数据时给一句人话：往雷达 IP 的 9 号端口发一个 UDP 包（雷达不理）逼系统去 ARP，1.5 s 后看 ARP 表。不需要 root。"""
+    ips = lidar_ips()
+    if not ips:
+        return '读不到雷达驱动配置里的雷达 IP，没法诊断网络'
+    for ip in ips:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.setblocking(False)
+                u.sendto(b'go2w', (ip, 9))
+        except OSError:
+            pass
+    await asyncio.sleep(1.5)
+    out = []
+    for ip in ips:
+        st = arp_state(ip)
+        if st is None:
+            out.append(f'雷达 {ip}：读不了 ARP 表，网络状态未知')
+        elif st:
+            out.append(f'雷达 {ip} 网络是通的，但没有点云：看雷达驱动日志 data/runtime/logs/navigation.log，或停止档位后重开')
+        else:
+            out.append(f'雷达 {ip} 在网络上没有回应（ARP 不通）：雷达没上电、网线没插好或者 IP 变了，检查雷达供电和网线')
+    return '；'.join(out)
 CTRL_WAIT = 3.0        # s：每一步切换（插值走完之后）最多等这么久，和同事的 sport_cli up 一致
 CTRL_INTERP = 2.0      # s：FixStand 从趴姿插值到站姿的时间（config.yaml 的 ts 末项）
 POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到新进程的 Passive
@@ -1377,6 +1439,8 @@ class Server:
         self.stand_hold = False    # 网页点了「保持站立」：不自动趴下，直到下次出发或手动趴下
         self.idle_since = None     # 开始空闲的时间
         self.ctrl_online = None    # 运控在线状态（ctrl_watch 记变化）；None = 刚启动还没判断
+        # 雷达无数据（lidar_watch）：active = 档位稳定在跑的起点；bad = 判定没数据的时刻；msg = 给人看的原因
+        self.lidar = {'active': None, 'bad': None, 'msg': None}
         self.t_start = time.monotonic()
         self.prep_hold_t = -1e9    # 网页自检最近一次说「我在自检」的时间
 
@@ -1993,6 +2057,59 @@ class Server:
             self.ctrl_online = True
             self.incident_close('ctrl_offline')
             self.node.event('INFO', '运控已恢复：重新收到运控状态')
+
+    def lidar_watch(self):
+        """每秒一次。建图 / 定位 / 导航在 run 且已稳 LIDAR_GRACE 秒后才判断；档位停了就把没结束的异常收掉。"""
+        L, n, now = self.lidar, self.node, time.monotonic()
+        if not any(self.prof(m) == 'run' for m in P.MODES):
+            if L['bad'] is not None:
+                self.incident_close('lidar_lost')
+                n.event('INFO', f"档位已停，雷达无数据的提醒结束（持续约 {now - L['bad']:.0f} s）")
+            L.update(active=None, bad=None, msg=None)
+            return
+        if L['active'] is None:
+            L['active'] = now
+        if now - L['active'] < LIDAR_GRACE:
+            return
+        stamps = n.rates['/scan'].stamps
+        quiet = now - max(stamps[-1] if stamps else 0.0, L['active'] + LIDAR_GRACE - LIDAR_STALE)
+        if L['bad'] is None:
+            if quiet < LIDAR_STALE:
+                return
+            L['bad'] = now
+            driver = 'livox_lidar_publisher' in set(n.get_node_names())
+            L['msg'] = f'/scan 已经 {quiet:.0f} s 没有数据' if driver else '雷达驱动没有运行（livox_lidar_publisher 不在）'
+            self.inc_open['lidar_lost'] = self.incident('lidar_lost', L['msg'], ongoing=True, ago=quiet,
+                                                        bag='雷达没数据，回溯包里也没有点云，不存')
+            if driver:
+                n.event('ERROR', f"雷达无数据：{L['msg']}，正在检查雷达网络……")
+                asyncio.ensure_future(self.lidar_report(L['bad']))
+            else:
+                n.event('ERROR', f"雷达无数据：{L['msg']}，停止后重开档位")
+        elif quiet < 1.0:
+            self.incident_close('lidar_lost')
+            n.event('INFO', f"雷达已恢复：/scan 又有数据了（断了约 {now - L['bad'] + LIDAR_STALE:.0f} s）")
+            L.update(bad=None, msg=None)
+
+    async def lidar_report(self, since):
+        try:
+            text = await lidar_diagnose()
+        except Exception as e:
+            text = f'诊断失败：{e!r}'
+        L = self.lidar
+        if L['bad'] != since:   # 诊断期间已经恢复 / 档位停了
+            return
+        L['msg'] = f"{L['msg']}。{text}"
+        self.node.event('ERROR', f'雷达无数据：{text}')
+        rid = self.inc_open.get('lidar_lost')
+        rec = self.incidents.get(rid) if rid else None
+        if rec is not None:
+            rec['msg'] = L['msg']
+            self.incidents.changed(rec)   # 存盘 + 推给云端监控页
+
+    def lidar_view(self):
+        L = self.lidar
+        return None if L['bad'] is None else {'since': round(time.monotonic() - L['bad'], 1), 'msg': L['msg']}
 
     def ctrl_view(self):
         if self.ctrl is None:
@@ -3090,7 +3207,7 @@ class Server:
         rec, i = r['record'], r['index']
         return {'routeId': rec['id'], 'name': rec['name'], 'point': i + 1, 'pointName': rec['points'][i]['name']}
 
-    def incident(self, typ, msg, ongoing=False, ago=0.0, task=INC_AUTO):
+    def incident(self, typ, msg, ongoing=False, ago=0.0, task=INC_AUTO, bag=True):
         """记一条异常并安排自动存包，返回 id。不抛异常：会在停车等安全动作的路径上调用。
         ago = 异常实际开始于多少秒前（卡住是判定时已经停了 8 秒）；task 不传 = 取当前任务。"""
         n = self.node
@@ -3105,7 +3222,10 @@ class Server:
             rec = self.incidents.open(typ, msg, robot_id()[0], ts=INC.now_ms() - ago * 1000, pose=pose,
                                       map_name=self.shown_map(), ongoing=ongoing,
                                       task=self.incident_task() if task is INC_AUTO else task)
-            self.incident_bag(rec)
+            if bag is True:
+                self.incident_bag(rec)
+            else:
+                self.incidents.set_bag(rec['id'], 'skipped', msg=bag or '这类异常不存包')
             if self.incidents.error:
                 n.event('ERROR', self.incidents.error)
             return rec['id']
@@ -4655,6 +4775,8 @@ class Server:
                     self.hot_tick()
                     self.idle_tick()
                     self.ctrl_watch()
+                if k % 10 == 0:
+                    self.lidar_watch()
                 # 急停期间底盘被其他客户端解锁 → 再次上锁。
                 # 只认急停 1 s 之后收到的「已解锁」，避免把上锁之前的旧状态当成又被解锁
                 if self.estop and n.is_armed() and n.armed_t > self.estop_t + 1.0 and k % 5 == 0:
@@ -4712,7 +4834,7 @@ class Server:
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
                               cont=self.cont_state(), contBusy=self.cont_busy,
                               contPaused=self.cont_blocked and self.prof('mapping') == 'run',
-                              autosave=self.autosave_view(), webVersion=self.version)
+                              autosave=self.autosave_view(), lidar=self.lidar_view(), webVersion=self.version)
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
