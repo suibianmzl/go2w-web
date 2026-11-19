@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSMsgType, WSServerHandshakeError, web
 from aiohttp.client import ClientSession
 
 
@@ -523,6 +523,89 @@ async def test_multi_robot_gateway():
             await runner.cleanup()
 
 
+async def test_browser_authentication():
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
+        Path(tmp, 'login.html').write_text(
+            '<form data-login>Login</form>', encoding='utf-8')
+        gateway = CloudGateway(
+            tmp,
+            rtc_app_id='123456781234567812345678',
+            rtc_app_key='test-app-key',
+            access_token='test-access-token',
+        )
+        runner, port = await start_app(gateway.app())
+        base = f'http://127.0.0.1:{port}'
+        try:
+            async with ClientSession() as session:
+                page = await session.get(
+                    base + '/quadruped/',
+                    allow_redirects=False,
+                    headers={'Accept': 'text/html'},
+                )
+                assert page.status == 302
+                assert page.headers['Location'].startswith('/login?next=')
+                page_head = await session.head(base + '/', allow_redirects=False)
+                assert page_head.status == 302
+                assert page_head.headers['Location'].startswith('/login?next=')
+
+                login = await session.get(base + '/login')
+                assert login.status == 200
+                assert 'data-login' in await login.text()
+
+                unauthorized_api = await session.get(base + '/quadruped/api/robots')
+                assert unauthorized_api.status == 401
+
+                robot = await session.ws_connect(base + '/quadruped/robot/ws')
+                robot_reader = Reader(robot)
+                await robot.send_str(
+                    '{"type":"hello","robot_id":"go2w-01","protocol":1}')
+
+                robot_rtc = await session.get(
+                    base + '/quadruped/rtc/config?role=robot&robot_id=go2w-01')
+                assert robot_rtc.status == 200
+
+                rejected = await session.post(
+                    base + '/auth/login',
+                    json={'token': 'wrong-token'},
+                )
+                assert rejected.status == 401
+                try:
+                    await session.ws_connect(base + '/quadruped/ws')
+                    raise AssertionError('unauthenticated browser WebSocket connected')
+                except WSServerHandshakeError as error:
+                    assert error.status == 401
+
+                accepted = await session.post(
+                    base + '/auth/login',
+                    json={'token': 'test-access-token'},
+                )
+                assert accepted.status == 200
+                assert (await accepted.json())['ok'] is True
+
+                authorized_page = await session.get(base + '/quadruped/')
+                assert authorized_page.status == 200
+                cookie_header = '; '.join(
+                    f'{name}={morsel.value}'
+                    for name, morsel in accepted.cookies.items()
+                )
+                browser = await session.ws_connect(
+                    base + '/quadruped/ws',
+                    headers={'Cookie': cookie_header},
+                )
+                await browser.close()
+
+                logged_out = await session.post(base + '/auth/logout')
+                assert logged_out.status == 200
+                denied_again = await session.get(base + '/quadruped/api/robots')
+                assert denied_again.status == 401
+
+                await robot.close()
+                await robot_reader.close()
+        finally:
+            await runner.cleanup()
+
+
 async def test_archive_gateway():
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
@@ -881,6 +964,8 @@ async def main():
     print('PASS cloud gateway: static, cache, layers, command ack, camera filtering')
     await test_multi_robot_gateway()
     print('PASS cloud gateway: concurrent robots, isolated data, routing, fleet API')
+    await test_browser_authentication()
+    print('PASS cloud gateway: browser token auth, machine route bypass, logout')
     await test_archive_gateway()
     print('PASS cloud gateway: archive session, telemetry, binary and command ACK capture')
     await test_internal_ssh_bindings()

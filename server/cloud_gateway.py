@@ -6,15 +6,18 @@ existing browser protocol between browser sessions and multiple robot gateways.
 """
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from aiohttp import WSMsgType, web
 from pymysql.err import IntegrityError
@@ -100,8 +103,13 @@ class CloudGateway:
         ssh_registration=None,
         archive_spool=None,
         archive_store=None,
+        access_token=None,
+        auth_session_ttl=12 * 60 * 60,
     ):
         self.static_dir = Path(static_dir).resolve()
+        self.access_token = str(access_token or '').strip()
+        self.auth_session_ttl = max(60, int(auth_session_ttl))
+        self.auth_sessions = {}
         self.rtc_app_id = rtc_app_id
         self.rtc_app_key = rtc_app_key
         self.rtc_room_id = rtc_room_id or 'go2w-01'
@@ -152,6 +160,96 @@ class CloudGateway:
     @staticmethod
     def clean_device_id(value):
         return re.sub(r'[^A-Za-z0-9_.-]', '', str(value or ''))[:128]
+
+    @staticmethod
+    def safe_auth_next(value):
+        target = str(value or '').strip()
+        if (
+            not target.startswith('/')
+            or target.startswith('//')
+            or '\\' in target
+            or any(ord(char) < 32 for char in target)
+        ):
+            return '/quadruped/fleet/'
+        return target
+
+    @staticmethod
+    def request_uses_https(req):
+        forwarded = req.headers.get('X-Forwarded-Proto', '').split(',', 1)[0].strip().lower()
+        return req.secure or forwarded == 'https'
+
+    def auth_enabled(self):
+        return bool(self.access_token)
+
+    def purge_auth_sessions(self):
+        now = time.time()
+        for session_id, expires_at in list(self.auth_sessions.items()):
+            if expires_at <= now:
+                self.auth_sessions.pop(session_id, None)
+
+    def authenticated(self, req):
+        if not self.auth_enabled():
+            return True
+        session_id = req.cookies.get('go2w_session', '')
+        if not session_id:
+            return False
+        expires_at = self.auth_sessions.get(session_id)
+        if expires_at is None:
+            return False
+        if expires_at <= time.time():
+            self.auth_sessions.pop(session_id, None)
+            return False
+        return True
+
+    @staticmethod
+    def is_machine_route(req):
+        path = req.path
+        if path in {
+            '/health',
+            '/quadruped/health',
+            '/robot/ws',
+            '/quadruped/robot/ws',
+            '/quadruped/camera/ws',
+            '/quadruped/rtc/publisher-status',
+            '/login',
+            '/quadruped/login',
+            '/auth/login',
+            '/auth/logout',
+            '/favicon.ico',
+        }:
+            return True
+        if path.startswith('/internal/'):
+            return True
+        return path == '/quadruped/rtc/config' and req.query.get('role') == 'robot'
+
+    @staticmethod
+    def is_page_request(req):
+        if req.method not in {'GET', 'HEAD'}:
+            return False
+        if req.path in {
+            '/',
+            '/quadruped',
+            '/quadruped/',
+            '/quadruped/fleet',
+            '/quadruped/fleet/',
+            '/quadruped/inspection',
+            '/quadruped/inspection/',
+        }:
+            return True
+        return 'text/html' in req.headers.get('Accept', '').lower()
+
+    @web.middleware
+    async def auth_middleware(self, req, handler):
+        if self.is_machine_route(req) or self.authenticated(req):
+            return await handler(req)
+        if self.is_page_request(req):
+            next_path = quote(req.raw_path or '/', safe='')
+            return web.HTTPFound(f'/login?next={next_path}')
+        return web.Response(
+            status=401,
+            text='authentication required',
+            headers={'WWW-Authenticate': 'Token'},
+        )
 
     def requested_robot_id(self, req):
         return self.clean_robot_id(req.query.get('robot_id')) or self.default_robot_id
@@ -1079,6 +1177,53 @@ class CloudGateway:
                 request_id, 503, 'SERVICE_UNAVAILABLE', 'SSH unbind unavailable')
         return self.internal_json(request_id, result)
 
+    # ---------- authentication ----------
+    async def login_page(self, req):
+        if self.authenticated(req):
+            return web.HTTPFound(self.safe_auth_next(req.query.get('next')))
+        return web.FileResponse(self.static_dir / 'login.html')
+
+    async def auth_login(self, req):
+        if not self.auth_enabled():
+            return web.json_response({'ok': True, 'next': '/quadruped/fleet/'})
+        try:
+            payload = await req.json()
+        except (TypeError, ValueError):
+            raise web.HTTPBadRequest(text='invalid JSON')
+        token = str(payload.get('token') or '') if isinstance(payload, dict) else ''
+        if not token or not hmac.compare_digest(token, self.access_token):
+            await asyncio.sleep(0.2)
+            return web.json_response(
+                {'ok': False, 'message': 'Token 无效'},
+                status=401,
+            )
+        self.purge_auth_sessions()
+        session_id = secrets.token_urlsafe(32)
+        expires_at = time.time() + self.auth_session_ttl
+        self.auth_sessions[session_id] = expires_at
+        response = web.json_response({
+            'ok': True,
+            'next': self.safe_auth_next((payload or {}).get('next')),
+        })
+        response.set_cookie(
+            'go2w_session',
+            session_id,
+            max_age=self.auth_session_ttl,
+            path='/',
+            httponly=True,
+            secure=self.request_uses_https(req),
+            samesite='Lax',
+        )
+        return response
+
+    async def auth_logout(self, req):
+        session_id = req.cookies.get('go2w_session', '')
+        if session_id:
+            self.auth_sessions.pop(session_id, None)
+        response = web.json_response({'ok': True})
+        response.del_cookie('go2w_session', path='/')
+        return response
+
     # ---------- HTTP ----------
     async def index(self, _req):
         return web.FileResponse(self.static_dir / 'index.html')
@@ -1347,8 +1492,12 @@ class CloudGateway:
             response.headers['Cache-Control'] = 'no-store'
             return response
 
-        app = web.Application(middlewares=[no_cache])
+        app = web.Application(middlewares=[no_cache, self.auth_middleware])
         app.on_cleanup.append(self.cleanup)
+        app.router.add_get('/login', self.login_page)
+        app.router.add_get('/quadruped/login', self.login_page)
+        app.router.add_post('/auth/login', self.auth_login)
+        app.router.add_post('/auth/logout', self.auth_logout)
         app.router.add_get('/health', self.health)
         app.router.add_get('/quadruped/health', self.health)
         app.router.add_get('/internal/v1/archive/status', self.archive_status_api)
@@ -1407,6 +1556,12 @@ def main():
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--static', default=str(here.parent / 'static'))
+    parser.add_argument('--access-token', default=os.environ.get('GO2W_ACCESS_TOKEN'))
+    parser.add_argument(
+        '--auth-session-ttl',
+        type=int,
+        default=int(os.environ.get('GO2W_AUTH_SESSION_TTL', str(12 * 60 * 60))),
+    )
     args = parser.parse_args()
     gateway = CloudGateway(
         args.static,
@@ -1415,6 +1570,8 @@ def main():
         rtc_room_id=os.environ.get('GO2W_RTC_ROOM_ID', 'go2w-01'),
         rtc_ttl=int(os.environ.get('GO2W_RTC_TOKEN_TTL', '3600')),
         default_robot_id=os.environ.get('GO2W_DEFAULT_ROBOT_ID'),
+        access_token=args.access_token,
+        auth_session_ttl=args.auth_session_ttl,
     )
     web.run_app(gateway.app(), host=args.host, port=args.port,
                 print=None, handle_signals=True, shutdown_timeout=3.0)

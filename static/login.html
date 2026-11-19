@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EvoX Fleet · 访问验证</title>
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#091217;
+      --panel:#101e24;
+      --line:#24414a;
+      --text:#e8f2f3;
+      --muted:#8da5aa;
+      --accent:#65dbc8;
+      --danger:#ff7c86;
+    }
+    *{box-sizing:border-box}
+    html,body{min-height:100%;margin:0}
+    body{
+      display:grid;
+      place-items:center;
+      overflow:hidden;
+      background:
+        radial-gradient(circle at 18% 20%,rgba(101,219,200,.14),transparent 30rem),
+        radial-gradient(circle at 82% 75%,rgba(65,123,255,.11),transparent 34rem),
+        linear-gradient(145deg,#081116,#0c181e 52%,#071015);
+      color:var(--text);
+      font:15px/1.55 Inter,"PingFang SC","Microsoft YaHei",sans-serif;
+    }
+    body::before{
+      content:"";
+      position:fixed;
+      inset:0;
+      opacity:.18;
+      pointer-events:none;
+      background-image:
+        linear-gradient(rgba(101,219,200,.12) 1px,transparent 1px),
+        linear-gradient(90deg,rgba(101,219,200,.12) 1px,transparent 1px);
+      background-size:48px 48px;
+      mask-image:linear-gradient(to bottom,transparent,#000 25%,#000 75%,transparent);
+    }
+    main{
+      position:relative;
+      z-index:1;
+      width:min(440px,calc(100vw - 32px));
+      padding:32px;
+      border:1px solid var(--line);
+      border-radius:20px;
+      background:linear-gradient(180deg,rgba(18,34,41,.98),rgba(10,23,29,.98));
+      box-shadow:0 30px 90px rgba(0,0,0,.55),inset 0 1px rgba(255,255,255,.04);
+    }
+    .brand{display:flex;align-items:center;gap:12px;margin-bottom:26px}
+    .mark{
+      display:grid;
+      width:42px;
+      height:42px;
+      place-items:center;
+      border:1px solid rgba(101,219,200,.5);
+      border-radius:13px;
+      background:rgba(101,219,200,.1);
+      color:var(--accent);
+      font-size:20px;
+      font-weight:800;
+    }
+    h1{margin:0;font-size:22px;letter-spacing:.02em}
+    .brand small{display:block;margin-top:2px;color:var(--muted);font-size:11px;letter-spacing:.16em}
+    .intro{margin:0 0 22px;color:var(--muted)}
+    label{display:block;margin-bottom:8px;color:#b9cbce;font-size:13px}
+    .field{position:relative}
+    input{
+      width:100%;
+      height:50px;
+      padding:0 48px 0 14px;
+      border:1px solid var(--line);
+      border-radius:11px;
+      outline:none;
+      background:#09171c;
+      color:var(--text);
+      font:inherit;
+      transition:border-color .15s,box-shadow .15s;
+    }
+    input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(101,219,200,.12)}
+    button{
+      width:100%;
+      height:50px;
+      margin-top:16px;
+      border:0;
+      border-radius:11px;
+      background:var(--accent);
+      color:#071317;
+      font:700 15px/1 inherit;
+      cursor:pointer;
+      transition:filter .15s,opacity .15s;
+    }
+    button:hover{filter:brightness(1.08)}
+    button:disabled{cursor:wait;opacity:.65}
+    #error{min-height:22px;margin:10px 0 0;color:var(--danger);font-size:13px}
+    .status{display:flex;align-items:center;justify-content:space-between;margin-top:22px;color:var(--muted);font-size:12px}
+    .status span:first-child::before{content:"";display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <div class="mark">E</div>
+      <div>
+        <h1>EvoX Fleet</h1>
+        <small>QUADRUPED CONTROL CLOUD</small>
+      </div>
+    </div>
+    <p class="intro">请输入访问 Token，验证通过后可进入设备列表、控制台和巡检工作台。</p>
+    <form id="loginForm">
+      <label for="token">访问 Token</label>
+      <div class="field">
+        <input id="token" name="token" type="password" autocomplete="current-password"
+          placeholder="请输入云端访问 Token" autofocus required>
+      </div>
+      <button id="submit" type="submit">验证并进入</button>
+      <div id="error" role="alert"></div>
+    </form>
+    <div class="status"><span>安全访问</span><span>EvoX Robot Cloud</span></div>
+  </main>
+  <script>
+    const form = document.querySelector('#loginForm');
+    const input = document.querySelector('#token');
+    const submit = document.querySelector('#submit');
+    const error = document.querySelector('#error');
+
+    function nextUrl(){
+      const value = new URLSearchParams(location.search).get('next') || '';
+      if (!value.startsWith('/') || value.startsWith('//') || value.includes('\\') || /[\u0000-\u001f]/.test(value)){
+        return '/quadruped/fleet/';
+      }
+      return value;
+    }
+
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const token = input.value.trim();
+      if (!token) return;
+      submit.disabled = true;
+      error.textContent = '';
+      try {
+        const response = await fetch('/auth/login', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({ token }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok){
+          throw new Error(payload.message || 'Token 验证失败');
+        }
+        location.replace(nextUrl());
+      } catch (reason){
+        error.textContent = reason?.message || 'Token 验证失败';
+        input.select();
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
