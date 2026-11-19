@@ -231,6 +231,9 @@ async def test_cloud_gateway():
         base = f'http://127.0.0.1:{port}'
         try:
             async with ClientSession() as session:
+                root = await session.get(base + '/', allow_redirects=False)
+                assert root.status in {301, 308}
+                assert root.headers['Location'].endswith('/quadruped/fleet/')
                 response = await session.get(base + '/quadruped/')
                 assert response.status == 200
                 assert 'Go2W' in await response.text()

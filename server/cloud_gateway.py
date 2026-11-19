@@ -1396,7 +1396,7 @@ class CloudGateway:
         app.router.add_get('/quadruped/inspection/', self.inspection)
         app.router.add_get('/quadruped/', self.index)
         app.router.add_get('/quadruped/{path:.*}', self.static_file)
-        app.router.add_get('/', lambda _r: web.HTTPPermanentRedirect('/quadruped/'))
+        app.router.add_get('/', lambda _r: web.HTTPPermanentRedirect('/quadruped/fleet/'))
         return app
 
 
