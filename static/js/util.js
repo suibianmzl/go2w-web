@@ -4,6 +4,8 @@ export const $$ = s => [...document.querySelectorAll(s)];
 export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
 export const deg = r => r * 180 / Math.PI;
+// 只有网页自己起的名字才是建图自动保存（和后端 AUTOSAVE_RE 一致）；autosave_…_c1 这种续建结果不算
+export const isAutosave = name => /^autosave_\d{4}_\d{6}(?:_prev)?$/.test(name);
 export const fmt = (v, n = 2) => (v >= 0 ? ' ' : '') + v.toFixed(n);
 export const gauss = () => { let u = 0; while (!u) u = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random()); };
 export function mulberry32(a){ return function(){ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }

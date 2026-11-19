@@ -110,7 +110,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 
 ## 建图自动保存（11-17）
 
-建图时每 30 s（`GO2W_AUTOSAVE_SECONDS`）、停止建图前、雷达 / FAST-LIO / 里程计出问题时（两次至少隔 5 s），把当前地图存成 `data/maps/autosave_<建图开始时间>`，同一次建图覆盖同一份；地图没变就不存，单次存图耗时超过周期的 1/10 自动拉长间隔。只留最近 3 次建图的自动保存（被路线引用的不删）。测试：`dev/test_autosave.mjs`。
+建图时每 30 s（`GO2W_AUTOSAVE_SECONDS`）、停止建图前、雷达 / FAST-LIO / 里程计出问题时（两次至少隔 5 s），把当前地图存成 `data/maps/autosave_<建图开始时间>`，同一次建图覆盖同一份；地图没变就不存，单次存图耗时超过周期的 1/10 自动拉长间隔。只留最近 3 次建图的自动保存，旧的挪进 `data/maps/.trash`（14 天）；只认网页自己起的名字 `autosave_MMDD_HHMMSS(_prev)`，被路线引用、正在用、续建正在拿来当基准或目标的不动（v1.0.7）。测试：`dev/test_autosave.mjs`。
 
 ## 地图编辑（v1.0.2，11-18）
 
@@ -129,7 +129,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 
 ## 管理地图 / 删除（v1.0.3，11-18）
 
-导航页第 1 步「地图」切换旁边的「管理」：列出 `data/maps` 里所有地图（大小、修改时间、上面有几个任务），勾选多张一起删除；可以按名字筛选、一键选中全部 `autosave_*`。
+导航页第 1 步「地图」切换旁边的「管理」：列出 `data/maps` 里所有地图（大小、修改时间、上面有几个任务），勾选多张一起删除；可以按名字筛选、一键选中全部自动保存（只认 `autosave_MMDD_HHMMSS(_prev)`，不含续建出来的 `autosave_…_c1`）。
 
 - 后端指令 `{t:'cmd', op:'map_delete', names:[...]}`（`Server.map_delete`）。**不是真删**：`<名字>.*` 整套文件（pgm / yaml / posegraph / data / meta.json / yaml.bak_*）挪进 `data/maps/.trash/<时间>_<名字>/`，同目录 `deleted.json` 记下文件清单、绑在这张图上的任务（从 `routes.json` 删掉）和显示方向（从 `map_views.json` 删掉）。回收站里超过 14 天（`MAP_TRASH_DAYS`）的在下次删除时清掉。恢复目前是手动：文件挪回 `data/maps`，任务从 `deleted.json` 并回 `routes.json`。
 - 拒绝删除：导航 / 定位正在用的图、续建正在当基准的图、正在执行任务的图；地图正在保存 / 切换 / 自动保存时也不删。
@@ -168,6 +168,17 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - 异常后马上停止档位时，先把回溯包存掉再停。
 
 测试：`dev/test_fall_guard.mjs`（准备见文件头：`GO2W_AUTOSAVE_SECONDS=4 GO2W_FAKE_MAP_GROW=1 dev/run.sh`）、`dev/test_autosave.mjs`。
+
+## 自动保存清理误删修复（v1.0.7，11-19）
+
+起因：11-19 在 .21 上，自动保存「只留最近 3 次」按前缀 `autosave_` 认图，把从自动保存续建出来、手动保存的 `autosave_…_c1` 也当成自动保存**直接删除**（不进回收站），一天丢了三张续建图；还在续建自检时删掉了基准图。
+
+- 清理只认 `autosave_MMDD_HHMMSS` 和它的 `_prev`（后端 `AUTOSAVE_RE` / `is_autosave()`，前端 `util.isAutosave`），清理掉的挪进 `data/maps/.trash`，14 天后才真删。
+- 不清理：正在用的图、被路线引用的、续建正在用的基准和目标名（`cont_start` 期间也保护）。
+- 从自动保存续建时默认新图名改成 `map_…_c1`；保存地图和续建都拒绝 `autosave_MMDD_HHMMSS` 这种名字。
+- 「管理地图」的「选中自动保存」只选真正的自动保存。
+
+测试：`dev/test_autosave.mjs`（新增：`autosave_…_c1` 等不被清理、清理进回收站、拒绝自动保存格式的名字）。
 
 ## 地图显示方向
 

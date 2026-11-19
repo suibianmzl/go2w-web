@@ -31,6 +31,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -190,6 +191,13 @@ AUTOSAVE_KEEP = 3
 AUTOSAVE_PREFIX = 'autosave_'
 AUTOSAVE_PROBLEM_GAP = 5.0    # s：出问题时立刻存，但两次之间至少隔这么久
 AUTOSAVE_PREV = '_prev'       # 每次覆盖前把上一份挪成 <名字>_prev：坏图写进来时还能退一步
+# 只有网页自己起的名字才算自动保存：autosave_MMDD_HHMMSS 和它的 _prev。11-19 在 .21 上，清理按前缀
+# 「autosave_」认，把从自动保存续建出来、用户手动保存的 autosave_…_c1 也当成自动保存直接删掉了（不进回收站）
+AUTOSAVE_RE = re.compile(r'autosave_\d{4}_\d{6}(?:_prev)?')
+
+
+def is_autosave(name):
+    return isinstance(name, str) and AUTOSAVE_RE.fullmatch(name) is not None
 # 摔倒 / 里程计发散保护（11-19：.30 建图时摔倒，FAST-LIO 发散，「出问题时自动保存」反而把摔倒前的好图
 # 覆盖成了 467 × 551 m 的坏图——/odom_healthy 只看 FAST-LIO 还在不在输出，不看输出对不对）。
 # 检测到「运控意外掉到 Passive」或「里程计数值离谱」：建图立刻冻结（关扫描闸门、停自动保存），并记异常 + 存回溯包
@@ -1281,6 +1289,7 @@ class Server:
         self.map_busy = False         # 保存和导出地图期间保护源快照及目标文件
         # 续建（docs/地图续建.md）：一次会话 = 基准图 + 新图名字 + 起点位姿 + 自检结果
         self.cont = None              # {base, name, source, pose, warn, check, started, paused}
+        self.cont_hold = ()           # cont_start 进行中的 (基准, 新名)：自动保存清理不许碰
         self.cont_busy = False
         self.cont_blocked = False
         # 建图自动保存：name = 这次建图的自动保存名；t = 上次存成功的时间；crc = 那时 /map 的 crc
@@ -3469,28 +3478,37 @@ class Server:
             pass   # 留不下上一份不影响这次保存
 
     def autosave_prune(self):
-        """只留最近 AUTOSAVE_KEEP 次建图的自动保存；被路线用到的、正在用的不删。"""
+        """只留最近 AUTOSAVE_KEEP 次建图的自动保存，旧的挪进回收站（data/maps/.trash，和「管理地图」删除同一处）。
+        只认网页自己起的名字（is_autosave）：续建 / 编辑 / 手动保存出来的图哪怕名字以 autosave_ 开头也不动。
+        正在用的、被路线引用的、续建正在拿来当基准或目标的不动。"""
         maps_dir = os.path.join(DATA, 'maps')
         try:
             files = os.listdir(maps_dir)
         except OSError:
             return
-        names = sorted({f.split('.', 1)[0] for f in files if f.startswith(AUTOSAVE_PREFIX) and f.endswith('.yaml')})
+        names = sorted({f[:-len('.yaml')] for f in files if f.endswith('.yaml') and is_autosave(f[:-len('.yaml')])})
         sess = lambda nm: nm[:-len(AUTOSAVE_PREV)] if nm.endswith(AUTOSAVE_PREV) else nm   # _prev 跟着本次建图走
         keep_sess = set(sorted({sess(nm) for nm in names})[-AUTOSAVE_KEEP:]) | {self.autosave['name']}
-        keep = {self.node.map_current} | {r.get('map') for r in self.routes.values()}
+        keep = {self.node.map_current, self.node.map_loaded} | {r.get('map') for r in self.routes.values()}
+        keep |= set(self.map_in_use()) | set(self.cont_hold)
+        if self.cont:
+            keep |= {self.cont.get('base'), self.cont.get('name')}
+        trash, stamp = os.path.join(maps_dir, '.trash'), time.strftime('%Y%m%d_%H%M%S')
         for name in names:
             if name in keep or sess(name) in keep_sess:
                 continue
-            for f in files:
-                if f.split('.', 1)[0] == name:
-                    try:
-                        os.unlink(os.path.join(maps_dir, f))
-                    except OSError:
-                        pass
-            self.node.event('INFO', f'删掉较早的建图自动保存 {name}（只留最近 {AUTOSAVE_KEEP} 次）')
+            try:
+                self.trash_map(maps_dir, name, os.path.join(trash, f'{stamp}_{name}'), [], None)
+            except OSError as e:
+                self.node.event('WARN', f'清理较早的建图自动保存 {name} 失败：{e}')
+                continue
+            self.node.event('INFO', f'较早的建图自动保存 {name} 挪进回收站 data/maps/.trash'
+                                    f'（只留最近 {AUTOSAVE_KEEP} 次，{self.MAP_TRASH_DAYS} 天后清掉）')
+        self.purge_trash(trash, self.MAP_TRASH_DAYS)
 
     async def save_map(self, name):
+        if is_autosave(name):
+            return False, 'autosave_月日_时分秒 这种名字留给建图自动保存（会被定期清理），请换个名字'
         if self.map_busy or self.autosave['running']:
             return False, '地图正在保存，请稍等'
         self.map_busy = True
@@ -3782,6 +3800,8 @@ class Server:
             return False, '基准图名不合法'
         if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name) or name == base:
             return False, '续建请填写一个不同的合法地图名'
+        if is_autosave(name):
+            return False, 'autosave_月日_时分秒 这种名字留给建图自动保存（会被定期清理），请换个名字'
         if source not in (None, 'manual', 'parking'):
             return False, '起点来源只能是自动定位、手动起点或停车点'
         if source == 'manual':
@@ -3797,6 +3817,7 @@ class Server:
             return False, f'已存在地图 {name}，请换个名字'
 
         self.cont_busy = True
+        self.cont_hold = (base, name)
         payload = {}
         phase = 'pause'
         try:
@@ -3877,6 +3898,7 @@ class Server:
             return False, msg, dict(payload, code=phase)
         finally:
             self.cont_busy = False
+            self.cont_hold = ()
 
     def _tool_script(self, name):
         """找工具脚本。扩展坞上 release 里是 web/current/tools，仓库里是 scripts/calib。

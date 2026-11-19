@@ -1,7 +1,7 @@
 // 用户操作：先按 store 做前置检查、必要时弹确认，再交给数据源执行。两种数据源共用这套规则。
 // 数据源的指令可以返回 { ok, msg }（或它的 Promise）：ROS 源以后端的回复为准，模拟源不返回就算成功
 import { toast, confirmBox, formBox } from './ui.js';
-import { deg } from './util.js';
+import { deg, isAutosave } from './util.js';
 
 export const MODES = { mapping: '建图', localization: '定位', navigation: '导航' };
 export const MODE_PKG = { mapping: 'slam_toolbox', localization: 'map_server · AMCL', navigation: 'AMCL · Nav2 · cmd_bridge' };
@@ -334,7 +334,7 @@ export function createActions(store, src){
       formBox({ title: `管理地图（${maps.length} 张）`, ok: '删除所选', danger: true,
         build: form => {
           form.closest('.modal').classList.add('modal-wide');
-          const auto = maps.filter(m => /^autosave_/.test(m.name) && !lock(m)).length;
+          const auto = maps.filter(m => isAutosave(m.name) && !lock(m)).length;
           form.innerHTML = `<div class="mapdel-bar"><input class="modal-select" data-q placeholder="筛选地图名…">
               <button type="button" class="btn sm ghost" data-auto ${auto ? '' : 'disabled'}>选中自动保存（${auto}）</button>
               <button type="button" class="btn sm ghost" data-none>全不选</button></div>
@@ -352,7 +352,7 @@ export function createActions(store, src){
           const fire = () => form.dispatchEvent(new Event('change'));
           form.querySelector('[data-q]').oninput = e => { const q = e.target.value.trim().toLowerCase();
             form.querySelectorAll('.mapdel-it').forEach(el => el.hidden = !!q && !el.dataset.n.toLowerCase().includes(q)); };
-          form.querySelector('[data-auto]').onclick = () => { boxes.forEach(b => { if (!b.disabled && /^autosave_/.test(maps[+b.dataset.i].name)) b.checked = true; }); fire(); };
+          form.querySelector('[data-auto]').onclick = () => { boxes.forEach(b => { if (!b.disabled && isAutosave(maps[+b.dataset.i].name)) b.checked = true; }); fire(); };
           form.querySelector('[data-none]').onclick = () => { boxes.forEach(b => b.checked = false); fire(); };
           form.addEventListener('change', sum);
         },

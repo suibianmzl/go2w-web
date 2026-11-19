@@ -425,7 +425,8 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     }
     const base = $('#contBase').value;
     const nameIn = $('#contName');
-    if (!nameIn.value && base) nameIn.value = `${base}_c1`;
+    // 自动保存当基准时别沿用 autosave_ 前缀：续建结果是正式地图，不该看着像自动保存（11-19 被清理误删过）
+    if (!nameIn.value && base) nameIn.value = `${base.replace(/^autosave_/, 'map_')}_c1`;
     $('#contPre').disabled = busy || !base;
     const starting = store.contBusy || !!store.contStarting || (!c && Date.now() - (store.contStartOkAt || 0) < 3000);
     const canStart = !busy && !starting && run('mapping') && !!base && !c?.ready;
