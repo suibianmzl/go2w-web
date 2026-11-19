@@ -390,12 +390,36 @@ async def test_cloud_gateway():
                 assert await browser_reader.binary(T_MAP) == bytes([T_MAP, 3, 4])
                 assert not any(x[0] == 'binary' and x[1][0] == T_CAM for x in browser_reader.items)
 
+                other = await session.ws_connect(base + '/quadruped/ws')
+                other_reader = Reader(other)
+                await other_reader.text(lambda m: m.get('t') == 'robot_status')
+                await other.send_str('{"t":"cmd","id":8,"op":"cancel"}')
+                command = await robot_reader.text(lambda m: m.get('t') == 'cmd')
+                assert command['op'] == 'cancel'
+                await robot.send_str(json.dumps({
+                    't': 'ack', 'id': command['id'], 'ok': True, 'msg': 'canceled',
+                }))
+                other_ack = await other_reader.text(lambda m: m.get('t') == 'ack')
+                assert other_ack == {
+                    't': 'ack', 'id': 8, 'ok': True, 'msg': 'canceled',
+                }
+
                 await browser.close()
+                await asyncio.sleep(0.1)
+                assert not any(
+                    item[0] == 'text'
+                    and item[1].get('t') == 'cmd'
+                    and item[1].get('op') in {'cancel', 'arm'}
+                    for item in robot_reader.items
+                )
+                await browser_reader.close()
+
+                await other.close()
                 cancel = await robot_reader.text(lambda m: m.get('t') == 'cmd' and m.get('op') == 'cancel')
                 lock = await robot_reader.text(lambda m: m.get('t') == 'cmd' and m.get('op') == 'arm')
                 assert cancel['op'] == 'cancel' and lock['on'] is False
 
-                await browser_reader.close()
+                await other_reader.close()
                 browser2 = await session.ws_connect(base + '/quadruped/ws')
                 browser2_reader = Reader(browser2)
                 status = await browser2_reader.text(lambda m: m.get('t') == 'robot_status')

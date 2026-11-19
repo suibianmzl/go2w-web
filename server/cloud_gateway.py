@@ -653,13 +653,6 @@ class CloudGateway:
         return ws
 
     # ---------- browser messages ----------
-    def ensure_owner(self, session, client):
-        if session is None:
-            return False
-        if session.owner is None or session.owner not in self.clients_for(session.robot_id):
-            session.owner = client
-        return session.owner is client
-
     async def send_system_command(self, session, op, extra, reason):
         command_id = uuid.uuid4().hex
         upstream_id = f'cloud-{self.command_seq}'
@@ -699,13 +692,13 @@ class CloudGateway:
                 command_id, 'failed', '机器人指令队列已满或连接已断开')
         return sent
 
-    async def stop_on_owner_loss(self, session):
+    async def stop_on_last_browser_loss(self, session):
         if session is None or session.ws.closed:
             return
         await self.send_system_command(
-            session, 'cancel', {}, '控制方页面断开，自动取消任务')
+            session, 'cancel', {}, '最后一个控制页面断开，自动取消任务')
         await self.send_system_command(
-            session, 'arm', {'on': False}, '控制方页面断开，自动锁定底盘')
+            session, 'arm', {'on': False}, '最后一个控制页面断开，自动锁定底盘')
 
     async def on_browser_text(self, client, data):
         try:
@@ -743,12 +736,6 @@ class CloudGateway:
                 if msg_type == 'cmd':
                     self.send_browser(client, json.dumps({
                         't': 'ack', 'id': msg.get('id'), 'ok': False, 'msg': '机器狗未连接',
-                    }, ensure_ascii=False, separators=(',', ':')))
-                return
-            if not self.ensure_owner(session, client):
-                if msg_type == 'cmd':
-                    self.send_browser(client, json.dumps({
-                        't': 'ack', 'id': msg.get('id'), 'ok': False, 'msg': '另一个页面正在控制'
                     }, ensure_ascii=False, separators=(',', ':')))
                 return
             if msg_type == 'cmd':
@@ -821,6 +808,7 @@ class CloudGateway:
         finally:
             self.clients.pop(ws, None)
             session = self.robots.get(robot_id)
+            remaining_clients = self.clients_for(robot_id)
             if session is not None:
                 for key, pending in list(session.ack_routes.items()):
                     if pending.client is client:
@@ -829,9 +817,11 @@ class CloudGateway:
                             pending.command_id, 'abandoned', '控制方网页已断开')
                 self.sync_layers(robot_id)
                 self.sync_topics(robot_id)
-                if session.owner is client:
+                if not remaining_clients:
                     session.owner = None
-                    await self.stop_on_owner_loss(session)
+                    await self.stop_on_last_browser_loss(session)
+                elif session.owner is client:
+                    session.owner = remaining_clients[0]
             if client.tx:
                 client.tx.cancel()
                 await asyncio.gather(client.tx, return_exceptions=True)
