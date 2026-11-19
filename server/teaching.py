@@ -86,6 +86,7 @@ class TeachingRepository:
                 model = importlib.import_module('go2w_taught_route.model')
                 processing = importlib.import_module('go2w_taught_route.processing')
                 recorder = importlib.import_module('go2w_taught_route.recorder')
+                spline = importlib.import_module('go2w_taught_route.spline')
                 if not all(
                     callable(getattr(bundle, name, None))
                     for name in (
@@ -99,7 +100,11 @@ class TeachingRepository:
                 ):
                     raise ImportError('incompatible taught route package')
                 self._core = SimpleNamespace(
-                    bundle=bundle, model=model, processing=processing, recorder=recorder
+                    bundle=bundle,
+                    model=model,
+                    processing=processing,
+                    recorder=recorder,
+                    spline=spline,
                 )
             except ImportError as exc:
                 raise TeachingError(
@@ -224,6 +229,24 @@ class TeachingRepository:
                 'map_token': token,
                 'revision': int(bundle['revision']) if bundle else 0,
                 'points': deepcopy(reference.get('points', [])),
+                # 控制点是操作者的稀疏输入；导航点是处理后的稠密结果，两者不能混作编辑句柄。
+                'control_points': deepcopy(
+                    (reference.get('editing') or {}).get(
+                        'control_points', reference.get('points', [])
+                    )
+                ),
+                'processing': (
+                    deepcopy(
+                        reference.get('processing')
+                        or self.processing_summary(
+                            reference,
+                            len(reference.get('yaw_samples', reference.get('points', []))),
+                            'recorded',
+                        )
+                    )
+                    if reference
+                    else None
+                ),
                 'length': float(reference.get('length', 0.0)),
                 'executable': valid,
                 'report': deepcopy(reference.get('report', {})),
@@ -241,6 +264,121 @@ class TeachingRepository:
             self._cache[name] = (key, deepcopy(doc), image)
             return doc
 
+    @staticmethod
+    def processing_summary(reference, input_count, interpolation):
+        """直接取实际处理器报告，不用按钮点击次数或假进度声称已经优化。"""
+        report = reference.get('report', {})
+        return {
+            'input_count': input_count,
+            'output_count': len(reference.get('points', [])),
+            'interpolation': interpolation,
+            'max_offset': float(report.get('max_offset', 0.0)),
+            'iterations': int(report.get('iterations', 0)),
+            'full_sweep_checked': bool(
+                reference.get('executable') and report.get('full_sweep_checked')
+            ),
+        }
+
+    @staticmethod
+    def processing_message(reference):
+        if reference.get('executable'):
+            return '样条与处理结果已通过完整轮廓检查，可保存'
+        reason = reference.get('report', {}).get('reason', '')
+        if reason == 'RAW_SWEEP_UNSAFE':
+            return '生成曲线的机器人轮廓会进入障碍、未知区域或地图外，请调整控制点'
+        if reason == 'DISCONTINUOUS_REFERENCE':
+            return '控制点存在断口，请明确连接断口后重新预览'
+        return '轨迹处理未通过：' + str(reason or '几何不满足要求')
+
+    def _build_reference(
+        self, name, points, *, expected_revision, map_token, fixed=True, provenance=None
+    ):
+        """预览与提交共用同一数学链；耗时曲线/足迹计算不持有展示缓存锁。"""
+        if not isinstance(points, list) or not 2 <= len(points) <= 20000:
+            raise TeachingError('示教轨迹需要2–20000个有效点')
+        doc = self.document(name)
+        if doc['revision'] != expected_revision:
+            raise TeachingError('示教已被其他页面修改，请重新加载后再保存', 'VERSION_CONFLICT')
+        if doc['map_token'] != map_token:
+            raise TeachingError('底图已变化，请重新加载后再保存', 'MAP_MISMATCH')
+        grid, _, token = self.grid(name)
+        if token != map_token:
+            raise TeachingError('校验期间底图已变化，请重新加载后再保存', 'MAP_MISMATCH')
+        recorded = bool(provenance and provenance.get('kind') == 'captured-reference')
+        controls = deepcopy(points)
+        generated = points
+        spline_meta = None
+        if not recorded:
+            generated, spline_meta = self.core.spline.interpolate_control_points(points)
+        footprint = self.footprint
+        parameters = dict(self.parameters)
+        if not recorded:
+            # 样条已经平滑并给出了切线yaw；再挪动xy却沿用旧切线会破坏它的几何含义。
+            parameters['smooth_max_offset'] = 0.0
+        samples = []
+        for i, p in enumerate(generated):
+            pose = _pose(p)
+            if not all(math.isfinite(value) for value in pose):
+                raise TeachingError('轨迹坐标必须是有限数值')
+            index = p.get('control_index')
+            original = controls[index] if index is not None else p
+            row = {
+                'sample_id': i,
+                'stamp': i * 0.1,
+                'pose_map': pose,
+                'map_id': grid.map_id,
+                'continuous_id': p.get('continuous_id', 0),
+                'fixed': bool(p.get('fixed', fixed)),
+                'raw_ids': deepcopy(p.get('raw_ids', [index] if index is not None else [])),
+                'edited': not recorded,
+            }
+            if 'mark' in original:
+                row['mark'] = deepcopy(original['mark'])
+            samples.append(row)
+        reference = self.core.processing.process_route(
+            samples,
+            grid,
+            footprint,
+            map_id=grid.map_id,
+            parameters=parameters,
+            preserve_fixed_points=bool(
+                recorded and provenance.get('mode') in ('append', 'replace_segment')
+            ),
+        )
+        if len({p.get('continuous_id', 0) for p in reference['points']}) > 1:
+            reference['executable'] = False
+            reference['report'].update(status='DRAFT', reason='DISCONTINUOUS_REFERENCE')
+        reference['footprint'] = deepcopy(footprint)
+        reference['provenance'] = provenance or {'kind': 'edited-reference-not-measurements'}
+        if not recorded:
+            reference['editing'] = {'control_points': controls, **spline_meta}
+        reference['processing'] = self.processing_summary(
+            reference, len(points), 'recorded' if recorded else 'cubic_spline'
+        )
+        # 计算期间发生的修改不能变成用户的新基线；预览也要明确否决过期结果。
+        current = self.core.bundle.inspect_bundle(self.path(name))
+        if (current['revision'] if current else 0) != expected_revision:
+            raise TeachingError('处理期间示教已被修改，请重新加载', 'VERSION_CONFLICT')
+        if self.core.bundle.map_source_token(self.path(name)) != map_token:
+            raise TeachingError('处理期间底图已变化，请重新加载', 'MAP_MISMATCH')
+        return reference, controls
+
+    def preview(self, name, points, *, expected_revision, map_token):
+        reference, controls = self._build_reference(
+            name, points, expected_revision=expected_revision, map_token=map_token
+        )
+        return {
+            'map': name,
+            'revision': expected_revision,
+            'map_token': map_token,
+            'control_points': controls,
+            'preview_points': reference['points'],
+            'processing': reference['processing'],
+            'executable': reference['executable'],
+            'report': reference['report'],
+            'message': self.processing_message(reference),
+        }
+
     def save(
         self,
         name,
@@ -252,54 +390,18 @@ class TeachingRepository:
         fixed=True,
         provenance=None,
     ):
-        """输入是地图几何而非新的测量；先完整校验，成功才替换YAML中的唯一活动参考。"""
-        if not isinstance(points, list) or not 2 <= len(points) <= 20000:
-            raise TeachingError('示教轨迹需要2–20000个有效点')
+        """编辑控制点先生成样条；采集点仍走原平滑，原始测量不会被改写成手绘点。"""
         with self._lock:
-            doc = self.document(name)
-            if doc['revision'] != expected_revision:
-                raise TeachingError('示教已被其他页面修改，请重新加载后再保存', 'VERSION_CONFLICT')
-            if doc['map_token'] != map_token:
-                raise TeachingError('底图已变化，请重新加载后再保存', 'MAP_MISMATCH')
-            grid, _, token = self.grid(name)
-            if token != map_token:
-                raise TeachingError('校验期间底图已变化，请重新加载后再保存', 'MAP_MISMATCH')
-            samples = []
-            for i, p in enumerate(points):
-                pose = _pose(p)
-                if not all(math.isfinite(value) for value in pose):
-                    raise TeachingError('轨迹坐标必须是有限数值')
-                # 合成时间仅用于处理器排序，不冒充真实传感器时间；原始测量另存samples.jsonl。
-                row = {
-                    'sample_id': i,
-                    'stamp': i * 0.1,
-                    'pose_map': pose,
-                    'map_id': grid.map_id,
-                    'continuous_id': 0,
-                    'fixed': bool(p.get('fixed', fixed)),
-                    'raw_ids': deepcopy(p.get('raw_ids', [])),
-                }
-                if 'mark' in p:
-                    row['mark'] = deepcopy(p['mark'])
-                samples.append(row)
-            footprint = self.footprint
-            reference = self.core.processing.process_route(
-                samples,
-                grid,
-                footprint,
-                map_id=grid.map_id,
-                parameters=self.parameters,
-                preserve_fixed_points=bool(
-                    provenance and provenance.get('mode') in ('append', 'replace_segment')
-                ),
+            reference, _ = self._build_reference(
+                name,
+                points,
+                expected_revision=expected_revision,
+                map_token=map_token,
+                fixed=fixed,
+                provenance=provenance,
             )
             if not reference.get('executable'):
-                raise TeachingError(
-                    '轨迹校验未通过：'
-                    + str(reference.get('report', {}).get('reason', '足迹或连续性不安全'))
-                )
-            reference['footprint'] = deepcopy(footprint)
-            reference['provenance'] = provenance or {'kind': 'edited-reference-not-measurements'}
+                raise TeachingError(self.processing_message(reference))
             self.core.bundle.write_bundle(
                 self.path(name),
                 reference,
@@ -309,7 +411,7 @@ class TeachingRepository:
             )
             # 运行缓存可由导航重新生成；地图包络始终是活动参考的权威来源。
             self.core.bundle.prepare_bundle_route(
-                self.store, self.path(name), grid.map_id, activate=True
+                self.store, self.path(name), reference['map_id'], activate=True
             )
             self._cache.pop(name, None)
             return self.document(name)
@@ -639,7 +741,7 @@ class CaptureManager:
                 self._checkpoint()
                 raise TeachingError(self.current['message'])
             self.current.update(
-                state='processing', message='正在检查轨迹与机器人轮廓，原有效路线保持不变'
+                state='processing', message='正在重采样与平滑优化，随后检查完整轮廓并保存'
             )
             self._checkpoint()
             try:
@@ -688,7 +790,7 @@ class CaptureManager:
                     },
                 )
                 self.current.update(
-                    state='finished', message='示教已校验并随地图保存，后续导航自动使用'
+                    state='finished', message='已完成重采样、平滑优化和完整轮廓校验，已随地图保存'
                 )
                 self._checkpoint()
                 self.marker.unlink(missing_ok=True)

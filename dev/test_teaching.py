@@ -153,8 +153,10 @@ class TeachingTests(unittest.TestCase):
     def test_replace_segment_preserves_both_exteriors(self):
         old = self.save([{'x': 0.0, 'y': 0.0}, {'x': 2.0, 'y': 0.0}])
         engine = self.manager()
+        start = min(range(len(old['points'])), key=lambda i: abs(old['points'][i]['x'] - 0.5))
+        end = min(range(len(old['points'])), key=lambda i: abs(old['points'][i]['x'] - 1.5))
         s = self.start(
-            engine, 'replace_segment', self.measurement(0.5), start_index=5, end_index=15
+            engine, 'replace_segment', self.measurement(0.5), start_index=start, end_index=end
         )
         for x, y, t in ((0.5, 0.3, 1.3), (1.5, 0.3, 1.9), (1.5, 0.0, 2.2)):
             engine.sample(self.measurement(x, y, t))

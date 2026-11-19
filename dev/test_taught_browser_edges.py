@@ -74,7 +74,7 @@ def main():
             delayed.wait_for_timeout(100)
             delayed.evaluate('const s=document.querySelector("#editorMap");s.value="editor";s.dispatchEvent(new Event("change"));')
             expect(delayed.locator('#editorMapTitle')).to_have_text('editor')
-            expect(delayed.locator('#editorCount')).to_have_text(f"{len(doc['points'])} 点")
+            expect(delayed.locator('#editorCount')).to_have_text(f"{len(doc.get('control_points',doc['points']))} 点")
             for route in pending:
                 stale=copy.deepcopy(doc);stale['map']='slow_fake'
                 try:route.fulfill(json=stale)
@@ -84,9 +84,9 @@ def main():
             expect(delayed.locator('#editorMap')).to_have_value('editor')
             passed('加载中换选后，迟到旧图请求无法抢占当前地图',old_requests=len(pending))
             assert not report['errors'],report['errors']
-            assert not report['posts'],report['posts']
+            assert all(url.endswith('/preview') for url in report['posts']),report['posts']
             assert not report['websockets'],report['websockets']
-            passed('边界测试未写后端文件、未建WS、无JS错误')
+            passed('边界测试只请求只读预览、未保存文件、未建WS、无JS错误')
             report['ok']=True
         except Exception as error:
             report['ok']=False;report['error']=repr(error)

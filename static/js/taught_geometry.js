@@ -35,6 +35,16 @@ export function taughtLength(points = []){
   return length;
 }
 
+export function taughtProcessingSummary(processing){
+  if (!processing) return '';
+  const count = value => Number.isInteger(value) && value >= 0 ? value : '—';
+  const spline = processing.interpolation === 'cubic_spline';
+  const method = spline ? '三次样条生成' : '录制采样平滑';
+  const offset = processing.max_offset;
+  const adjustment = Number.isFinite(offset) && offset >= 0 ? offset === 0 ? `${spline ? '无需额外调整' : '无需调整'}（0 cm）` : `最大调整 ${(offset*100).toFixed(2)} cm` : '调整量未返回';
+  return `${method}：${count(processing.input_count)} → ${count(processing.output_count)} 点；${adjustment}；${count(processing.iterations)} 次迭代；完整足迹${processing.full_sweep_checked === true ? '已核验' : '未核验'}`;
+}
+
 export function rebuildTaughtPoints(points){
   const out = cleanTaughtPoints(points); let s = 0;
   for (let i=0;i<out.length;i++){

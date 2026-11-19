@@ -175,6 +175,7 @@ class TaughtWeb:
         self._taught_epoch = time.monotonic()
         self._taught_stood_seq = self.stood_seq
         self._taught_job = None
+        self._taught_prepare_owner = None
         self._taught_mutation = asyncio.Lock()
         self._taught_finish_busy = False
         self._taught_missing_since = None
@@ -231,7 +232,13 @@ class TaughtWeb:
         self._taught_stood_seq = self.stood_seq
         for check in self.taught_checks.values():
             # 准备本就会主动换图/启栈，不能把这次预期切换提前广播成“准备已失败”。
-            if self._taught_job and check.get('state') in ('preparing', 'loading', 'localizing'):
+            if self._taught_job and check.get('state') in (
+                'preparing',
+                'standing',
+                'settling',
+                'loading',
+                'localizing',
+            ):
                 check.update(ok=False)
             else:
                 check.update(state='failed', ok=False, message=reason)
@@ -323,6 +330,14 @@ class TaughtWeb:
         def row(key, label, ok, message):
             checks.append({'key': key, 'label': label, 'ok': bool(ok), 'message': message})
 
+        state, ready, _ = self.ctrl_get()
+        row(
+            'standing',
+            '站立就绪',
+            state == 'Velocity' and ready and self.ctrl_op is None,
+            '需站起并由策略接管；趴下或运控状态未知时，请重新准备采集',
+        )
+
         row(
             'stack',
             '导航与定位服务',
@@ -400,12 +415,80 @@ class TaughtWeb:
         self.taught_checks[name] = check
         return check, measurement
 
-    async def taught_prepare_job(self, name):
+    def require_taught_preparation(self, ws, *, standing=False):
+        """站起属于实际动作：异步阶段之间必须复核发起页，断开后不能继续后续动作。"""
+        client = self.clients.get(ws)
+        if (
+            self._taught_prepare_owner is not ws
+            or self.owner is not ws
+            or ws.closed
+            or not client
+            or time.monotonic() - client['last_ping'] > self.heartbeat
+        ):
+            raise TeachingError('准备页面已断开或控制权变化，准备已中断，请重新点击准备')
+        if self.estop:
+            raise TeachingError('急停中，示教准备已停止')
+        if standing:
+            state, ready, _ = self.ctrl_get()
+            if state != 'Velocity' or not ready or self.ctrl_op is not None:
+                raise TeachingError('站立状态尚未就绪或已被打断，请重新准备')
+
+    async def taught_prepare_job(self, name, ws):
         n = self.node
         try:
+            self.require_taught_preparation(ws)
             doc = await asyncio.to_thread(self.taught_repo.document, name)
-            if self.estop or n.nav_active() or self.route_running() or self.teleop is not None:
+            self.require_taught_preparation(ws)
+            if (
+                n.nav_active()
+                or self.route_running()
+                or self.teleop is not None
+                or self.prof('patrol') != 'stop'
+                or self.moving()
+            ):
                 raise TeachingError('先停止当前运动或导航任务，再准备采集')
+            self.taught_checks[name].update(
+                state='standing', message='正在确认站立；趴着时自动站起并等待策略就绪'
+            )
+            if n.is_armed():
+                await self.disarm_and_cancel('示教准备：先停止速度输出')
+            self.require_taught_preparation(ws)
+
+            def still_owned():
+                try:
+                    self.require_taught_preparation(ws)
+                except TeachingError:
+                    return False
+                return True
+
+            ok, text = await self.stand_up('示教采集准备', valid=still_owned)
+            if not ok:
+                raise TeachingError(text)
+            self.require_taught_preparation(ws, standing=True)
+            # 与现有自动定位相同，策略ready后再留2秒站稳；避免站起晃动进入LIO初始化。
+            self.taught_checks[name].update(
+                state='settling', message='已站起，正在等待站稳后加载地图并定位'
+            )
+            deadline = time.monotonic() + 15.0
+            quiet_since = max(self.ctrl.steady_t or time.monotonic(), self._taught_epoch)
+            while True:
+                self.require_taught_preparation(ws, standing=True)
+                now = time.monotonic()
+                steady = self.ctrl.steady_t
+                if self.moving():
+                    quiet_since = None
+                elif quiet_since is None:
+                    # 运动后重新开始连续静止计时，不能借用更早的策略ready时间跳过站稳等待。
+                    quiet_since = now
+                if (
+                    steady is not None
+                    and quiet_since is not None
+                    and now - max(quiet_since, steady) >= 2.0
+                ):
+                    break
+                if now > deadline:
+                    raise TeachingError('没有等到机器人站稳静止，请停稳后重新准备')
+                await asyncio.sleep(0.1)
             # 运行中已启用同功能时只换图；旧栈则重启导航组，使普通目标代理真正生效。
             self.taught_checks[name].update(
                 state='loading', message='正在启动导航服务并加载选定地图'
@@ -416,6 +499,7 @@ class TaughtWeb:
                     raise TeachingError(result[1])
                 deadline = time.monotonic() + 95.0
                 while self.busy or self.prof('navigation') == 'starting':
+                    self.require_taught_preparation(ws, standing=True)
                     if time.monotonic() > deadline:
                         raise TeachingError('导航服务启动超时，请查看运行日志')
                     await asyncio.sleep(0.2)
@@ -427,21 +511,26 @@ class TaughtWeb:
             await self.sync_taught_map(name, required=True)
             deadline = time.monotonic() + 10.0
             while n._taught_map_id != doc['map_id']:
+                self.require_taught_preparation(ws, standing=True)
                 if time.monotonic() > deadline:
                     raise TeachingError('选定地图尚未从/map到达，不能开始采集')
                 await asyncio.sleep(0.1)
             self._taught_stood_seq = self.stood_seq
+            self.require_taught_preparation(ws, standing=True)
             self.taught_checks[name].update(
                 state='localizing', message='保持静止，正在定位；失败后可手动修正位置并重做自检'
             )
             if self.autoloc_busy:
                 while self.autoloc_busy:
+                    self.require_taught_preparation(ws, standing=True)
                     await asyncio.sleep(0.2)
             if self.pose_set_t <= self._taught_epoch:
                 await self.auto_localize('示教采集准备', on_start=True)
+            self.require_taught_preparation(ws, standing=True)
             # 新initialpose之后至少等一帧新的scan，不将定位前缓存立即当作通过。
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
+                self.require_taught_preparation(ws, standing=True)
                 scan = n._taught_scan
                 amcl = n.amcl
                 if (
@@ -462,14 +551,29 @@ class TaughtWeb:
             }
             n.event('WARN', '示教准备未完成：' + str(exc))
         finally:
+            if self._taught_prepare_owner is ws:
+                self._taught_prepare_owner = None
             self._taught_job = None
             await self.taught_push()
 
     async def taught_owner_lost(self, owner, reason):
+        if owner is getattr(self, '_taught_prepare_owner', None):
+            self.cancel_taught_preparation(reason)
         if owner is not self.taught_owner:
             return
         self.taught_owner = None
         await self.taught_interrupt(reason)
+
+    def cancel_taught_preparation(self, reason):
+        if self._taught_job is None:
+            return False
+        self._taught_prepare_owner = None
+        if self.ctrl_op == 'up':
+            self.ctrl_abort = True
+        for check in self.taught_checks.values():
+            if check.get('state') in ('preparing', 'standing', 'settling', 'loading', 'localizing'):
+                check.update(state='failed', ok=False, message=reason)
+        return True
 
     async def taught_interrupt(self, reason):
         if self.taught_recording():
@@ -493,7 +597,9 @@ class TaughtWeb:
         try:
             async with self._taught_mutation:
                 await asyncio.to_thread(self.captures.finish, sid)
-            self.node.event('INFO', '示教校验保存完成，后续普通导航自动读取地图内参考')
+            self.node.event(
+                'INFO', '示教重采样、平滑优化和完整轮廓校验已完成，后续普通导航自动使用'
+            )
         except Exception as exc:
             self.node.event('WARN', '示教保存失败，草稿已保留：' + str(exc))
         finally:
@@ -546,7 +652,9 @@ class TaughtWeb:
                 'message': '准备加载地图并定位',
                 'checks': [],
             }
-            self._taught_job = asyncio.create_task(self.taught_prepare_job(name))
+            self.reserve_taught_owner(ws, name)
+            self._taught_prepare_owner = ws
+            self._taught_job = asyncio.create_task(self.taught_prepare_job(name, ws))
             self.pending.add(self._taught_job)
             self._taught_job.add_done_callback(self.pending.discard)
             return True, '正在准备，保持机器人静止', await self.taught_document(name)
@@ -611,7 +719,9 @@ class TaughtWeb:
                     self._taught_capture = await asyncio.to_thread(
                         self.captures.pause, sid, '正在校验保存'
                     )
-                self._taught_capture.update(state='processing', message='正在校验完整足迹并保存')
+                self._taught_capture.update(
+                    state='processing', message='正在重采样与平滑优化，随后校验完整轮廓并保存'
+                )
                 self._taught_finish_busy = True
                 self.map_busy = True
                 self.background(self.taught_finish_job(sid))
@@ -633,6 +743,9 @@ class TaughtWeb:
                 if self.taught_recording():
                     try:
                         measurement = self.node.taught_measurement()
+                        blocker = self.ctrl_blocker()
+                        if blocker:
+                            raise TeachingError('站立或运控状态失效：' + blocker)
                         # 行走时不要求静止，也不要求每个AMCL协方差消息都更新；新鲜scan仍须可信。
                         scan = self.node._taught_scan
                         amcl = self.node.amcl
@@ -703,6 +816,17 @@ class TaughtWeb:
                 )
             if request.method == 'POST':
                 data = await request.json()
+                if request.path.endswith('/preview'):
+                    preview = await asyncio.to_thread(
+                        self.taught_repo.preview,
+                        name,
+                        data.get('points'),
+                        expected_revision=data.get('expected_revision'),
+                        map_token=data.get('map_token'),
+                    )
+                    return web.json_response(
+                        {'ok': preview['executable'], 'msg': preview['message'], 'data': preview}
+                    )
                 if self.map_busy:
                     raise TeachingError('地图正在保存，请稍候')
                 self.map_busy = True
@@ -774,5 +898,6 @@ class TaughtWeb:
         )
         app.router.add_get('/api/taught/maps', self.taught_http)
         app.router.add_get('/api/taught/maps/{name}/grid', self.taught_http)
+        app.router.add_post('/api/taught/maps/{name}/preview', self.taught_http)
         app.router.add_get('/api/taught/maps/{name}', self.taught_http)
         app.router.add_post('/api/taught/maps/{name}', self.taught_http)

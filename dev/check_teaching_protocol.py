@@ -77,7 +77,7 @@ class Client:
         await asyncio.sleep(0.5)
 
 
-async def main(output, port):
+async def main(output, port, initial_posture='Velocity'):
     output.mkdir(parents=True, exist_ok=True)
     maps = output / 'maps'
     maps.mkdir(exist_ok=True)
@@ -102,6 +102,7 @@ async def main(output, port):
         GO2W_TAUGHT_ROUTE='false',
         GO2W_AUTO_LOCALIZE='0',
         GO2W_IDLE_LIE='0',
+        GO2W_FAKE_CTRL=initial_posture,
     )
     env['PYTHONPATH'] = os.pathsep.join(
         (str(ROOT / 'dev/fake_ros'), str(ROOT.parent / 'go2w/src/navigation/go2w_taught_route'))
@@ -151,6 +152,25 @@ async def main(output, port):
             assert initial['ok'], initial
             d = initial['data']
             assert d['revision'] == 0 and d['points'] == [], d
+            for _ in range(30):
+                if c.state:
+                    break
+                await asyncio.sleep(0.1)
+            assert c.state['ctrl']['state'] == initial_posture, c.state
+            # 编辑器后端预览是真实算法，但此时不能产生新地图修订或控制动作。
+            before_yaml = (maps / 'lab.yaml').read_bytes()
+            controls = [{'x': -1.0, 'y': 0.0}, {'x': 0.0, 'y': 1.0}, {'x': 1.0, 'y': 0.0}]
+            async with session.post(
+                url + '/api/taught/maps/lab/preview',
+                json={'expected_revision': 0, 'map_token': d['map_token'], 'points': controls},
+            ) as response:
+                preview = await response.json()
+                assert preview['ok'], preview
+                assert len(preview['data']['preview_points']) > len(controls)
+            assert (maps / 'lab.yaml').read_bytes() == before_yaml
+            evidence.append(
+                'real spline preview uses three sparse controls without publishing or moving'
+            )
             denied = await c.cmd(
                 'taught_start',
                 map='lab',
@@ -162,6 +182,8 @@ async def main(output, port):
             evidence.append('unknown localization blocks capture')
             prepared = await c.cmd('taught_prepare', map='lab')
             assert prepared['ok'], prepared
+            refused = await c.cmd('arm', on=True)
+            assert not refused['ok'], refused
             for _ in range(400):
                 prepared = (await c.cmd('taught_get', map='lab'))['data']
                 if prepared['check']['state'] in ('ready', 'failed'):
@@ -177,8 +199,9 @@ async def main(output, port):
                 await asyncio.sleep(0.1)
             assert c.state.get('armed') is False, c.state
             assert c.task.get('status') != 'active', c.task
+            assert c.state['ctrl']['state'] == 'Velocity' and c.state['ctrl']['ready'], c.state
             evidence.append(
-                'map prepare upgraded legacy navigation, loaded map and checked localization without automatic arm or goal'
+                f'{initial_posture} prepare stands if needed, settles, upgrades navigation and localizes without automatic arm or goal'
             )
             assert (await c.cmd('initial_pose', x=0.025, y=0.025, th=0.0))['ok']
             for _ in range(30):
@@ -218,6 +241,7 @@ async def main(output, port):
             env['GO2W_FAKE_START'] = f"{last['x']},{last['y']},{last['yaw']}"
             # 真机网页重启不会重启已准备好的导航；假ROS与网页同进程，重建同样的已启用状态。
             env['GO2W_TAUGHT_ROUTE'] = 'true'
+            env['GO2W_FAKE_CTRL'] = 'Velocity'
             start()
             await ready(session)
             c = await connect(session)
@@ -262,6 +286,9 @@ async def main(output, port):
                 and result['revision'] == 1
             ), result
             assert len({p['continuous_id'] for p in result['points']}) == 1, result
+            assert result['processing']['interpolation'] == 'recorded'
+            assert result['processing']['full_sweep_checked']
+            assert result['processing']['input_count'] >= count
             raw = maps / 'lab.taught/captures' / sid / 'samples.jsonl'
             raw_rows = [json.loads(row) for row in raw.read_text().splitlines()]
             assert len({p['continuous_id'] for p in raw_rows}) == 2
@@ -337,5 +364,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8840)
+    parser.add_argument('--initial-posture', choices=('Passive', 'Velocity'), default='Velocity')
     args = parser.parse_args()
-    asyncio.run(main(args.output.resolve(), args.port))
+    asyncio.run(main(args.output.resolve(), args.port, args.initial_posture))

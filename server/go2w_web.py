@@ -1402,6 +1402,11 @@ class Server(TaughtWeb):
         if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
+        # 先让准备凭据失效，再进入可能await的停车分支；同一页面取消也必须中断站起。
+        cancelled_preparation = False
+        if op in ('cancel', 'estop', 'lie_down') or (op == 'arm' and not d.get('on')):
+            cancelled_preparation = self.cancel_taught_preparation(
+                '用户停止了示教准备，请重新点击准备后继续')
         if op in ('goal', 'arm', 'cancel', 'estop'):
             self.owner = ws
         try:
@@ -1477,6 +1482,8 @@ class Server(TaughtWeb):
                 n.event('INFO', f"导航目标 ({d['x']:.2f}, {d['y']:.2f}, {math.degrees(d['th']):.0f}°)")
                 return True, '目标已下发' if n.is_armed() else '目标已下发，底盘上锁中，解锁后才会运动'
             if op == 'cancel':
+                if cancelled_preparation:
+                    return True, '已取消示教准备，不再继续后续站立或定位阶段'
                 await self.taught_interrupt('手动取消，示教草稿已保留')
                 self.motion_stops += 1
                 try:
@@ -1610,10 +1617,13 @@ class Server(TaughtWeb):
             return False   # 没有里程计（导航没开）：不知道，按静止算
         return abs(v[0]) > STILL_V or abs(v[1]) > STILL_V or abs(v[2]) > STILL_W
 
-    async def ctrl_switch(self, api, src, dst, timeout, need_ready=True):
+    async def ctrl_switch(self, api, src, dst, timeout, need_ready=True, valid=None):
         """在 src（元组）里时发 api（need_ready：还要等 src 的 ready），直到 dst 且 ready。返回 None 或失败原因。"""
         t0, sent = time.monotonic(), -1e9
         while True:
+            # 示教准备绑定发起页面；每次重发和判断完成前都复核，取消后不能进入下一站起阶段。
+            if valid is not None and not valid():
+                return '发起页面已断开、准备已取消或控制权变化，已停止后续站立动作'
             if self.ctrl_abort and api != R.API_STANDDOWN:
                 return '被「趴下」打断'
             s, ready, _ = self.ctrl_get()
@@ -1636,7 +1646,9 @@ class Server(TaughtWeb):
         self.node.event('INFO' if ok else 'ERROR', msg)
         return ok, msg
 
-    async def stand_up(self, who):
+    async def stand_up(self, who, *, valid=None):
+        if valid is not None and not valid():
+            return False, '准备已取消，未继续站起'
         if self.ctrl is None:
             return False, self.ctrl_blocker() or '运控接入已关闭（GO2W_CTRL=0）'
         if self.ctrl_op:
@@ -1659,7 +1671,7 @@ class Server(TaughtWeb):
             n = self.node
             if lying:
                 n.event('INFO', f'站起：Passive → FixStand（{who}）')
-                err = await self.ctrl_switch(R.API_STANDUP, ('Passive',), 'FixStand', CTRL_INTERP + CTRL_WAIT)
+                err = await self.ctrl_switch(R.API_STANDUP, ('Passive',), 'FixStand', CTRL_INTERP + CTRL_WAIT, valid=valid)
                 if err:
                     return self.ctrl_done(False, f'站起失败：{err}')
             if self.estop:
@@ -1669,7 +1681,7 @@ class Server(TaughtWeb):
                 n.event('INFO', '启动策略：FixStand → Velocity')
                 # FixStand 没站稳时运控也接受 1002，会在半站的姿态下切进策略：ctrl_switch 等 ready 才发
                 err = await self.ctrl_switch(R.API_BALANCESTAND, ('FixStand',), 'Velocity',
-                                             CTRL_WAIT + (0 if ready else CTRL_INTERP))
+                                             CTRL_WAIT + (0 if ready else CTRL_INTERP), valid=valid)
                 if err:
                     return self.ctrl_done(False, f'启动策略失败：{err}')
             if lying:

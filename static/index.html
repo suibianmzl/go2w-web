@@ -337,7 +337,8 @@
         <p class="hint" id="taughtMapHint"></p>
         <div class="taught-stats"><span>已保存<b id="taughtReference">--</b></span><span>本次采样<b id="taughtSamples">--</b></span></div>
         <div class="taught-legend"><span><i class="ref"></i>已保存参考</span><span><i class="live"></i>本次采样（断口不连线）</span></div>
-        <div class="btn-row taught-buttons"><button class="btn sm" id="taughtPrepare">加载地图并定位</button><button class="btn sm" id="taughtCheck">重新自检</button></div>
+        <div class="btn-row taught-buttons"><button class="btn sm" id="taughtPrepare">准备示教</button><button class="btn sm" id="taughtCheck">重新自检</button></div>
+        <p class="hint">趴着或站着均可准备：自动站起并站稳 → 加载地图 → 定位自检 → 可开始采集。</p>
         <div class="note" id="taughtCheckNote" role="status" aria-live="polite">先选择地图。</div>
         <ul class="taught-checks" id="taughtChecks"></ul>
         <div class="taught-section">
@@ -356,9 +357,10 @@
           <div class="taught-capture-head"><b id="taughtCaptureTitle">采集草稿</b><span class="mono" id="taughtCaptureId"></span></div>
           <p class="hint" id="taughtCaptureNote" role="status" aria-live="polite"></p>
           <div class="btn-row taught-buttons"><button class="btn sm" id="taughtTeleop">键盘遥控 (T)</button><button class="btn sm" id="taughtPause">暂停采集</button><button class="btn sm" id="taughtResume">自检后继续</button></div>
-          <div class="btn-row taught-buttons"><button class="btn sm pri" id="taughtFinish">结束并校验保存</button><button class="btn sm ghost" id="taughtAbandon">放弃本次草稿</button></div>
+          <div class="btn-row taught-buttons"><button class="btn sm pri" id="taughtFinish">结束并平滑保存</button><button class="btn sm ghost" id="taughtAbandon">放弃本次草稿</button></div>
           <a class="taught-link" id="taughtRecover" target="_blank" rel="noopener">在独立编辑器恢复草稿</a>
         </div>
+        <div class="note" id="taughtProcessing" hidden role="status" aria-live="polite"></div>
         <div class="note" id="taughtMessage" hidden role="status" aria-live="polite"></div>
         <a class="btn ghost taught-editor-link" id="taughtEditorLink" href="/taught-editor" target="_blank" rel="noopener">打开独立路线编辑器</a>
         <p class="hint">独立编辑器只读写保存的地图文件，可新建、拖点、插点、删点；不会切换机器人地图。</p>

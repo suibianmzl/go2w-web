@@ -1,16 +1,16 @@
 // 示教任务页：只请求后端采集状态，不把普通里程轨迹当作示教，也不在自检/准备阶段发速度。
 import { $, $$ } from './util.js';
-import { toast, confirmBox, formBox, stillCheck } from './ui.js';
-import { captureIsOpen, storeTaughtDocument, taughtStartBlocker } from './taught_geometry.js';
+import { toast, confirmBox, formBox } from './ui.js';
+import { captureIsOpen, storeTaughtDocument, taughtStartBlocker, taughtProcessingSummary } from './taught_geometry.js';
 
-const CAPTURE_STATE = {recording:'正在采集',paused:'已暂停',interrupted:'采集中断',processing:'校验保存中',finished:'已保存',failed:'校验未通过',abandoned:'草稿已放弃'};
-const CHECK_STATE = {idle:'尚未自检',preparing:'准备中',loading:'加载地图中',localizing:'定位中',ready:'自检通过',failed:'自检未通过'};
+const CAPTURE_STATE = {recording:'正在采集',paused:'已暂停',interrupted:'采集中断',processing:'平滑与校验中',finished:'已保存',failed:'校验未通过',abandoned:'草稿已放弃'};
+const CHECK_STATE = {idle:'尚未自检',preparing:'准备中',standing:'正在自动站起',settling:'等待站稳',loading:'加载地图中',localizing:'定位中',ready:'自检通过，可开始采集',failed:'自检未通过'};
 const MODES = {replace:'整条替换',append:'末尾追加',replace_segment:'替换选中区间'};
 const editorUrl = (map, capture) => `/taught-editor${map ? `?map=${encodeURIComponent(map)}${capture ? `&capture=${encodeURIComponent(capture)}` : ''}` : ''}`;
 
 export function setupTaught(store, src, setTool){
   const sel = $('#taughtMapSel'), mode = $('#taughtMode');
-  let mapsKey = '', rangeKey = '', checksKey = '', request = 0, busy = false, pickFirst = null, wasLinked = false;
+  let mapsKey = '', rangeKey = '', checksKey = '', request = 0, busy = false, finishing = false, pickFirst = null, wasLinked = false;
   const doc = () => store.taught?.map === store.taughtMap ? store.taught : null;
   const currentCapture = () => doc()?.capture;
   const range = () => ({start:Number($('#taughtRangeStart').value)-1,end:Number($('#taughtRangeEnd').value)-1});
@@ -19,7 +19,7 @@ export function setupTaught(store, src, setTool){
   async function command(name, arg){
     if (busy) return {ok:false,msg:'上一个示教操作尚未完成'};
     if (!src.can(name)) return {ok:false,msg:'当前数据源不支持示教操作'};
-    const map = store.taughtMap; busy = true; message(''); render();
+    const map = store.taughtMap; busy = true; finishing = name === 'taughtFinish'; message(''); render();
     try {
       const r = await Promise.resolve(src.cmd[name](arg));
       if (map !== store.taughtMap) return r;
@@ -28,7 +28,7 @@ export function setupTaught(store, src, setTool){
       else if (r?.msg) message(r.msg);
       return r;
     } catch (e){ const r = {ok:false,msg:e.message || '示教请求失败'}; message(r.msg,true); return r; }
-    finally { busy = false; render(); }
+    finally { busy = false; finishing = false; render(); }
   }
   async function load(map){
     if (!map) return;
@@ -67,9 +67,12 @@ export function setupTaught(store, src, setTool){
   };
   $('#taughtPrepare').onclick = () => {
     const map = store.taughtMap; if (!map || busy) return;
-    formBox({title:'准备示教采集',ok:'加载并定位',rows:[['地图',map]],
-      body:'将加载这张地图并启动定位与导航服务。确认机器人已站立静止；完成后还需明确开始采集、进入遥控。',
-      build:f => stillCheck(f),valid:f => f.querySelector('[data-still]').checked,
+    formBox({title:'准备示教采集',ok:'开始准备',rows:[['地图',map]],
+      body:'趴着或站着都可以准备。趴着时会自动站起，等待站稳后加载地图并定位；自检通过后可开始采集。之后请明确点击「开始采集」，再手动遥控走路线。',
+      build:f => {
+        const label = document.createElement('label'); label.className = 'modal-chk';
+        label.innerHTML = '<input type="checkbox" data-still><span>机器人周围已清空，允许自动站起；准备期间不碰机器人、不操作遥控</span>'; f.appendChild(label);
+      },valid:f => f.querySelector('[data-still]').checked,
       onOk:() => command('taughtPrepare',map)});
   };
   $('#taughtCheck').onclick = () => command('taughtCheck',store.taughtMap);
@@ -98,7 +101,7 @@ export function setupTaught(store, src, setTool){
   $('#taughtFinish').onclick = () => {
     const c = currentCapture(); if (!c?.session_id) return;
     stopTeleop();
-    confirmBox({title:'结束并保存示教',ok:'校验并保存',body:'停止采样，检查整条路线的足迹、连续性与地图版本。通过后更新这张地图唯一的参考轨迹；未通过会保留草稿。',onOk:() => command('taughtFinish',c.session_id)});
+    confirmBox({title:'结束并平滑保存',ok:'结束并平滑保存',body:'停止采样后自动加密并平滑路线，再检查完整机器人足迹、连续性与地图版本。通过后更新参考轨迹并显示处理结果；未通过会保留草稿。',onOk:() => command('taughtFinish',c.session_id)});
   };
   $('#taughtAbandon').onclick = () => {
     const c = currentCapture(); if (!c?.session_id) return;
@@ -135,12 +138,16 @@ export function setupTaught(store, src, setTool){
     const reconnected = store.link.ok && !wasLinked; wasLinked = store.link.ok;
     if (store.uiTask === 'taught' && reconnected && store.taughtMap){ const map = store.taughtMap; queueMicrotask(()=>load(map)); }
     const link = !!store.link.ok, ready = d?.check?.ok === true && d.check.state === 'ready';
-    const checkBusy = ['preparing','loading','localizing'].includes(d?.check?.state);
+    const checkBusy = ['preparing','standing','settling','loading','localizing'].includes(d?.check?.state);
     const stateText = !link && recording ? '连接中断，等待核对' : c && open ? CAPTURE_STATE[c.state] : d ? d.state === 'ready' ? '参考可用' : d.state === 'invalid' ? '参考无效' : '尚无轨迹' : '未读取';
     const pill = $('#taughtState'); pill.textContent = stateText; pill.dataset.s = !link || c?.state === 'failed' || d?.state === 'invalid' ? 'warn' : recording ? 'run' : ready ? 'ok' : '';
-    $('#taughtMapHint').textContent = !names.length ? '先在建图任务中保存地图，再回来采集。' : store.taughtMap !== store.mapCurrent ? `机器人当前使用 ${store.mapCurrent || '（未选图）'}；点击「加载地图并定位」后再采集。` : `中央地图：${store.mapCurrent}${store.source === 'mock' ? '（纯前端模拟）' : ''}`;
+    $('#taughtMapHint').textContent = !names.length ? '先在建图任务中保存地图，再回来采集。' : store.taughtMap !== store.mapCurrent ? `机器人当前使用 ${store.mapCurrent || '（未选图）'}；点击「准备示教」后再采集。` : `中央地图：${store.mapCurrent}${store.source === 'mock' ? '（纯前端模拟）' : ''}`;
     $('#taughtReference').textContent = d ? `${d.points?.length || 0} 点 / ${Number(d.length || 0).toFixed(2)} m` : '--';
     $('#taughtSamples').textContent = c ? `${c.sample_count ?? c.points?.length ?? 0} 点 / ${Number(c.length || 0).toFixed(2)} m` : '0 点 / 0.00 m';
+    const summary = taughtProcessingSummary(d?.processing), processingNote = $('#taughtProcessing');
+    processingNote.hidden = !finishing && !processing && !summary;
+    processingNote.textContent = finishing || processing ? '正在加密采样、平滑路线并检查完整机器人足迹，请等处理结果。' : summary ? `已保存参考的处理结果：${summary}` : '';
+    processingNote.setAttribute('aria-busy',String(finishing || processing));
     $('#taughtCheckNote').textContent = !link ? '连接断开。采样不会自动恢复；重连后读取状态并人工继续。' : d?.check?.message || CHECK_STATE[d?.check?.state || 'idle'];
     $('#taughtCheckNote').classList.toggle('warn',!link || d?.check?.state === 'failed');
     const checks = Array.isArray(d?.check?.checks) ? d.check.checks : [], ck = JSON.stringify(checks);

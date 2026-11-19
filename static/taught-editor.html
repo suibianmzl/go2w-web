@@ -26,8 +26,8 @@
           <div class="btn-row"><button class="btn" id="editorReload">重新读取</button><button class="btn" id="editorNew" disabled>新建轨迹</button></div>
         </section>
         <section class="te-section">
-          <div class="te-section-head"><h2>路线点</h2><span id="editorCount" class="mono">0 点</span></div>
-          <p class="hint">添加点绘制路线，或选择点后拖动。Shift + 点击可选连续区间。</p>
+          <div class="te-section-head"><h2>路线控制点</h2><span id="editorCount" class="mono">0 点</span></div>
+          <p class="hint">用少量控制点确定路线，系统生成平滑的三次样条并校验。拖点调整曲线，Shift + 点击选择区间。</p>
           <div class="te-tools" id="editorTools" role="group" aria-label="编辑工具">
             <button class="btn on" data-editor-tool="select" aria-pressed="true">选择 / 拖点</button><button class="btn" data-editor-tool="add" aria-pressed="false">绘制 / 加点</button><button class="btn" data-editor-tool="insert" aria-pressed="false">在段内插点</button><button class="btn" data-editor-tool="pan" aria-pressed="false">平移地图</button>
           </div>
@@ -40,13 +40,17 @@
             <div class="te-range"><label>区间起点<input id="editorRangeStart" type="number" min="1" step="1" value="1"></label><label>区间终点<input id="editorRangeEnd" type="number" min="1" step="1" value="1"></label><button class="btn" id="editorRangeSelect">选中区间</button></div>
             <div class="te-point-list" id="editorPoints" role="group" aria-label="附近路线点"></div>
             <div class="btn-row"><button class="btn" id="editorInsert">选中点后插入</button><button class="btn danger" id="editorDelete">删除选中点</button></div>
+            <button class="btn te-wide" id="editorJoinGaps" hidden>连接断口…</button>
           </div>
         </section>
         <section class="te-section te-save-section">
           <div class="te-section-head"><h2>保存参考</h2><strong id="editorDirty">未修改</strong></div>
-          <p class="hint">保存会检查完整机器人足迹、平滑与连续性。检查通过后更新地图的参考修订。</p>
+          <p class="hint">曲线预览与保存使用同一套样条生成和完整机器人足迹检查。当前预览通过后才能保存。</p>
+          <div class="note te-message" id="editorPreviewStatus" role="status" aria-live="polite">至少添加两个控制点后生成预览。</div>
+          <button class="btn ghost te-wide" id="editorPreviewRetry" hidden>重新生成预览</button>
           <button class="btn pri te-wide" id="editorSave" disabled>校验并保存</button>
           <button class="btn ghost te-wide" id="editorExport" disabled>导出当前草稿</button>
+          <div class="note te-message" id="editorProcessing" hidden></div>
           <div class="note te-message" id="editorMessage" role="status" aria-live="polite">选择地图后开始编辑。</div>
         </section>
       </aside>
@@ -54,7 +58,7 @@
         <canvas id="editorCanvas" tabindex="0" aria-label="路线画布。选择点后用方向键移动，Delete 删除，Ctrl 加 Z 撤销。"></canvas>
         <div class="te-stage-top"><div class="te-map-title"><b id="editorMapTitle">尚未选图</b><span id="editorSummary">无参考轨迹</span></div><div class="te-view-tools" role="group" aria-label="地图显示方向"><button class="btn" id="editorFit">适配全图</button><button class="btn" id="editorRotateLeft" aria-label="逆时针旋转显示 90 度">左转 90°</button><button class="btn" id="editorRotateRight" aria-label="顺时针旋转显示 90 度">右转 90°</button><button class="btn" id="editorRotateReset">方向复位</button></div></div>
         <div class="te-empty" id="editorEmpty"><b>加载一张已保存地图</b><span>没有示教轨迹时，可以直接绘制并保存。</span></div>
-        <div class="te-stage-bottom"><div><span id="editorToolHint">拖动平移 · 滚轮缩放</span><small id="editorCursor">x -- / y --</small></div><label><input type="checkbox" id="editorShowReference" checked>显示已保存参考（琥珀虚线）</label><span class="mono" id="editorAngle">显示 0°</span></div>
+        <div class="te-stage-bottom"><div><span id="editorToolHint">拖动平移 · 滚轮缩放</span><small id="editorCursor">x -- / y --</small><span class="te-route-legend"><span>圆点 / 灰虚线：控制点</span><span>青实线：样条预览</span><span>红实线：校验未通过</span></span></div><label><input type="checkbox" id="editorShowReference" checked>已保存参考（琥珀虚线）</label><span class="mono" id="editorAngle">显示 0°</span></div>
       </section>
     </div>
   </main>

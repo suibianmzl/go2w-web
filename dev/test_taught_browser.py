@@ -169,14 +169,15 @@ def main():
             saved=get_editor_doc();assert saved['revision'] > 0 and saved['executable']
             assert abs(saved['points'][0]['x']+2)<.05 and abs(saved['points'][0]['y']-1.1)<.05
             editor.reload(wait_until='networkidle')
-            expect(editor.locator('#editorCount')).to_have_text(f"{len(saved['points'])} 点")
+            saved_controls=saved.get('control_points',saved['points'])
+            expect(editor.locator('#editorCount')).to_have_text(f"{len(saved_controls)} 点")
             expect(editor.locator('#editorDirty')).to_have_text('未修改')
             passed('旋转90度后拖点保持世界坐标、真实校验保存与刷新恢复',revision=saved['revision'],points=len(saved['points']))
 
             other=browser.new_page(viewport={'width':1280,'height':900});monitor(other,'editor-other')
             other.goto(args.url+'/taught-editor?map=editor',wait_until='networkidle')
             change_y(editor,1,1.11)
-            change_y(other,len(saved['points']),1.05)
+            change_y(other,len(saved_controls),1.05)
             updated=save_editor(other);assert updated['ok'],updated
             conflict=save_editor(editor);assert conflict['ok'] is False,conflict
             expect(editor.locator('#editorDirty')).to_have_text('有未保存修改')

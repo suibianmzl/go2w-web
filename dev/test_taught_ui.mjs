@@ -46,10 +46,24 @@ assert.equal(el('taughtResume').hidden,true,'校验失败不开放继续采样')
 assert.equal(el('taughtResume').disabled,true,'can_resume=false 不可继续');
 assert.equal(el('taughtPrepare').disabled,true,'失败草稿不重新准备');
 for(const state of ['recording','processing','finished','abandoned']){render(state);assert.equal(el('taughtRecover').hidden,true,`${state} 不展示编辑恢复`);}
+for(const state of ['standing','settling']){
+  render(null,'one',state);
+  assert.equal(el('taughtPrepare').disabled,true,`${state} 阶段不可重复准备`);
+  assert.equal(el('taughtStart').disabled,true,`${state} 阶段不可开始采集`);
+  assert.match(el('taughtCheckNote').textContent,/站/,'站起与站稳阶段有可读提示');
+}
 render('paused','other');assert.equal(el('taughtPrepare').disabled,true,'不允许为另一张草稿地图准备');
 render('paused','one','preparing');assert.equal(el('taughtPrepare').disabled,true,'准备中不重复派发');
 render('interrupted');el('taughtPrepare').onclick();
-await globalThis.taughtForms.pop().onOk();
-assert.deepEqual(calls,[['prepare','one']],'准备只请求加载定位，不自动站起或解锁');
+const prepare = globalThis.taughtForms.pop();
+assert.match(prepare.body,/趴/,'准备说明允许初始趴姿');
+assert.match(prepare.body,/自动站起/,'准备说明实际的站起动作');
+assert.doesNotMatch(prepare.body,/已站立/,'准备不要求用户已经站立');
+await prepare.onOk();
+assert.deepEqual(calls,[['prepare','one']],'站起由后端准备流程处理，前端只派发一次准备请求');
 assert.equal(el('taughtStart').disabled,true,'没有后端自检通过仍不可新采集');
-console.log('PASS 暂停/中断同图准备、保留草稿锁与禁止自动站起解锁');
+render('processing');assert.match(el('taughtProcessing').textContent,/平滑/,'结束处理阶段明确显示平滑步骤');
+render('finished');store.taught.processing={input_count:3,output_count:81,interpolation:'recorded',max_offset:0,iterations:0,full_sweep_checked:true};panel.render();
+assert.match(el('taughtProcessing').textContent,/3.*81/,'完成后显示真实输入与输出点数');
+assert.match(el('taughtProcessing').textContent,/无需调整/,'零偏移不宣称改善');
+console.log('PASS 站起与站稳门槛、准备文案、草稿锁与真实平滑结果');

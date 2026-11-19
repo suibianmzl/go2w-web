@@ -181,6 +181,8 @@ class TaughtWebTests(unittest.IsolatedAsyncioTestCase):
         host.prof = lambda mode: 'run' if mode == 'navigation' else 'stop'
         host.route_running = lambda: False
         host.taught_repo = NS(document=lambda _: {'map': 'lab', 'map_id': 'map1'})
+        host.ctrl_get = lambda: ('Velocity', True, 1)
+        host.ctrl_op = None
         check, measurement = await host.taught_self_check('lab')
         self.assertFalse(check['ok'])
         self.assertTrue(
@@ -213,6 +215,8 @@ class TaughtWebTests(unittest.IsolatedAsyncioTestCase):
         host.prof = lambda mode: 'run'
         host.route_running = lambda: False
         host.taught_repo = NS(document=lambda _: {'map_id': 'map1'})
+        host.ctrl_get = lambda: ('Velocity', True, 1)
+        host.ctrl_op = None
         check, _ = await host.taught_self_check('lab')
         self.assertFalse(check['ok'])
 

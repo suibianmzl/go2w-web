@@ -3,7 +3,7 @@
 import { $, $$, clamp, gridToCanvas } from './util.js';
 import { confirmBox } from './ui.js';
 import { cleanTaughtPoints, rebuildTaughtPoints, continuousRuns, taughtLength, createTaughtHistory,
-  taughtWorldToScreen, taughtScreenToWorld, taughtInMap, readTaughtGridFrame } from './taught_geometry.js';
+  taughtWorldToScreen, taughtScreenToWorld, taughtInMap, readTaughtGridFrame, taughtProcessingSummary } from './taught_geometry.js';
 
 const params = new URLSearchParams(location.search), initialMap = params.get('map'), recoveryId = params.get('capture');
 const cv = $('#editorCanvas'), ctx = cv.getContext('2d'), stage = $('#editorStage'), mapSel = $('#editorMap');
@@ -11,11 +11,14 @@ const history = createTaughtHistory();
 const view = {cx:0,cy:0,s:40};
 let mapName = '', doc = null, asset = null, points = [], selected = new Set(), anchor = null, tool = 'select';
 let baseline = '[]', angle = 0, loading = false, saving = false, version = 0, abort = null, drag = null;
+let previewPoints = [], previewProcessing = null, previewState = 'empty', previewError = '', previewKey = '';
+let previewVersion = 0, previewAbort = null, previewTimer = null;
 let W = 1, H = 1, DPR = 1, frame = false, pointListKey = '';
 const names = [];
 const dirty = () => JSON.stringify(points) !== baseline;
 const current = () => selected.size ? selected.values().next().value : -1;
 const canEdit = () => !!asset && !!doc && !loading && !saving;
+const previewReady = () => previewState === 'ready' && previewKey === JSON.stringify(points);
 const apiPath = name => `/api/taught/maps/${encodeURIComponent(name)}`;
 const screen = p => taughtWorldToScreen(p,W,H,view,angle);
 const world = (x,y) => taughtScreenToWorld(x,y,W,H,view,angle);
@@ -45,7 +48,43 @@ function validateDoc(value, expectedMap){
   if (value.map !== expectedMap) throw new Error('返回的地图与选择不符，请重新读取');
   if (!Number.isInteger(value.revision) || value.revision < 0 || typeof value.map_token !== 'string' || !value.map_token) throw new Error('地图版本信息缺失，无法安全保存');
   cleanTaughtPoints(value.points);
+  cleanTaughtPoints(value.control_points ?? value.points);
   return value;
+}
+
+function clearPreview(){
+  clearTimeout(previewTimer); previewAbort?.abort(); ++previewVersion;
+  previewPoints = []; previewProcessing = null; previewKey = ''; previewError = ''; previewState = 'empty';
+}
+function schedulePreview(delay = 180){
+  clearPreview();
+  if (!doc || !asset || points.length < 2) return;
+  previewState = 'waiting';
+  const seq = previewVersion;
+  previewTimer = setTimeout(()=>requestPreview(seq),delay);
+}
+async function requestPreview(seq){
+  if (seq !== previewVersion || !doc || !asset) return;
+  const name = mapName, mapVersion = version, revision = doc.revision, token = doc.map_token;
+  const snapshot = cleanTaughtPoints(points), key = JSON.stringify(snapshot), controller = new AbortController();
+  previewAbort = controller; previewState = 'loading'; render();
+  const timeout = setTimeout(()=>controller.abort(),125000);
+  const stale = () => seq !== previewVersion || mapVersion !== version || name !== mapName || key !== JSON.stringify(points);
+  try {
+    const result = await fetch(apiPath(name)+'/preview',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,
+      body:JSON.stringify({expected_revision:revision,map_token:token,points:snapshot})}).then(jsonResponse);
+    if (stale()) return;
+    const value = result?.data;
+    if (value){
+      if (value.map !== name || value.revision !== revision || value.map_token !== token) throw new Error('预览的地图版本不符，请重新读取后重试');
+      previewPoints = cleanTaughtPoints(value.preview_points ?? []); previewProcessing = value.processing;
+    }
+    if (result?.ok !== true || value?.executable !== true || previewPoints.length < 2) throw new Error(result?.msg || '曲线未通过完整路线校验，请调整控制点');
+    previewState = 'ready'; previewKey = key;
+  } catch(e){
+    if (stale()) return;
+    previewState = 'error'; previewError = e.name === 'AbortError' ? '样条预览超时，请重试；控制点和撤销记录已保留' : e.message || '样条预览失败，请重试';
+  } finally { clearTimeout(timeout); if (!stale()) render(); }
 }
 function askDiscard(next){
   if (!dirty()) return next();
@@ -55,6 +94,7 @@ function askDiscard(next){
 async function loadMap(name, {recover = false} = {}){
   if (!name || saving) return;
   abort?.abort(); abort = new AbortController(); const seq = ++version;
+  clearPreview();
   loading = true; mapName = name; mapSel.value = name; doc = null; asset = null;
   points = history.reset([]); baseline = '[]'; selected.clear(); anchor = null; drag = null; angle = 0;
   message('正在读取地图与参考轨迹…'); render();
@@ -67,11 +107,11 @@ async function loadMap(name, {recover = false} = {}){
     ]);
     if (seq !== version) return;
     doc = validateDoc(value,name); asset = grid;
-    points = history.reset(doc.points); baseline = JSON.stringify(points);
+    points = history.reset(doc.control_points ?? doc.points); baseline = JSON.stringify(points);
     if (recover && Array.isArray(value.draft_points) && value.draft_points.length){
       points = history.commit(cleanTaughtPoints(value.draft_points));
       message(`已恢复 ${points.length} 个草稿点。编辑完成后需重新校验保存，已保存参考仍保留。`);
-    } else message(points.length ? '参考轨迹已读取。选择点即可拖动，或填写坐标。' : '这张地图尚无示教轨迹。选择「绘制 / 加点」，沿可通行区域点出路线。');
+    } else message(points.length ? '参考与控制点已读取。拖动控制点后自动生成样条预览，校验通过即可保存。' : '这张地图尚无示教轨迹。选择「绘制 / 加点」，沿可通行区域点出控制点。');
     selected = points.length ? new Set([0]) : new Set(); anchor = points.length ? 0 : null;
     tool = points.length ? 'select' : 'add'; fit();
     const url = new URL(location.href); url.searchParams.set('map',name);
@@ -80,7 +120,7 @@ async function loadMap(name, {recover = false} = {}){
   } catch(e){
     if (seq !== version || e.name === 'AbortError') return;
     doc = null; asset = null; message(e.message || '地图读取失败','error');
-  } finally { if (seq === version){ loading = false; render(); } }
+  } finally { if (seq === version){ loading = false; schedulePreview(); render(); } }
 }
 
 function resize(){
@@ -119,7 +159,8 @@ function draw(){
   ctx.save(); ctx.translate(origin.x,origin.y); ctx.rotate(-(g.oyaw+angle)); ctx.imageSmoothingEnabled = false;
   ctx.drawImage(g.img,0,-g.h*g.res*view.s,g.w*g.res*view.s,g.h*g.res*view.s); ctx.restore();
   if ($('#editorShowReference').checked) drawRoute(doc.points,'#f3b13f',[7,5],2);
-  drawRoute(points,'#38e1dc',[],2.7);
+  drawRoute(points,'#7c95a8',[3,5],1.1);
+  if (previewPoints.length) drawRoute(previewPoints,previewState === 'error' ? '#f06782' : '#38e1dc',[],2.7);
   const step = points.length > 1600 ? Math.ceil(points.length/1600) : 1;
   for (let i=0;i<points.length;i++){
     const isSelected = selected.has(i); if (i%step && !isSelected && i !== points.length-1) continue;
@@ -142,7 +183,7 @@ function commit(next, selection = selected){
   points = history.commit(rebuildTaughtPoints(next));
   selected = new Set([...selection].filter(i=>i >= 0 && i < points.length));
   if (!selected.size && points.length) selected.add(Math.min(Math.max(0,anchor || 0),points.length-1));
-  anchor = current() < 0 ? null : current(); render();
+  anchor = current() < 0 ? null : current(); schedulePreview(); render();
 }
 function changeTool(value){ tool = value; render(); cv.focus({preventScroll:true}); }
 function insertAt(index, point){
@@ -161,11 +202,21 @@ function nearestPoint(px,py){
   return index;
 }
 function nearestSegment(px,py){
-  let index = -1, distance = 22;
+  if (!previewReady()) return -1;
+  // 先命中稠密曲线，再找同一连续段的控制点区间；插入位置按控制点顺序，不按采样点数。
+  let nearest = null, curveDistance = 22;
+  for (let i=0;i<previewPoints.length-1;i++){
+    const p=previewPoints[i],q=previewPoints[i+1]; if(p.continuous_id !== q.continuous_id)continue;
+    const a=screen(p),b=screen(q),dx=b.x-a.x,dy=b.y-a.y;
+    const t=clamp(((px-a.x)*dx+(py-a.y)*dy)/(dx*dx+dy*dy || 1),0,1),d=Math.hypot(px-a.x-t*dx,py-a.y-t*dy);
+    if(d<curveDistance){curveDistance=d;nearest={x:a.x+t*dx,y:a.y+t*dy,continuous_id:p.continuous_id};}
+  }
+  if (!nearest) return -1;
+  let index = -1, distance = Infinity;
   for (let i=0;i<points.length-1;i++){
-    if (points[i].continuous_id !== points[i+1].continuous_id) continue;
+    if (points[i].continuous_id !== points[i+1].continuous_id || points[i].continuous_id !== nearest.continuous_id) continue;
     const a = screen(points[i]), b = screen(points[i+1]), dx = b.x-a.x, dy = b.y-a.y;
-    const t = clamp(((px-a.x)*dx+(py-a.y)*dy)/(dx*dx+dy*dy || 1),0,1), d = Math.hypot(px-a.x-t*dx,py-a.y-t*dy);
+    const t = clamp(((nearest.x-a.x)*dx+(nearest.y-a.y)*dy)/(dx*dx+dy*dy || 1),0,1), d = Math.hypot(nearest.x-a.x-t*dx,nearest.y-a.y-t*dy);
     if (d < distance){distance=d;index=i;}
   }
   return index;
@@ -183,13 +234,23 @@ function render(){
   $('#editorNew').disabled = !active;
   $('#editorMeta').textContent = asset && doc ? `${asset.w} × ${asset.h} · ${Number(asset.res.toPrecision(6))} m / 格 · 修订 ${doc.revision}` : loading ? '正在读取…' : '底图尚未加载';
   $('#editorMapTitle').textContent = mapName || '尚未选图';
-  $('#editorSummary').textContent = asset ? `${points.length} 点 / ${taughtLength(points).toFixed(2)} m${selected.size ? ` · 选中 ${selected.size} 点` : ''}` : loading ? '正在读取地图…' : '无参考轨迹';
+  const previewLabel = {empty:'等待控制点',waiting:'生成曲线中',loading:'校验曲线中',ready:'预览通过',error:'预览未通过'}[previewState];
+  $('#editorSummary').textContent = asset ? `${points.length} 控制点 · ${previewLabel}${previewPoints.length ? ` / ${previewPoints.length} 曲线点 / ${taughtLength(previewPoints).toFixed(2)} m` : ''}${selected.size ? ` · 选中 ${selected.size} 点` : ''}` : loading ? '正在读取地图…' : '无参考轨迹';
+  $('#editorSummary').dataset.s = previewState === 'error' ? 'error' : '';
   $('#editorCount').textContent = `${points.length} 点`;
   $('#editorDirty').textContent = changed ? '有未保存修改' : '未修改'; $('#editorDirty').dataset.dirty = String(changed);
   $('#editorUndo').disabled = !active || !history.canUndo; $('#editorRedo').disabled = !active || !history.canRedo;
-  $('#editorSave').disabled = !active || !changed || points.length < 2;
+  $('#editorSave').disabled = !active || !changed || points.length < 2 || !previewReady();
   $('#editorSave').textContent = saving ? '正在校验保存…' : doc?.revision ? '校验并保存修订' : '校验并创建参考';
   $('#editorExport').disabled = !points.length || loading;
+  const pending = ['waiting','loading'].includes(previewState), previewStatus = $('#editorPreviewStatus');
+  previewStatus.textContent = pending ? '正在生成三次样条并校验完整足迹…' : previewState === 'ready' ? `预览通过。${taughtProcessingSummary(previewProcessing)}` : previewState === 'error' ? `${previewError}。当前控制点与撤销记录已保留。` : '至少添加两个控制点后生成预览。虚线只表示控制点顺序。';
+  previewStatus.dataset.s = previewState === 'error' ? 'error' : previewState === 'ready' ? 'ok' : '';
+  previewStatus.setAttribute('aria-busy',String(pending));
+  $('#editorPreviewRetry').hidden = previewState !== 'error'; $('#editorPreviewRetry').disabled = !active;
+  $('#editorJoinGaps').hidden = continuousRuns(points).length < 2; $('#editorJoinGaps').disabled = !active;
+  const processing = taughtProcessingSummary(doc?.processing);
+  $('#editorProcessing').hidden = !processing; $('#editorProcessing').textContent = processing ? `已保存参考：${processing}` : '';
   for (const id of ['editorIndex','editorX','editorY','editorApply','editorDelete']) $('#'+id).disabled = !active || !p;
   $('#editorPrev').disabled = !active || index <= 0; $('#editorNext').disabled = !active || index < 0 || index >= points.length-1;
   $('#editorInsert').disabled = !active || !p || !points[index+1] || p.continuous_id !== points[index+1].continuous_id;
@@ -201,7 +262,7 @@ function render(){
   $$('#editorTools [data-editor-tool]').forEach(b=>{ b.disabled = !active; b.classList.toggle('on',b.dataset.editorTool === tool); b.setAttribute('aria-pressed',String(b.dataset.editorTool === tool)); });
   for (const id of ['editorFit','editorRotateLeft','editorRotateRight','editorRotateReset']) $('#'+id).disabled = !asset || loading;
   $('#editorAngle').textContent = `显示 ${Math.round(angle*180/Math.PI)}°`;
-  const hints = {select:'点击选点并拖动 · Shift + 点击选择区间 · 方向键移动选中点',add:'在地图上依次点击绘制 · 新点接在路线末尾',insert:'点击已有连续线段附近插入点',pan:'拖动平移地图 · 滚轮缩放'};
+  const hints = {select:'点击控制点并拖动 · Shift + 点击选择区间 · 方向键移动',add:'依次点击添加控制点 · 自动生成样条预览',insert:'在有效预览曲线附近插点，按相邻控制点顺序加入',pan:'拖动平移地图 · 滚轮缩放'};
   $('#editorToolHint').textContent = hints[tool]; cv.style.cursor = tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair';
   const empty = $('#editorEmpty'); empty.hidden = !!asset && !!points.length;
   empty.querySelector('b').textContent = loading ? '正在读取地图' : asset ? '在地图上绘制一条路线' : '加载一张已保存地图';
@@ -226,8 +287,8 @@ $('#editorNew').onclick = () => {
   confirmBox({title:'绘制一条新轨迹？',ok:'开始绘制',body:'清空当前编辑点，从头绘制。原参考文件保留，只有校验保存通过后才会更新；本次清空也可以撤销。',onOk:go});
 };
 $$('#editorTools [data-editor-tool]').forEach(b=>b.onclick=()=>changeTool(b.dataset.editorTool));
-function undo(){ if (!canEdit()) return; points=history.undo(); selected=points.length ? new Set([Math.min(Math.max(0,current()),points.length-1)]) : new Set(); anchor=current(); render(); }
-function redo(){ if (!canEdit()) return; points=history.redo(); selected=points.length ? new Set([Math.min(Math.max(0,current()),points.length-1)]) : new Set(); anchor=current(); render(); }
+function undo(){ if (!canEdit()) return; points=history.undo(); selected=points.length ? new Set([Math.min(Math.max(0,current()),points.length-1)]) : new Set(); anchor=current(); schedulePreview(); render(); }
+function redo(){ if (!canEdit()) return; points=history.redo(); selected=points.length ? new Set([Math.min(Math.max(0,current()),points.length-1)]) : new Set(); anchor=current(); schedulePreview(); render(); }
 $('#editorUndo').onclick = undo; $('#editorRedo').onclick = redo;
 $('#editorPrev').onclick = () => choose(current()-1); $('#editorNext').onclick = () => choose(current()+1);
 $('#editorIndex').onchange = e => choose(Number(e.target.value)-1);
@@ -249,6 +310,13 @@ $('#editorInsert').onclick = () => {
   insertAt(i,{x:(a.x+b.x)/2,y:(a.y+b.y)/2});
 };
 $('#editorDelete').onclick = deleteSelected;
+$('#editorPreviewRetry').onclick = () => { if (canEdit()){ schedulePreview(0); render(); } };
+$('#editorJoinGaps').onclick = () => {
+  if (!canEdit() || continuousRuns(points).length < 2) return;
+  confirmBox({title:'按控制点顺序连接全部断口？',ok:'连接断口并预览',danger:true,
+    body:'这会把各段控制点连成一条路线，断口之间也会生成样条。只在确认这些区域可以通行时连接；随后仍须通过完整足迹预览校验。此操作可以撤销。',
+    onOk:() => { if (canEdit()) commit(points.map(p=>({...p,continuous_id:0}))); }});
+};
 $('#editorFit').onclick = fit; $('#editorRotateLeft').onclick = () => setAngle(angle+Math.PI/2);
 $('#editorRotateRight').onclick = () => setAngle(angle-Math.PI/2); $('#editorRotateReset').onclick = () => setAngle(0);
 $('#editorShowReference').onchange = queueDraw;
@@ -258,9 +326,9 @@ $('#editorExport').onclick = () => {
   link.href=url;link.download=`${mapName || 'taught'}-draft.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
 $('#editorSave').onclick = async () => {
-  if (!canEdit() || !dirty() || points.length < 2) return;
+  if (!canEdit() || !dirty() || points.length < 2 || !previewReady()) return;
   const name = mapName, seq = version, snapshot = cleanTaughtPoints(points), controller = new AbortController();
-  const timer = setTimeout(()=>controller.abort(),125000); saving=true;message('正在校验完整路线，期间请保留此页…');render();
+  const timer = setTimeout(()=>controller.abort(),125000); saving=true;message('正在生成样条并校验完整路线，期间请保留此页…');render();
   try {
     const r = await fetch(apiPath(name),{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,
       body:JSON.stringify({expected_revision:doc.revision,map_token:doc.map_token,points:snapshot})}).then(jsonResponse);
@@ -268,10 +336,11 @@ $('#editorSave').onclick = async () => {
     // 版本冲突、碰撞或服务异常均不得重置 history/baseline，用户草稿和撤销链原样保留。
     if (r?.ok !== true) return message(`${r?.msg || '保存未通过'}。当前草稿已保留；可继续修改、导出，或核对最新版本后重新读取。`,'error');
     const updated = validateDoc(r.data,name);
-    doc=updated;points=history.reset(updated.points);baseline=JSON.stringify(points);
+    doc=updated;points=history.reset(updated.control_points ?? updated.points);baseline=JSON.stringify(points);
+    clearPreview(); previewPoints=cleanTaughtPoints(updated.points);previewProcessing=updated.processing;previewState='ready';previewKey=baseline;
     selected=points.length ? new Set([0]) : new Set();anchor=current();
     const url=new URL(location.href);url.searchParams.delete('capture');window.history.replaceState(null,'',url);
-    message(`已保存 ${name} 的参考轨迹（修订 ${doc.revision}，${points.length} 点 / ${Number(doc.length || taughtLength(points)).toFixed(2)} m）。`,'ok');
+    message(`已保存 ${name} 的参考轨迹（修订 ${doc.revision}，${points.length} 控制点 → ${doc.points.length} 参考点 / ${Number(doc.length || taughtLength(doc.points)).toFixed(2)} m）。`,'ok');
   } catch(e){message(`${e.name === 'AbortError' ? '等待保存结果超时，请重新读取核对实际版本' : e.message || '保存失败'}。当前草稿已保留。`,'error');}
   finally{clearTimeout(timer);saving=false;render();}
 };
@@ -288,7 +357,7 @@ cv.addEventListener('pointerdown',e=>{
     insertAt(points.length-1,at);return;
   }
   if (tool === 'insert'){
-    const i=nearestSegment(p.x,p.y);if(i<0)return message('请点击已有连续线段附近；断口处不能插入伪造连接。','error');
+    const i=nearestSegment(p.x,p.y);if(i<0)return message('请等预览通过后点击连续曲线附近；断口处不能插入伪造连接。','error');
     if(!taughtInMap(at,asset))return;insertAt(i,at);return;
   }
   const i=nearestPoint(p.x,p.y);
@@ -305,11 +374,11 @@ cv.addEventListener('pointermove',e=>{
     view.cx=drag.cx-c*dx-s*dy;view.cy=drag.cy+s*dx-c*dy;queueDraw();return;
   }
   const next=translated(drag.before,drag.indices,at.x-drag.start.x,at.y-drag.start.y);
-  if(next){points=next;drag.moved=true;queueDraw();}
+  if(next){points=next;drag.moved=true;schedulePreview();render();}
 });
 function endDrag(cancel = false){
   if(!drag)return;const d=drag;drag=null;
-  if(d.kind==='point'){if(cancel)points=d.before;else if(d.moved)points=history.commit(rebuildTaughtPoints(points));}
+  if(d.kind==='point'){if(cancel)points=d.before;else if(d.moved)points=history.commit(rebuildTaughtPoints(points));schedulePreview();}
   render();
 }
 cv.addEventListener('pointerup',()=>endDrag());cv.addEventListener('pointercancel',()=>endDrag(true));
