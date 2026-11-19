@@ -28,6 +28,7 @@ slam_toolbox 的 `START_AT_GIVEN_POSE` 有个要命的性质：位姿给错**不
 所以 settle() 对三级结果一视同仁地检查「在不在图里」。
 """
 import math
+import numpy as np
 
 # 和 globloc.py 一致的门限：那里已经在 11-10 用两段实录 bag 评估过
 GLOBLOC_MIN_SCORE = 0.75
@@ -103,6 +104,41 @@ def accept_globloc(result):
     return pose, ''
 
 
+def location_diagnostics(result):
+    if not result or 'score' not in result:
+        return {}
+    candidates = [{'pose': [result['x'], result['y'], result['th']], 'score': result['score']}]
+    if result.get('second_pose') is not None:
+        candidates.append({'pose': result['second_pose'], 'score': result['second']})
+    return {'score': result['score'], 'ratio': result['ratio'], 'candidates': candidates}
+
+
+def matches_loaded_grid(reference, loaded):
+    """Check that the new /map still contains the old geometry in both directions."""
+    grid, res, ox, oy = loaded
+    if not math.isclose(res, reference['res'], abs_tol=1e-6) or abs(reference['oyaw']) > 1e-6:
+        return False
+    ref = reference['grid']
+    dx = round((reference['ox'] - ox) / res)
+    dy = round((reference['oy'] - oy) / res)
+
+    def fraction(src, dst, x, y):
+        rows, cols = np.nonzero(src >= 65)
+        if not len(rows):
+            return 0.0
+        rows, cols = rows + y, cols + x
+        h, w = dst.shape
+        matched = np.zeros(len(rows), dtype=bool)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                r, c = rows + dr, cols + dc
+                inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+                matched[inside] |= dst[r[inside], c[inside]] >= 65
+        return matched.mean()
+
+    return fraction(ref, grid, dx, dy) >= 0.85 and fraction(grid, ref, -dx, -dy) >= 0.85
+
+
 def settle(parking, robot_pose, globloc, manual=None, force=None):
     """按三级顺序定起点位姿，返回 dict：
 
@@ -112,18 +148,19 @@ def settle(parking, robot_pose, globloc, manual=None, force=None):
         tried   每一级为什么没用（诊断用）
         warn    需要显式告警的话（手动级一定有）
 
-    force='manual' 时跳过前两级——人明确说了「我说的才算」。
+    调用方指定 force 时只检查该来源。
     """
     tried, warn = [], ''
-    if force not in (None, 'manual'):
-        raise ValueError('force 只能是 manual')
-    if force is None:
+    if force is not None and force not in SOURCE_LEVEL:
+        raise ValueError('未知的续建起点来源')
+    if force in (None, 'parking'):
         pose, why = choose_parking(parking, robot_pose)
         if pose is not None:
             return {'source': 'parking', 'pose': pose,
                     'note': parking_note(parking, robot_pose),
                     'tried': tried, 'warn': ''}
         tried.append(('parking', why))
+    if force in (None, 'globloc'):
         pose, why = accept_globloc(globloc)
         if pose is not None:
             return {'source': 'globloc', 'pose': pose,
@@ -131,6 +168,8 @@ def settle(parking, robot_pose, globloc, manual=None, force=None):
                             f"（分数 {float(globloc['score']):.2f}）",
                     'tried': tried, 'warn': ''}
         tried.append(('globloc', why))
+    if force in ('parking', 'globloc'):
+        return {'source': None, 'pose': None, 'note': why, 'tried': tried, 'warn': ''}
     if not (isinstance(manual, (list, tuple)) and len(manual) == 3):
         return {'source': None, 'pose': None,
                 'note': '前两级都不可信，而且没有手动给位姿',
@@ -139,7 +178,7 @@ def settle(parking, robot_pose, globloc, manual=None, force=None):
     return {'source': 'manual', 'pose': pose,
             'note': f'手动位姿 {pose[0]:.2f}, {pose[1]:.2f}, {math.degrees(pose[2]):.0f}°',
             'tried': tried,
-            'warn': '起点位姿是手动给的：这一级没有自动校验，开走后务必看自检结果'}
+            'warn': '手动指定了起点，开始采集前会自动自检'}
 
 
 def in_coverage(base, pose):

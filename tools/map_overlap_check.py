@@ -83,6 +83,13 @@ from map_to_png import read_pgm
 # ---- 判据 ----
 MIN_POINTS = 120
 MIN_FIT = 0.85
+# A scan can see furniture and space that was never mapped. Require both
+# agreement on the known part and enough old-wall evidence in the full scan.
+MIN_KNOWN_FIT = 0.65
+MIN_WALL_POINTS = 60
+MIN_WALL_COVERAGE = 0.35
+VERIFIED_SHIFT = 0.15
+VERIFIED_YAW = 4.0
 # MAX_DX 不是「我们希望多准」，而是「slam_toolbox 自己能不能纠回来」：
 # 加载 posegraph 后第一帧 scan 要和图里已有节点做匹配，搜索窗由
 # correlation_search_space_dimension: 0.5（m）决定。窗口内的偏差会自己吸附，
@@ -90,7 +97,6 @@ MIN_FIT = 0.85
 MAX_DX = 0.40        # m
 MAX_DYAW = 8.0       # °，粗角搜索 coarse_search_angle_offset: 0.349 rad = 20°，取一半
 MATCH_TOL = 0.10     # m，比网页 live 匹配率的 0.15 紧一档
-MAX_SEARCH_XY = 0.60  # m，报给用户的修正量上限（真偏差更大时会被截断，并有提示）
 WIDE_SEARCH_XY = 1.50  # m，粗搜范围。要比容差大一档，才能分清「偏多了」和「图用错了」
 SEARCH_STEP = 0.05    # m
 # 必须大于 MAX_DYAW：搜索上限够不到门限的话，角度偏差再大也报不成「起点位姿错了」，
@@ -154,6 +160,10 @@ class BaseMap:
         机器人转 dyaw 时转的是它自己。绕原点转的话，离原点 11.7 m 的机器人转 5° 等于被平移约 1 m，
         真实 5°、零平移的偏差会被报成「偏了 0.85 m」（11-17 在 lab_20261116 上实测踩到）。
         """
+        hits, known, _inside = self.evidence(x, y, near, dx=dx, dy=dy, dyaw=dyaw, pivot=pivot)
+        return hits / known if known else 0.0, known
+
+    def evidence(self, x, y, near, *, dx=0.0, dy=0.0, dyaw=0.0, pivot=(0.0, 0.0)):
         if dyaw:
             ca, sa = math.cos(math.radians(dyaw)), math.sin(math.radians(dyaw))
             px, py = pivot
@@ -162,10 +172,12 @@ class BaseMap:
         x, y = x + dx, y + dy
         keep = self.inside(x, y)
         if not keep.any():
-            return 0.0, 0
+            return 0, 0, 0
         r, c = self.to_index(x[keep], y[keep])
         r, c = np.rint(r).astype(np.int32), np.rint(c).astype(np.int32)
-        return float(near[r, c].mean()), int(keep.sum())
+        matched = near[r, c]
+        known = matched | (self.grid[r, c] != GRID_VALUE_UNKNOWN)
+        return int(matched.sum()), int(known.sum()), int(keep.sum())
 
 
 def load_base(path):
@@ -221,7 +233,7 @@ def thin(pts, voxel=0.05):
     return pts[np.sort(keep)]
 
 
-def check(base, pts, *, tol=MATCH_TOL, pivot=None):
+def check(base, pts, *, tol=MATCH_TOL, pivot=None, require_aligned=False):
     """比对 scan 与基准图，返回可直接 JSON 化的 dict。
 
     pivot 是起点位姿的 (x, y)，角度修正绕它转。不给时退回点云重心——一圈 scan 的重心
@@ -235,30 +247,29 @@ def check(base, pts, *, tol=MATCH_TOL, pivot=None):
     if pivot is not None:
         result['pivot'] = [round(pivot[0], 3), round(pivot[1], 3)]
     if len(pts) < MIN_POINTS:
+        result['code'] = 'insufficient_scan'
         result['reason'] = f'样本不足：只有 {len(pts)} 个有效激光点（至少 {MIN_POINTS}）'
         return result
 
     near = base.near(tol)
-    fit0, used = base.fit(pts[:, 0], pts[:, 1], near)
-    result.update({'fit': round(fit0, 4), 'points_used': used})
-    if used < MIN_POINTS:
-        result['reason'] = (f'只有 {used} 个点落在基准图范围内（至少 {MIN_POINTS}）'
-                            f'——机器人很可能不在基准图覆盖的地方')
-        return result
+    x, y = pts.T
+    hits0, used, inside = base.evidence(x, y, near)
+    fit0 = hits0 / used if used else 0.0
+    result.update(fit=round(fit0, 4), points_used=used, points_inside=inside,
+                  wall_points=hits0, wall_coverage=round(hits0 / len(pts), 4))
 
     # 先粗后细。粗搜的范围要比「容差」大一档：要为「偏得太多」和「图用错了」这两种情况
     # 分开留出判断空间——只搜 ±0.25 m 的话，偏 0.6 m 会因为够不着而报成「图对不上」。
-    def score_at(dx, dy, dyaw):
-        return base.fit(pts[:, 0], pts[:, 1], near, dx=dx, dy=dy, dyaw=dyaw, pivot=pivot)[0]
-
-    best = (fit0, 0.0, 0.0, 0.0)          # (贴合率, dx, dy, dyaw)
+    # Rank by total matched points, with a fixed denominator. A hypothesis
+    # cannot win by pushing the poorly matched part of the scan off the map.
+    best = (hits0, 0.0, 0.0, 0.0)
 
     def consider(dx, dy, dyaw):
         """更新最优解。分数打平时取修正量更小的，避免报出无意义的偏移。"""
         nonlocal best
-        s = score_at(dx, dy, dyaw)
-        if (s > best[0] + 1e-9 or
-                (s > best[0] - 1e-9 and
+        s, _, _ = base.evidence(x, y, near, dx=dx, dy=dy, dyaw=dyaw, pivot=pivot)
+        if (s > best[0] or
+                (s == best[0] and
                  math.hypot(dx, dy) + abs(dyaw) * 0.05 <
                  math.hypot(best[1], best[2]) + abs(best[3]) * 0.05)):
             best = (s, dx, dy, dyaw)
@@ -277,31 +288,58 @@ def check(base, pts, *, tol=MATCH_TOL, pivot=None):
             for ix in range(-fine, fine + 1):
                 consider(cx + ix * SEARCH_STEP, cy + iy * SEARCH_STEP, float(dyaw))
 
-    fit_best, dx, dy, dyaw = best
+    hits_best, dx, dy, dyaw = best
+    _, known_best, _ = base.evidence(x, y, near, dx=dx, dy=dy, dyaw=dyaw, pivot=pivot)
+    fit_best = hits_best / known_best if known_best else 0.0
     shift = math.hypot(dx, dy)
 
     result.update({
         'fit_best': round(fit_best, 4),
+        'wall_coverage_best': round(hits_best / len(pts), 4),
         'correction': [round(dx, 3), round(dy, 3), round(dyaw, 2)],
         'correction_norm': round(shift, 3),
     })
-    if fit_best < MIN_FIT:
+    required = MIN_KNOWN_FIT if require_aligned else MIN_FIT
+    limit_xy = VERIFIED_SHIFT if require_aligned else MAX_DX
+    limit_yaw = VERIFIED_YAW if require_aligned else MAX_DYAW
+    enough_walls = max(MIN_WALL_POINTS, MIN_WALL_COVERAGE * len(pts))
+    if inside < MIN_WALL_POINTS or known_best < MIN_WALL_POINTS or (
+        require_aligned and known_best < enough_walls
+    ):
+        result['code'] = 'insufficient_overlap'
+        result['reason'] = (f'与旧图重叠不足（找到 {hits_best} 个旧墙匹配点，'
+                            f'占扫描 {hits_best / len(pts):.0%}），请到能同时看到旧墙和墙角的位置')
+    elif fit_best < required:
         # 平移旋转都救不回来：不是「偏了一点」，是环境和这张图对不上。
         # 这一支必须先判，否则「用错地图」会被误报成「位姿偏了 0.6 m」，让人白折腾一轮。
-        result['reason'] = (f'贴合率 {fit0:.0%}，而且平移旋转都救不回来（最好也只有 {fit_best:.0%}，'
-                            f'要求 ≥ {MIN_FIT:.0%}）：眼前的环境和这张基准图对不上。'
-                            f'确认机器人在基准图覆盖范围内、没有用错地图')
-    elif shift > MAX_DX or abs(dyaw) > MAX_DYAW:
+        result['code'] = 'mismatch'
+        result['reason'] = (f'旧图贴合率 {fit0:.0%}（局部搜索最好 {fit_best:.0%}，要求 ≥ {required:.0%}）。'
+                            '请核对场景变化、基准图和起点')
+        if not require_aligned:
+            result['reason'] += '，扫描与基准图对不上'
+    elif require_aligned and hits_best < enough_walls:
+        result['code'] = 'insufficient_overlap'
+        result['reason'] = f'旧墙约束不足（匹配 {hits_best} 个点），请到能看到更多旧墙的位置重试'
+    elif (shift > limit_xy or abs(dyaw) > limit_yaw
+          or (require_aligned and (fit0 < required or hits0 < enough_walls))):
         # 场是对的，但偏差超出了 slam_toolbox 的扫描匹配窗口，它自己纠不回来
         clamp = ''
-        if shift >= MAX_SEARCH_XY - 1e-6 or abs(dyaw) >= MAX_SEARCH_YAW - 1e-6:
-            clamp = (f'（修正量已经顶到搜索上限 ±{MAX_SEARCH_XY:.2f} m / ±{MAX_SEARCH_YAW:.0f}°，'
-                     f'实际偏差更大）')
-        result['reason'] = (f'起点位姿偏了 {shift:.2f} m / {dyaw:+.1f}°'
-                            f'（容差 {MAX_DX:.2f} m / {MAX_DYAW:.1f}°）{clamp}，'
+        if max(abs(dx), abs(dy)) >= WIDE_SEARCH_XY + 0.15 - 1e-6 or abs(dyaw) >= MAX_SEARCH_YAW + 2 - 1e-6:
+            clamp = '（修正量已到搜索边界，实际偏差可能更大）'
+        result['code'] = 'pose_offset'
+        label = 'SLAM' if require_aligned else '起点'
+        result['reason'] = (f'{label}位姿偏了 {shift:.2f} m / {dyaw:+.1f}°'
+                            f'（容差 {limit_xy:.2f} m / {limit_yaw:.1f}°）{clamp}，'
                             f'修正后贴合率 {fit_best:.0%}。'
                             f'按 correction 改起点位姿再开始，否则会建出双线墙')
-    elif fit0 < MIN_FIT:
+    elif require_aligned and any(
+        all(base.evidence(x, y, near, dx=dx + sign * ux, dy=dy + sign * uy,
+                          dyaw=dyaw, pivot=pivot)[0] >= 0.95 * hits_best for sign in (-1, 1))
+        for ux, uy in ((0.35, 0.0), (0.0, 0.35), (0.25, 0.25), (0.25, -0.25))
+    ):
+        result['code'] = 'ambiguous_overlap'
+        result['reason'] = '旧墙能贴合，但沿一个方向移动后仍然相似，请换到能看到墙角或门框的位置'
+    elif not require_aligned and fit0 < MIN_FIT:
         # 当前贴合率不高，但偏差在 slam_toolbox 的扫描匹配窗口内，它加载图后会把
         # 第一帧 scan 匹配到位。放行，同时说清楚它自己会纠，省得人以为漏判了。
         result['ok'] = True
@@ -310,8 +348,9 @@ def check(base, pts, *, tol=MATCH_TOL, pivot=None):
                             f'它会自己吸附到位，可以开始；想更稳就先按 correction 改起点')
     else:
         result['ok'] = True
-        result['reason'] = (f'贴合率 {fit0:.0%}，起点位姿偏差 {shift:.2f} m / {dyaw:+.1f}°，'
-                            f'{used} 个点，可以开始采集')
+        result['code'] = 'verified'
+        result['reason'] = (f'旧图贴合率 {fit0:.0%}，旧墙约束覆盖 {hits0 / len(pts):.0%}，'
+                            f'位姿修正 {shift:.2f} m / {dyaw:+.1f}°')
     return result
 
 
@@ -321,6 +360,7 @@ def main(argv=None):
     parser.add_argument('scan', help='网页后端写的 scan.npz（pts 已转到地图坐标系）')
     parser.add_argument('--json', action='store_true', help='只输出一行 JSON')
     parser.add_argument('--tol', type=float, default=MATCH_TOL)
+    parser.add_argument('--require-aligned', action='store_true', help='验证 SLAM 已经对齐的位姿')
     parser.add_argument('--pivot', help='起点位姿 x,y（地图坐标系）。角度修正绕它转；'
                                         '负数要写成 --pivot=-1.2,3.4。不给时用点云重心')
     args = parser.parse_args(argv)
@@ -330,7 +370,8 @@ def main(argv=None):
             px, py = (float(v) for v in args.pivot.split(','))
             pivot = (px, py)
         base = load_base(args.base)
-        report = check(base, thin(load_scan(args.scan)), tol=args.tol, pivot=pivot)
+        report = check(base, thin(load_scan(args.scan)), tol=args.tol, pivot=pivot,
+                       require_aligned=args.require_aligned)
     except (ValueError, OSError, KeyError, SyntaxError) as error:
         if args.json:
             print(json.dumps({'ok': False, 'reason': str(error)}, ensure_ascii=False))

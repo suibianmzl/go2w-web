@@ -491,6 +491,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:4px;margin-top:6px}
 .route-points span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .route-point-name{grid-column:1/-1;width:100%;min-width:0;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font-size:11px}
+.route-point-note{grid-column:1/-1;width:100%;min-width:0;min-height:38px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:4px 7px;font-family:inherit;font-size:11px;line-height:1.4;resize:vertical}
 .route-points .btn{padding:0 6px}
 .route-controls{margin-top:8px}
 .route-points .route-end{color:#94e8a8}

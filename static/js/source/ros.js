@@ -7,7 +7,7 @@ const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, 
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
   'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
-  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking']);
+  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
 };
@@ -172,6 +172,8 @@ export function createRosSource(store, bus){
         Object.assign(store.loc, { std: null, yaw: null, match: null }, m.loc || {});
         store.autoLoc = m.autoLoc || null;
         store.cont = m.cont || null;
+        store.contPaused = !!m.contPaused;
+        store.contBusy = !!m.contBusy;
         store.autosave = m.autosave || null;
         store.webVersion = m.webVersion || null;
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
@@ -269,8 +271,9 @@ export function createRosSource(store, bus){
     // 续建：检查基准 → 开始（定起点 + 反序列化基准 posegraph）→ 自检 → 收工另存
     contPreflight: base => send('cont_preflight', { base }, 15000),
     contStart: (base, name, pose, source) =>
-      send('cont_start', { base, name, ...(pose ? { pose } : {}), ...(source ? { source } : {}) }, 95000),
+      send('cont_start', { base, name, ...(pose ? { pose } : {}), ...(source ? { source } : {}) }, 145000),
     contCheck: () => send('cont_check', {}, 100000),
+    mapResume: () => send('map_resume', {}, 15000),
     contFinish: reason => send('cont_finish', { reason }, 45000),
     contAbort: () => send('cont_abort', {}),
     contParking: (base, clear) => send('cont_parking', clear ? { base, clear: true } : { base }),

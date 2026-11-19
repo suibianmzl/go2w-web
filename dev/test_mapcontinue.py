@@ -121,9 +121,18 @@ class SettleTests(unittest.TestCase):
         self.assertEqual(r['source'], 'manual')
         self.assertEqual(r['tried'], [])
 
-    def test_force只能填manual(self):
+    def test_force拒绝未知来源(self):
         with self.assertRaises(ValueError):
-            C.settle(self.PARK, (0, 0, 0), loc(0, 0), force='parking')
+            C.settle(self.PARK, (0, 0, 0), loc(0, 0), force='unknown')
+
+    def test_显式自动定位不采用停车点(self):
+        result = C.settle(self.PARK, None, loc(5, 5), force='globloc')
+        self.assertEqual(result['source'], 'globloc')
+
+    def test_显式停车点缺失时不接受其它来源(self):
+        result = C.settle(None, None, loc(5, 5), force='parking')
+        self.assertIsNone(result['source'])
+        self.assertEqual(result['tried'][0][0], 'parking')
 
 
 class CoverageTests(unittest.TestCase):

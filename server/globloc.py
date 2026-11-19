@@ -95,6 +95,7 @@ class GlobalLocalizer:
         self.coarse = sliding_max(coarse, coarse_cells)
         # 候选位置：空闲且离障碍有一定距离（狗不可能贴着墙 / 在墙里）
         ok = free & (dm > robot_clearance)
+        self.walkable = ok
         ys, xs = np.nonzero(ok[::coarse_cells, ::coarse_cells])
         self.cand = np.stack([ys * coarse_cells, xs * coarse_cells], 1)
         self.prep_s = time.time() - t0
@@ -120,6 +121,12 @@ class GlobalLocalizer:
         d = np.arange(-xy_cells, xy_cells + 1)
         gy, gx = np.meshgrid(cy + d, cx + d, indexing='ij')
         gy, gx = gy.ravel(), gx.ravel()
+        inside = (gy >= 0) & (gy < self.h) & (gx >= 0) & (gx < self.w)
+        gy, gx = gy[inside], gx[inside]
+        free = self.walkable[gy, gx]
+        if not free.any():
+            return -1.0, cy, cx, yaw
+        gy, gx = gy[free], gx[free]
         DY, DX = self._offsets(pts, yaws)
         best = (-1.0, cy, cx, yaw)
         for i, a in enumerate(yaws):
@@ -133,6 +140,8 @@ class GlobalLocalizer:
         t0 = time.time()
         yaws = np.deg2rad(np.arange(-180, 180, yaw_step_deg))
         cand = self.cand
+        if not len(cand):
+            return {'error': '基准图没有可用的空地候选'}
         DY, DX = self._offsets(pts, yaws)
         S = np.zeros((len(cand), len(yaws)), np.float32)
         for i in range(len(yaws)):
@@ -140,11 +149,25 @@ class GlobalLocalizer:
         coarse_s = time.time() - t0
         bi = S.argmax(1)
         bs = S[np.arange(len(S)), bi]
+        # Preserve an opposing heading even if two hypotheses share a location.
+        alternate_score = np.full(len(S), -1.0, dtype=np.float32)
+        ai = np.zeros_like(bi)
+        for i in range(len(yaws)):
+            da = np.abs(i - bi)
+            better = ((np.minimum(da, len(yaws) - da) * yaw_step_deg > 30)
+                      & (S[:, i] > alternate_score))
+            alternate_score[better] = S[better, i]
+            ai[better] = i
+        scores = np.concatenate([bs, alternate_score])
+        angles = np.concatenate([bi, ai])
         picks, min_sep = [], (0.5 / self.res) ** 2
-        for j in np.argsort(-bs):
-            y, x = cand[j]
-            if all((y - py) ** 2 + (x - px) ** 2 >= min_sep for py, px, _ in picks):
-                picks.append((int(y), int(x), float(yaws[bi[j]])))
+        for j in np.argsort(-scores):
+            y, x = cand[j % len(cand)]
+            a = float(yaws[angles[j]])
+            if all((y - py) ** 2 + (x - px) ** 2 >= min_sep
+                   or abs(math.remainder(a - pa, 2 * math.pi)) > math.radians(30)
+                   for py, px, pa in picks):
+                picks.append((int(y), int(x), a))
                 if len(picks) >= top_k:
                     break
         step, res = math.radians(yaw_step_deg), []
