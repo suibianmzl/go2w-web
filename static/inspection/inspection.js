@@ -7,41 +7,35 @@ const POSE_RENDER_MS = 1000;
 const TRAIL_MIN_MOVE = 0.04;
 const HEARTBEAT_MS = 500;
 
-const FIXED_INSPECTION_NODES = [
+const INSPECTION_NODES = [
   {
-    code:'A',
-    name:'大厅门禁',
-    aliases:['大厅门禁', '门禁', '起点'],
+    code:'01',
+    name:'起点',
+    cot:[
+      '已获取导航路径，立即前往【电动车存放处】',
+      '已识别门禁打开，正在通过',
+      '已识别大门打开，正在通过',
+      '识别到台阶，正在通过',
+    ],
   },
   {
-    code:'B',
-    name:'进入室外',
-    aliases:['进入室外', '室外区域'],
+    code:'02',
+    name:'电动车存放处',
+    cot:[
+      '已到达巡逻点位【电动车存放处】',
+      '定点巡逻中（30s）...',
+      '巡逻结束，出发前往【人行步道】',
+      '已识别门禁打开，正在通过...',
+    ],
   },
   {
-    code:'C',
-    name:'下台阶',
-    aliases:['下台阶', '台阶'],
-  },
-  {
-    code:'D',
-    name:'定点拍照-1',
-    aliases:['定点拍照-1', '定点拍照1', '电动车存放处'],
-  },
-  {
-    code:'E',
-    name:'通过闸机-2',
-    aliases:['通过闸机-2', '通过闸机2', '通过闸机', '闸机', '电动车棚'],
-  },
-  {
-    code:'F',
-    name:'定点拍照-2',
-    aliases:['定点拍照-2', '定点拍照2', '门前步道', '人行步道'],
-  },
-  {
-    code:'↩',
-    name:'返回待机位置',
-    aliases:['返回待机位置', '返回待机', '返回起点', '待机位置'],
+    code:'03',
+    name:'人行步道',
+    cot:[
+      '已到达巡逻点位【人行步道】',
+      '定点巡逻中（30s）...',
+      '巡逻结束，返回待机位置',
+    ],
   },
 ];
 
@@ -136,6 +130,7 @@ const state = {
   history: { items: new Map(), before: null, loading: false, hasMore: true },
   playbackId: null,
   lastFixedNodeIndex: null,
+  openNodeIndex: 0,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -175,23 +170,22 @@ function taskForSelectedRoute(){
   return state.task?.type !== 'idle' && state.task?.routeId === state.selectedRouteId;
 }
 
-function normalizePointName(value){
-  return String(value || '')
-    .replace(/\s+/g, '')
-    .replace(/[【】\[\]（）()·,，。:：-]/g, '')
-    .toLowerCase();
+function taskNodeIndex(task){
+  const point = Number(task?.point);
+  if (!Number.isInteger(point) || point < 1) return -1;
+  return Math.min(INSPECTION_NODES.length - 1, point - 1);
 }
 
-function fixedNodeIndex(pointName){
-  const name = normalizePointName(pointName);
-  if (!name) return -1;
-  return FIXED_INSPECTION_NODES.findIndex(node =>
-    node.aliases.some(alias => name.includes(normalizePointName(alias))));
+function incidentNodeIndex(item){
+  const point = Number(item.task?.point);
+  return Number.isInteger(point) && point >= 1 && point <= INSPECTION_NODES.length
+    ? point - 1
+    : -1;
 }
 
-function fixedNodeIncidents(index){
+function nodeIncidents(index){
   return state.incidents
-    .filter(item => fixedNodeIndex(item.task?.pointName) === index)
+    .filter(item => incidentNodeIndex(item) === index)
     .sort((left, right) => right.ts - left.ts);
 }
 
@@ -269,7 +263,7 @@ function renderSelectedRoute(){
   const route = selectedRoute();
   els.routeSelect.disabled = !state.routes.length || taskActive();
   els.routeMap.textContent = route?.map ? `地图 ${route.map}` : '地图 --';
-  els.routeCount.textContent = `固定 ${FIXED_INSPECTION_NODES.length} 个节点`;
+  els.routeCount.textContent = `固定 ${INSPECTION_NODES.length} 个节点`;
   els.startBtn.disabled = !route || !state.wsOpen || !state.online || taskActive();
   els.stopBtn.disabled = !state.wsOpen || !taskActive();
   renderTask();
@@ -282,10 +276,9 @@ function taskStateLabel(){
   if (!taskForSelectedRoute()) return taskActive() ? '其他任务执行中' : '等待下发任务';
   if (task.status === 'active') {
     if (task.phase === 'checking') return '出发准备中';
-    if (task.back) return '返回待机位置';
-    const index = fixedNodeIndex(task.pointName);
-    const node = FIXED_INSPECTION_NODES[index];
-    return node ? `${node.code} · ${node.name}` : (task.pointName || `第 ${task.point || 1} 站`);
+    const index = task.back ? INSPECTION_NODES.length - 1 : taskNodeIndex(task);
+    const node = INSPECTION_NODES[index];
+    return node ? `${node.code} · ${node.name}` : `第 ${task.point || 1} 站`;
   }
   if (task.status === 'succeeded') return '巡检已完成';
   if (task.status === 'canceled') return '巡检已中止';
@@ -313,18 +306,21 @@ function renderTask(){
   els.taskPercent.textContent = `${Math.round(progress * 100)}%`;
   els.taskProgress.style.width = `${progress * 100}%`;
   const currentIndex = related
-    ? (task.back ? FIXED_INSPECTION_NODES.length - 1 : fixedNodeIndex(task.pointName))
+    ? (task.back ? INSPECTION_NODES.length - 1 : taskNodeIndex(task))
     : -1;
-  const currentNode = FIXED_INSPECTION_NODES[currentIndex];
+  const currentNode = INSPECTION_NODES[currentIndex];
   els.currentPoint.textContent = currentNode
-    ? `${currentNode.code} · ${currentNode.name}`
-    : (task.pointName || '--');
+    ? `${currentIndex + 1}/${INSPECTION_NODES.length} · ${currentNode.name}`
+    : '--';
   renderSteps(task, related, currentIndex);
   renderHint(selectedRoute());
 }
 
 function renderSteps(task, related, currentIndex){
-  els.steps.innerHTML = FIXED_INSPECTION_NODES.map((node, index) => {
+  if (currentIndex >= 0 && currentIndex !== state.lastFixedNodeIndex){
+    state.openNodeIndex = currentIndex;
+  }
+  els.steps.innerHTML = INSPECTION_NODES.map((node, index) => {
     let stepState = 'pending';
     let label = '待执行';
     if (related && task.status === 'succeeded'){
@@ -345,7 +341,8 @@ function renderSteps(task, related, currentIndex){
         label = task.back ? '返回中' : '当前节点';
       }
     }
-    const incidents = fixedNodeIncidents(index);
+    const incidents = nodeIncidents(index);
+    const expanded = state.openNodeIndex === index;
     const incidentHtml = incidents.length ? `
       <div class="node-incidents">
         ${incidents.slice(0, 3).map(item => `
@@ -359,17 +356,25 @@ function renderSteps(task, related, currentIndex){
       </div>
     ` : '';
     return `<li data-s="${stepState}">
-      <span class="index">${esc(node.code)}</span>
-      <span class="name" title="${esc(node.name)}">${esc(node.name)}</span>
-      <span class="state">${label}</span>
-      ${incidentHtml}
+      <button class="step-head" type="button" data-open-node="${index}" aria-expanded="${expanded}">
+        <span class="index">${esc(node.code)}</span>
+        <span class="name" title="${esc(node.name)}">${esc(node.name)}</span>
+        <span class="state">${label}</span>
+        <span class="chevron">⌄</span>
+      </button>
+      <div class="cot-content" ${expanded ? '' : 'hidden'}>
+        <div class="cot-list">
+          ${node.cot.map(text => `<div class="cot-item"><i></i><span>${esc(text)}</span></div>`).join('')}
+        </div>
+        ${incidentHtml}
+      </div>
     </li>`;
   }).join('');
   if (currentIndex !== state.lastFixedNodeIndex){
     state.lastFixedNodeIndex = currentIndex;
     if (currentIndex >= 0){
       requestAnimationFrame(() => {
-        els.steps.querySelector('li[data-s="active"]')
+        els.steps.querySelector(`[data-open-node="${currentIndex}"]`)
           ?.scrollIntoView({ block:'center', behavior:'smooth' });
       });
     }
@@ -1168,6 +1173,13 @@ els.fitMap.addEventListener('click', () => { fitView(); drawMap(); });
 els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
 els.expandMap.addEventListener('click', () => setMapCollapsed(false));
 els.steps.addEventListener('click', event => {
+  const toggle = event.target.closest('[data-open-node]');
+  if (toggle){
+    const index = Number(toggle.dataset.openNode);
+    state.openNodeIndex = state.openNodeIndex === index ? null : index;
+    renderTask();
+    return;
+  }
   const button = event.target.closest('[data-step-incident]');
   if (!button) return;
   const incident = state.incidents.find(item => item.id === button.dataset.stepIncident);
