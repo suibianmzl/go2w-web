@@ -142,6 +142,8 @@ const state = {
   cotSegment: null,
   cotMoving: false,
   preparing: false,
+  inspectionRunStart: null,
+  inspectionRouteId: null,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -181,6 +183,18 @@ function taskForSelectedRoute(){
   return state.task?.type !== 'idle' && state.task?.routeId === state.selectedRouteId;
 }
 
+function beginInspectionRun(task, startedAt = Date.now()){
+  stopCotReveal();
+  state.inspectionRunStart = startedAt;
+  state.inspectionRouteId = task?.routeId || null;
+  state.openNodeIndex = null;
+  state.lastOpenedNodeIndex = null;
+  state.cotVisible.clear();
+  state.cotSegment = null;
+  state.cotMoving = false;
+  state.lastFixedNodeIndex = null;
+}
+
 function taskNodeIndex(task){
   const point = Number(task?.point);
   if (!Number.isInteger(point) || point < 1) return -1;
@@ -215,8 +229,15 @@ function incidentNodeIndex(item){
 }
 
 function nodeIncidents(index){
+  if (!state.inspectionRunStart) return [];
   return state.incidents
-    .filter(item => incidentNodeIndex(item) === index)
+    .filter(item => (
+      incidentNodeIndex(item) === index
+      && Number(item.ts) >= state.inspectionRunStart
+      && (!state.inspectionRouteId
+        || !item.task?.routeId
+        || item.task.routeId === state.inspectionRouteId)
+    ))
     .sort((left, right) => right.ts - left.ts);
 }
 
@@ -249,7 +270,7 @@ function syncMovementCot(task, related, currentIndex){
   }
   const cotIndex = (task.back || currentIndex >= INSPECTION_NODES.length - 1)
     ? INSPECTION_NODES.length - 1
-    : Math.max(0, Math.min(INSPECTION_NODES.length - 2, currentIndex - 1));
+    : Math.max(0, currentIndex);
   const segment = [
     task.routeId || '',
     task.loop || 1,
@@ -833,8 +854,21 @@ function onJson(message){
       renderRouteOptions();
       drawMap();
       break;
-    case 'task':
-      state.task = message.task || { type:'idle' };
+    case 'task': {
+      const previous = state.task || { type:'idle' };
+      const next = message.task || { type:'idle' };
+      if (
+        next.status === 'active'
+        && next.routeId
+        && (previous.status !== 'active' || previous.routeId !== next.routeId)
+      ){
+        const elapsed = Number(next.elapsed);
+        beginInspectionRun(
+          next,
+          Number.isFinite(elapsed) ? Date.now() - elapsed * 1000 : Date.now(),
+        );
+      }
+      state.task = next;
       if (taskActive() && state.task.routeId) {
         state.selectedRouteId = state.task.routeId;
         els.routeSelect.value = state.selectedRouteId;
@@ -843,6 +877,7 @@ function onJson(message){
       renderSelectedRoute();
       drawMap();
       break;
+    }
     case 'pose':
       state.pose = message;
       state.poseAt = performance.now();
@@ -1031,6 +1066,11 @@ async function startInspection(){
       ...(Number.isFinite(opts.wmax) ? { wmax:opts.wmax } : {}),
     });
     if (reply.ok){
+      if (!(state.task?.status === 'active'
+        && state.task?.routeId === route.id
+        && state.inspectionRunStart)){
+        beginInspectionRun({ routeId:route.id }, Date.now());
+      }
       toast(reply.msg || '巡检任务已下发');
       state.selectedRouteId = route.id;
     } else {
