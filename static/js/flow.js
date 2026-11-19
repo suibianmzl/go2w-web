@@ -423,10 +423,20 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
           ct ? `${ct.base} → ${ct.name}${ct.check ? (ct.check.ok ? ' · 自检通过' : ' · 自检没通过') : ' · 还没自检'}` : '在已有地图上继续采集');
         // 建图自动保存（后端每 30 s 覆盖一份 autosave_<开始时间>，停止前、出问题时也会存）
         const A = store.autosave, au = $('#mpAuto');
-        const autoTxt = !A ? '' : A.err ? `自动保存失败：${A.err}` : A.running ? '正在自动保存…'
+        // 摔倒 / 里程计异常时后端冻结建图：闸门关上、自动保存停住，最近那份好的不再被覆盖
+        const F = A?.frozen, fz = $('#mpFrozen');
+        const hm = t => new Date(t * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+        fz.hidden = !F;
+        fz.textContent = !F ? '' : `建图已冻结（${hm(F.wall)}）：${F.reason}。`
+          + (F.gate ? '' : '扫描闸门不可用，地图可能还在被写坏。')
+          + (F.kept ? `最近一份好的自动保存 ${F.kept}（${hm(F.kept_wall)}）不会再被覆盖。` : '')
+          + (F.wild ? '里程计已经飘了，不能继续：请停止建图，把狗扶正静止后从这份图续建。'
+            : '建议停止建图后从这份图续建；如果只是正常趴下、地图没乱，站起来后可以点「继续建图」。');
+        $('#mpFrozenRow').hidden = !F || F.wild;
+        const autoTxt = !A ? '' : F ? '自动保存已暂停（建图冻结）' : A.err ? `自动保存失败：${A.err}` : A.running ? '正在自动保存…'
           : A.wall ? `已自动保存到 ${A.name} · ${A.ago < 60 ? `${Math.round(A.ago)} 秒前` : `${Math.round(A.ago / 60)} 分钟前`}` : `等待第一次自动保存（每 ${Math.round(A.period)} 秒）`;
         au.hidden = !A; au.textContent = A ? `${autoTxt}（每 ${Math.round(A.period)} 秒、停止前、出问题时覆盖这一份，只是兜底）` : '';
-        au.classList.toggle('warn', !!A?.err);
+        au.classList.toggle('warn', !!A?.err || !!F);
         setStep('mpEnd', on ? 'cur' : 'todo', saved ? `导航会用 ${store.mapSavedName || '刚保存的地图'}` : A?.wall ? `还没正式保存；停止后可在地图列表找到自动保存 ${A.name}` : '先保存，否则停止后地图会丢失');
         $('#mapToNav').disabled = !on || !saved;
         $('#mapStop').disabled = !on;

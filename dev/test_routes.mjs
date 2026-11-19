@@ -7,7 +7,7 @@ assert.match(url, /^ws:\/\/(127\.0\.0\.1|localhost):\d+\/ws$/);
 const map = 'lab_20261021', first = { x: .01, y: 0, th: 0 };
 const points = [
   { ...first, name:'入口', manualHeading:false },
-  { x:.11, y:-.70, th:-Math.PI / 2, name:'走廊', manualHeading:true },
+  { x:.11, y:-.70, th:-Math.PI / 2, name:'走廊', note:'  经过门禁，等门打开  ', manualHeading:true },
   { x:.21, y:-1.35, th:-Math.PI / 2, name:'工位', manualHeading:true },
 ];
 
@@ -88,7 +88,14 @@ try {
   const edited = await command('route_save', { route_id:route.id, map, name:'三点任务', points });
   assert.equal(edited.id, route.id);
   assert.deepEqual(edited.opts, { loop:false, loops:1, vmax:0.45, wmax:1.2 }, '不带 opts 保存 = 默认参数');
-  assert.deepEqual(edited.points, points, '保存并更新后仍保留站名和朝向');
+  // 备注（11-18）：去掉首尾空格；没填的点是空字符串
+  assert.deepEqual(edited.points, points.map(p => ({ ...p, note:(p.note || '').trim() })), '保存并更新后仍保留站名、备注和朝向');
+  assert.equal(edited.points[1].note, '经过门禁，等门打开');
+  for (const note of ['长'.repeat(201), 5, null])
+    assert.equal((await c.cmd('route_save', { map, name:'非法备注', points:[{ ...first, note }, points[1]] })).ok, false, `拒绝备注 ${JSON.stringify(note)}`);
+  const capped = await command('route_save', { map, name:'备注上限', points:[{ ...first, note:'长'.repeat(200) }, points[1]] });
+  assert.equal(capped.points[0].note.length, 200, '200 字备注可以保存');
+  await command('route_delete', { route_id:capped.id });
   assert.equal((await c.cmd('route_save', {
     map, name:'非法站名', points:[{ ...first, name:'长'.repeat(41) }, points[1]],
   })).ok, false);
@@ -101,6 +108,7 @@ try {
   assert.deepEqual([...new Set(c.tasks.filter(t => t.name === '三点任务').map(t => t.point))], [1, 2, 3]);
   assert.ok(Math.hypot(c.pose.x - points[2].x, c.pose.y - points[2].y) < .3);
   assert.deepEqual([...new Set(c.tasks.filter(t => t.name === '三点任务').map(t => t.pointName))], ['入口', '走廊', '工位']);
+  assert.deepEqual(Object.fromEntries(c.tasks.filter(t => t.name === '三点任务').map(t => [t.point, t.pointNote])), { 1:'', 2:'经过门禁，等门打开', 3:'' }, '执行进度带当前站备注');
   await command('route_delete', { route_id:route.id });
   await until(() => observer.routes && !observer.routes.some(r => r.id === route.id), '另一客户端收到删除');
   assert.equal((await c.cmd('route_start', { route_id:route.id })).ok, false);

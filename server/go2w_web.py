@@ -27,10 +27,13 @@ WebSocket 协议
 """
 import argparse
 import asyncio
+import base64
 import json
 import math
 import os
+import re
 import shutil
+import socket
 import struct
 import sys
 import tempfile
@@ -68,9 +71,8 @@ from tf2_ros import Buffer, TransformListener
 # 和续建无关，所以缺失时只把续建这条路标成不可用
 try:
     from slam_toolbox.srv import DeserializePoseGraph
-    from slam_toolbox.srv import Pause as SlamPause
 except ImportError:  # pragma: no cover - 只在没有 slam_toolbox 的环境走到
-    DeserializePoseGraph = SlamPause = None
+    DeserializePoseGraph = None
 try:
     from slam_toolbox.srv import SerializePoseGraph
 except ImportError:  # pragma: no cover
@@ -78,6 +80,7 @@ except ImportError:  # pragma: no cover
 from geometry_msgs.msg import Pose2D
 
 import camera as C
+import incidents as INC
 import mapcontinue as MC
 import mapmeta as MM
 import mapedit as ME
@@ -146,6 +149,12 @@ ROLLBACK_SAVE_TIMEOUT = 20.0  # 等存包完成的最长时间
 STUCK_SECONDS = float(os.environ.get('GO2W_STUCK_SECONDS', '8'))
 STUCK_MOVE, STUCK_TURN = 0.08, 0.15
 STUCK_BEFORE, STUCK_AFTER, STUCK_COOLDOWN = 15.0, 15.0, 60.0
+# 11-18 起所有异常（incidents.py 的 TYPES）都按上面的 前 + 后 自动存回溯包：
+#   计划存包前又出了异常，离存包还有 ≥ INC_MERGE 秒就并进同一个包；
+#   同一类异常两次自动存包至少隔 STUCK_COOLDOWN（异常照样记，包标成「没存」并说明原因）
+INC_MERGE = 5.0
+INC_PUSH = 50          # 网页连上时推最近多少条异常
+INC_AUTO = object()    # Server.incident 的 task 默认值：取当前任务
 # 档位进程起来后，看到这些节点才算「运行中」
 MODE_NODES = {'mapping': ('slam_toolbox',), 'localization': ('amcl',), 'navigation': ('bt_navigator', 'go2w_cmd_bridge')}
 START_TIMEOUT = 90.0
@@ -185,12 +194,28 @@ AUTOSAVE_PERIOD = float(os.environ.get('GO2W_AUTOSAVE_SECONDS', '30'))
 AUTOSAVE_KEEP = 3
 AUTOSAVE_PREFIX = 'autosave_'
 AUTOSAVE_PROBLEM_GAP = 5.0    # s：出问题时立刻存，但两次之间至少隔这么久
+AUTOSAVE_PREV = '_prev'       # 每次覆盖前把上一份挪成 <名字>_prev：坏图写进来时还能退一步
+# 只有网页自己起的名字才算自动保存：autosave_MMDD_HHMMSS 和它的 _prev。11-19 在 .21 上，清理按前缀
+# 「autosave_」认，把从自动保存续建出来、用户手动保存的 autosave_…_c1 也当成自动保存直接删掉了（不进回收站）
+AUTOSAVE_RE = re.compile(r'autosave_\d{4}_\d{6}(?:_prev)?')
+
+
+def is_autosave(name):
+    return isinstance(name, str) and AUTOSAVE_RE.fullmatch(name) is not None
+# 摔倒 / 里程计发散保护（11-19：.30 建图时摔倒，FAST-LIO 发散，「出问题时自动保存」反而把摔倒前的好图
+# 覆盖成了 467 × 551 m 的坏图——/odom_healthy 只看 FAST-LIO 还在不在输出，不看输出对不对）。
+# 检测到「运控意外掉到 Passive」或「里程计数值离谱」：建图立刻冻结（关扫描闸门、停自动保存），并记异常 + 存回溯包
+ODOM_WILD_SPEED = 4.0         # m/s：Go2W 实际最快约 1.2 m/s；11-19 发散时 -8 → -48 m/s
+ODOM_WILD_TURN = 8.0          # rad/s
+ODOM_WILD_JUMP = 1.0          # m：相邻两条 /odom（10 Hz）位置跳变
+FALL_LIE_GRACE = 3.0          # s：网页刚让狗趴下后的这段时间里掉到 Passive 不算意外
 # 路线启动时离第 1 站不到这么远，就当已在第 1 站、直接去第 2 站：这么短的路径 RotationShim 不会先转正
 # （forward_sampling_distance 0.5），MPPI 只给出很小的速度，Go2W 不执行，会一直卡住
 ROUTE_NEAR_START = 0.5
 # 多点任务：Nav2 报未到达（差几厘米到 goal checker 0.15 m 判不过、收尾蹭不进去）时，
 # 机器人离该站不超过这么远就当作到了，继续下一站；更远才终止任务
 ROUTE_ARRIVE_TOL = 0.4
+ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
 # 地图显示方向（只转网页画面，不改地图坐标）：按地图名存在 data/map_views.json，大家看到的方向一样。
 # 建图时还没有地图名，用 MAPPING_VIEW 暂存，存图时带给新地图
 MAPPING_VIEW = '_mapping'
@@ -231,6 +256,67 @@ AUTOLOC_TURN_CLEAR = 0.65    # 原地转：这个半径内不能有点（足迹�
 # 运控（go2w_ctrl）站起 / 趴下，见 robot_ctrl.py。GO2W_CTRL=0 关掉（不查站没站起来，也不自动趴下）
 CTRL_ON = os.environ.get('GO2W_CTRL', '1') != '0'
 CTRL_STALE = 2.0       # s：状态 topic 10 Hz，超过这么久没收到就当不知道
+# 雷达无数据（11-19：.21 雷达掉线一个多小时，web.log 里只有「里程计不可用」的间接痕迹，网页红条只在浏览器里）：
+# 建图 / 定位 / 导航跑稳 LIDAR_GRACE 秒后，/scan 连续 LIDAR_STALE 秒没数据 → ERROR 日志 + 持续异常 lidar_lost；
+# 同时探一下雷达 IP 的 ARP，区分「雷达不在网上（供电 / 网线 / IP）」和「网络通但没点云（驱动 / 配置）」
+LIDAR_GRACE = float(os.environ.get('GO2W_LIDAR_GRACE', '15'))
+LIDAR_STALE = float(os.environ.get('GO2W_LIDAR_STALE', '5'))
+LIDAR_CONFIGS = [c for c in (os.environ.get('GO2W_LIDAR_CONFIG'), '/tmp/go2w_MID360_config.json',
+                             '/opt/go2w/base/go2w_bringup/share/go2w_bringup/config/MID360_config.json') if c]
+LIDAR_ARP = os.environ.get('GO2W_LIDAR_ARP', '/proc/net/arp')
+
+
+def lidar_ips():
+    """雷达驱动配置里的雷达 IP（运行时配置优先）。读不到返回 []。"""
+    for path in LIDAR_CONFIGS:
+        try:
+            with open(path, encoding='utf-8') as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        ips = [c.get('ip') for c in cfg.get('lidar_configs', []) if isinstance(c, dict) and isinstance(c.get('ip'), str)]
+        if ips:
+            return ips
+    return []
+
+
+def arp_state(ip, path=None):
+    """True = ARP 表里有这个 IP 的网卡地址（网络上找得到它）；False = 没有；None = 读不了 ARP 表。"""
+    try:
+        with open(path or LIDAR_ARP, encoding='ascii') as f:
+            rows = f.read().splitlines()[1:]
+    except OSError:
+        return None
+    for row in rows:
+        col = row.split()
+        if len(col) >= 4 and col[0] == ip:
+            return int(col[2], 16) & 0x2 != 0 and col[3] != '00:00:00:00:00:00'
+    return False
+
+
+async def lidar_diagnose():
+    """雷达没数据时给一句人话：往雷达 IP 的 9 号端口发一个 UDP 包（雷达不理）逼系统去 ARP，1.5 s 后看 ARP 表。不需要 root。"""
+    ips = lidar_ips()
+    if not ips:
+        return '读不到雷达驱动配置里的雷达 IP，没法诊断网络'
+    for ip in ips:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.setblocking(False)
+                u.sendto(b'go2w', (ip, 9))
+        except OSError:
+            pass
+    await asyncio.sleep(1.5)
+    out = []
+    for ip in ips:
+        st = arp_state(ip)
+        if st is None:
+            out.append(f'雷达 {ip}：读不了 ARP 表，网络状态未知')
+        elif st:
+            out.append(f'雷达 {ip} 网络是通的，但没有点云：看雷达驱动日志 data/runtime/logs/navigation.log，或停止档位后重开')
+        else:
+            out.append(f'雷达 {ip} 在网络上没有回应（ARP 不通）：雷达没上电、网线没插好或者 IP 变了，检查雷达供电和网线')
+    return '；'.join(out)
 CTRL_WAIT = 3.0        # s：每一步切换（插值走完之后）最多等这么久，和同事的 sport_cli up 一致
 CTRL_INTERP = 2.0      # s：FixStand 从趴姿插值到站姿的时间（config.yaml 的 ts 末项）
 POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到新进程的 Passive
@@ -464,8 +550,12 @@ class Bridge(TaughtMeasurements, Node):
         self.map_raw = None      # 自动定位用：(OccupancyGrid 原始 int8 栅格 h×w, res, ox, oy)
         self.map_crc = None      # 最新 /map 内容的 crc32（自动保存判断有没有变化）
         self.scans_base = deque(maxlen=AUTOLOC_SCANS)   # 自动定位用：(收到时间, base_footprint 下的 N×2 点, 收到时是否静止)
+        self.scan_evidence = deque(maxlen=100)
+        self.slam_poses = deque(maxlen=32)
+        self.map_sample = (0, None)
         self.odom = None
         self.odom_pose = None    # (x, y, yaw, 收到时间)，odom 坐标系；卡住检测用
+        self.odom_wild = None    # (原因, monotonic, time)：里程计第一次出现离谱数值；FAST-LIO 重启（换档位）时清掉
         self.speed = SpeedCheck()
         self.rate_warned = 0.0
         self.healthy, self.healthy_t = None, 0.0
@@ -473,6 +563,7 @@ class Bridge(TaughtMeasurements, Node):
         self.fixed = 'map'
 
         self.goal = None        # 网页发出的当前目标（见 track_goal）
+        self.on_goal_fail = None   # 单点目标被 Nav2 放弃时回调 (x, y, th)，在 rclpy 线程里调；Server 设置
         self.statuses = {}      # 所有 navigate_to_pose 目标的状态：uuid → status（含 RViz、patrol 发的）
         self.bt_running = set()
         self.params = {}
@@ -481,6 +572,7 @@ class Bridge(TaughtMeasurements, Node):
                              reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(OccupancyGrid, '/map', self.on_map, latched)
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
+        self.create_subscription(PoseWithCovarianceStamped, '/pose', self.on_slam_pose, 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 20)
         self.create_subscription(Bool, '/odom_healthy', self.on_healthy, 10)
         self.create_subscription(Bool, f'{BRIDGE}/armed', self.on_armed, 10)
@@ -507,13 +599,11 @@ class Bridge(TaughtMeasurements, Node):
         # 注意 save_map.sh 里用的是 /slam_toolbox/serialize_map，两者同一套命名
         self.deser_cli = (self.create_client(DeserializePoseGraph, '/slam_toolbox/deserialize_map')
                           if DeserializePoseGraph is not None else None)
-        self.pause_cli = (self.create_client(SlamPause, '/slam_toolbox/pause_new_measurements')
-                          if SlamPause is not None else None)
+        self.scan_gate_set = self.create_client(SetParameters, '/go2w_mapping_scan_gate/set_parameters')
+        self.scan_gate_get = self.create_client(GetParameters, '/go2w_mapping_scan_gate/get_parameters')
         # 建图自动保存：直接调 serialize_map（不起 ros2 命令行进程，30 s 一次也不费事）
         self.ser_cli = (self.create_client(SerializePoseGraph, '/slam_toolbox/serialize_map')
                         if SerializePoseGraph is not None else None)
-        # slam_toolbox 的 pause 是「切换」，调之前必须先读到当前状态（paused_new_measurements）
-        self.slam_param_cli = self.create_client(GetParameters, '/slam_toolbox/get_parameters')
 
         self.initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -573,6 +663,8 @@ class Bridge(TaughtMeasurements, Node):
             self.map_raw = None
         self.map_crc = zlib.crc32(np.asarray(m.data, dtype=np.int8).tobytes())   # 自动保存用来判断地图变没变
         self.map_ver += 1
+        if m.header.frame_id == 'map':
+            self.map_sample = (self.map_ver, self.map_raw)
         self.get_logger().info(f'map {info.width}x{info.height} @ {info.resolution:.3f} m')
 
     def show_file_map(self, name, m):
@@ -631,7 +723,21 @@ class Bridge(TaughtMeasurements, Node):
         # 只叠加静止时的帧：原地转动时几帧叠在一起会糊掉（11-10 用 bag 测到过）
         v = self.odom or (0.0, 0.0, 0.0)
         still = math.hypot(v[0], v[1]) < AUTOLOC_STILL[0] and abs(v[2]) < AUTOLOC_STILL[1]
-        self.scans_base.append((time.monotonic(), np.stack([tx + r * np.cos(a), ty + r * np.sin(a)], 1), still))
+        now = time.monotonic()
+        pts = np.stack([tx + r * np.cos(a), ty + r * np.sin(a)], 1)
+        self.scans_base.append((now, pts, still))
+        odom = self.odom_pose
+        trusted = (self.healthy and now - self.healthy_t < STALE
+                   and odom is not None and now - odom[3] < STALE)
+        stamp = m.header.stamp
+        self.scan_evidence.append(((stamp.sec, stamp.nanosec), now, pts, still and trusted, odom))
+
+    def on_slam_pose(self, msg):
+        if msg.header.frame_id != 'map':
+            return
+        stamp, pose = msg.header.stamp, msg.pose.pose
+        self.slam_poses.append(((stamp.sec, stamp.nanosec), time.monotonic(),
+                                (pose.position.x, pose.position.y, yaw_of(pose.orientation))))
 
     def on_amcl(self, m):
         c = m.pose.covariance
@@ -813,7 +919,7 @@ class Bridge(TaughtMeasurements, Node):
         `return true`，而且 DeserializePoseGraph.srv 的 response 段是空的（没有 result）。
         所以这里只负责把请求发出去，图到底加载没有交给 map_overlap_check.py 量。
         """
-        if not self.deser_cli.service_is_ready():
+        if self.deser_cli is None or not self.deser_cli.service_is_ready():
             raise RuntimeError('slam_toolbox 的 deserialize_map 服务不可用（建图没在跑？）')
         req = DeserializePoseGraph.Request()
         req.filename = os.path.join(DATA, 'maps', name)
@@ -860,8 +966,27 @@ class Bridge(TaughtMeasurements, Node):
         t = m.twist.twist
         self.odom = (t.linear.x, t.linear.y, t.angular.z)
         p, st = m.pose.pose, m.header.stamp
+        if self.odom_wild is None:
+            self.odom_wild = self.odom_sanity(t, p)
         self.odom_pose = (p.position.x, p.position.y, yaw_of(p.orientation), time.monotonic())
         self.speed.add(time.monotonic(), st.sec + st.nanosec * 1e-9, p.position.x, p.position.y, yaw_of(p.orientation))
+
+    def odom_sanity(self, t, p):
+        """里程计数值离谱（摔倒后 FAST-LIO 发散的样子）：返回 (原因, monotonic, time)，正常返回 None。"""
+        now, why = time.monotonic(), None
+        vals = (t.linear.x, t.linear.y, t.angular.z, p.position.x, p.position.y)
+        last, self._odom_last = getattr(self, '_odom_last', None), (p.position.x, p.position.y, now)
+        if not all(math.isfinite(v) for v in vals):
+            why = '里程计输出了无效数值'
+        elif math.hypot(t.linear.x, t.linear.y) > ODOM_WILD_SPEED:
+            why = f'里程计速度 {math.hypot(t.linear.x, t.linear.y):.1f} m/s（狗最快约 1.2 m/s）'
+        elif abs(t.angular.z) > ODOM_WILD_TURN:
+            why = f'里程计转速 {t.angular.z:.1f} rad/s'
+        elif last and now - last[2] < 0.5:
+            jump = math.hypot(p.position.x - last[0], p.position.y - last[1])
+            if jump > ODOM_WILD_JUMP:
+                why = f'里程计位置 {now - last[2]:.2f} s 内跳了 {jump:.1f} m'
+        return (why, now, time.time()) if why else None
 
     def on_healthy(self, m):
         self.rates['/odom_healthy'].tick()
@@ -956,6 +1081,9 @@ class Bridge(TaughtMeasurements, Node):
             self.event('INFO', '导航目标已取消')
         else:
             self.event('ERROR', f'导航失败（Nav2 放弃了这个目标）{": " + repr(err) if err else ""}')
+            cb = self.on_goal_fail   # 异常记录（rclpy 线程 → Server 自己切回 asyncio）
+            if cb and g.get('kind') != 'route':   # 巡逻任务的站点失败由 run_route 判断（可能在容差内算到达）
+                cb(p)
 
     def on_params(self, fut):
         try:
@@ -1006,10 +1134,10 @@ class Bridge(TaughtMeasurements, Node):
         g.planner_id = 'GridBased'
         return self.planner.send_goal_async(g)
 
-    def track_goal(self, handle, pose):
+    def track_goal(self, handle, pose, kind='goal'):
         gid = bytes(handle.goal_id.uuid)
         with self.lock:
-            self.goal = {'id': gid, 'pose': pose, 't0': time.monotonic(), 'status': 'active', 'end': None,
+            self.goal = {'id': gid, 'pose': pose, 'kind': kind, 't0': time.monotonic(), 'status': 'active', 'end': None,
                          'remaining': None, 'total': None, 'nav_time': None, 'eta': None, 'recoveries': 0}
         result = handle.get_result_async()
         result.add_done_callback(lambda f: self.on_result(gid, f))
@@ -1235,7 +1363,9 @@ class Server(TaughtWeb):
         self.map_busy = False         # 保存和导出地图期间保护源快照及目标文件
         # 续建（docs/地图续建.md）：一次会话 = 基准图 + 新图名字 + 起点位姿 + 自检结果
         self.cont = None              # {base, name, source, pose, warn, check, started, paused}
+        self.cont_hold = ()           # cont_start 进行中的 (基准, 新名)：自动保存清理不许碰
         self.cont_busy = False
+        self.cont_blocked = False
         # 建图自动保存：name = 这次建图的自动保存名；t = 上次存成功的时间；crc = 那时 /map 的 crc
         self.autosave = {'name': None, 't': 0.0, 'wall': None, 'crc': None, 'dur': None, 'err': None,
                          'running': False, 'problem': False, 'count': 0}
@@ -1244,7 +1374,20 @@ class Server(TaughtWeb):
         self.bags = P.list_bags(os.path.join(DATA, 'bags'))
         self.rollback_file = os.path.join(DATA, 'rollback.json')
         self.rollback_on, self.rollback_t, self.rollback_started, self.rollback_saving = True, 0.0, False, False
-        self.stuck, self.stuck_t = StuckWatch(), -STUCK_COOLDOWN
+        self.stuck = StuckWatch()
+        # 异常记录 + 自动录包（incidents.py）。变化时推给所有网页
+        self.incidents = INC.IncidentLog(os.path.join(DATA, 'incidents.json'), on_change=self.incident_push)
+        if self.incidents.error:
+            node.event('ERROR', self.incidents.error)
+        self.inc_save = None          # 计划中的异常存包：{'at': 存包时刻, 't0': 第一条异常时刻, 'ids': [...]}
+        self.inc_bag_t = {}           # 类型 → 上次为它自动存包的时间
+        self.map_frozen = None        # 建图冻结（摔倒 / 里程计异常）：{reason, wild, wall, kept, kept_wall, gate}
+        self.fall_prev = None         # 上一轮看到的运控状态（检测意外掉到 Passive）
+        self.lie_done_t = -1e9        # 网页最近一次让狗趴下结束的时间
+        self.odom_wild_seen = None
+        self.inc_open = {}            # 持续中的异常：'stuck' / 'estop' / 'motor_hot' / 'ctrl_offline' → id
+        self.rollback_last = None     # 最近一次存成功的回溯包名
+        self.loop = None
         self.quota_warned = False     # 超限又删不动时只报一次警，回到上限以下再复位
         try:
             with open(self.rollback_file) as f:
@@ -1308,6 +1451,8 @@ class Server(TaughtWeb):
         self.stand_hold = False    # 网页点了「保持站立」：不自动趴下，直到下次出发或手动趴下
         self.idle_since = None     # 开始空闲的时间
         self.ctrl_online = None    # 运控在线状态（ctrl_watch 记变化）；None = 刚启动还没判断
+        # 雷达无数据（lidar_watch）：active = 档位稳定在跑的起点；bad = 判定没数据的时刻；msg = 给人看的原因
+        self.lidar = {'active': None, 'bad': None, 'msg': None}
         self.t_start = time.monotonic()
         self.prep_hold_t = -1e9    # 网页自检最近一次说「我在自检」的时间
         self.init_taught(DATA)
@@ -1414,9 +1559,12 @@ class Server(TaughtWeb):
                 # 先停车，再记日志
                 self.estop, self.estop_t = True, time.monotonic()
                 errors = await self.disarm_and_cancel(f'网页急停（{self.remote(ws)}）')
+                if 'estop' not in self.inc_open:
+                    self.inc_open['estop'] = self.incident('estop', f'网页急停（{self.remote(ws)}）', ongoing=True)
                 return (False, '急停已锁存，但：' + '；'.join(errors)) if errors else (True, '已急停：导航已取消，底盘已上锁')
             if op == 'release_estop':
                 self.estop = False
+                self.incident_close('estop')
                 n.event('INFO', '急停已解除（底盘仍上锁）')
                 return True, '急停已解除，底盘仍处于上锁'
             if op == 'initial_pose':
@@ -1579,6 +1727,8 @@ class Server(TaughtWeb):
                 if not res[0]:
                     n.event('WARN', f'续建没开始：{res[1]}（{self.remote(ws)}）')
                 return res
+            if op == 'map_resume':
+                return await self.map_resume(self.remote(ws))
             if op == 'cont_check':
                 return await self.cont_check()
             if op == 'cont_finish':
@@ -1727,6 +1877,76 @@ class Server(TaughtWeb):
             return self.ctrl_done(True, '已趴下' + ('（电机过热自动）' if auto == 'hot' else '（空闲自动）' if auto else ''))
         finally:
             self.ctrl_op, self.ctrl_abort = None, False
+            self.lie_done_t = time.monotonic()
+
+    # ---------- 摔倒 / 里程计发散保护 ----------
+    def fall_tick(self):
+        """safety 循环 5 Hz：运控意外掉到 Passive、或里程计数值离谱 → 记异常（自动存回溯包），建图中就冻结。"""
+        n = self.node
+        s, _, _ = self.ctrl_get()
+        prev, self.fall_prev = self.fall_prev, (s or self.fall_prev)
+        if (prev in ('FixStand', 'Velocity') and s == 'Passive' and self.ctrl_op != 'down'
+                and time.monotonic() - self.lie_done_t > FALL_LIE_GRACE):
+            msg = f'运控从 {prev} 意外掉到 Passive（摔倒，或遥控器让它趴下）'
+            self.incident('fall', msg)
+            if self.prof('mapping') == 'run':
+                self.background(self.freeze_mapping(msg))
+        w = n.odom_wild
+        if w and w is not self.odom_wild_seen:
+            self.odom_wild_seen = w
+            self.incident('odom_wild', f'{w[0]}：FAST-LIO 很可能已经发散')
+            if self.prof('mapping') == 'run':
+                self.background(self.freeze_mapping(w[0], wild=True))
+
+    async def freeze_mapping(self, reason, wild=False):
+        """关扫描闸门（地图停在这一刻）、停自动保存（最近一份好的不再被覆盖）、暂停续建采集。"""
+        n, a = self.node, self.autosave
+        f = self.map_frozen
+        if f:
+            if wild and not f['wild']:
+                f['wild'] = True
+                f['reason'] += f'；随后{reason}'
+                n.event('ERROR', f'建图冻结中又发现{reason}：里程计已经飘了，不能再继续建，只能停止建图后续建')
+            return
+        f = self.map_frozen = {'reason': reason, 'wild': wild, 'wall': time.time(),
+                               'kept': a['name'] if a['wall'] else None, 'kept_wall': a['wall'], 'gate': None}
+        try:
+            await self.gate_set(0)
+            f['gate'] = True
+        except Exception as e:
+            f['gate'] = False
+            gate_err = str(e) or repr(e)
+        if self.cont:
+            self.cont['ready'] = False
+            self.cont['check'] = {'ok': False, 'code': 'frozen', 'reason': f'建图冻结：{reason}'}
+        kept = (f"最近一份好的自动保存 data/maps/{f['kept']}（{time.strftime('%H:%M:%S', time.localtime(f['kept_wall']))}）"
+                f"不会再被覆盖" if f['kept'] else '还没有自动保存过')
+        n.event('ERROR', f'建图已冻结：{reason}。' +
+                ('已关闭建图扫描闸门，地图停在这一刻；' if f['gate'] else
+                 f'扫描闸门不可用（{gate_err}），slam 可能还在被写坏；') +
+                f'自动保存已暂停，{kept}。建议：停止建图，把狗扶正、静止放平，再从这份图（或刚手动保存的图）续建' +
+                ('' if wild else '；如果只是正常趴下、地图没乱，站起来后可以点「继续建图」'))
+
+    async def map_resume(self, who):
+        f = self.map_frozen
+        if not f:
+            return False, '建图没有被冻结'
+        if f['wild'] or self.node.odom_wild:
+            return False, '里程计已经飘过，继续建只会把地图写坏：请停止建图，扶正静止后从最近的好图续建'
+        if self.prof('mapping') != 'run':
+            return False, '建图没有在运行'
+        s, _, _ = self.ctrl_get()
+        if s not in ('FixStand', 'Velocity'):
+            return False, f'先让狗站起来再继续建图（运控状态 {s}；趴着时雷达高度不对，扫到的墙会错位）'
+        if self.cont:
+            self.map_frozen = None
+            self.node.event('WARN', f'解除建图冻结（{who}）：续建采集仍暂停，站稳后点「自检」，通过才恢复')
+            return True, '已解除冻结：续建请站稳后点「自检」，通过后才会恢复采集'
+        if f['gate']:
+            await self.gate_set(-1)
+        self.map_frozen = None
+        self.node.event('WARN', f"继续建图（{who}）：解除冻结（原因：{f['reason']}），自动保存恢复")
+        return True, '已继续建图，自动保存恢复'
 
     # ---------- 运控策略切换：只在趴着时，停掉 control 组换策略名重启 ----------
     def policies(self):
@@ -1843,6 +2063,7 @@ class Server(TaughtWeb):
             return
         hot = self.motor_hot()
         if not hot:
+            self.incident_close('motor_hot')   # 降到阈值以下（或温度读不到了）：这次过热结束
             return
         s, _, _ = self.ctrl_get()
         now = time.monotonic()
@@ -1851,6 +2072,9 @@ class Server(TaughtWeb):
         self.hot_lie_t = now
         v, i = hot
         self.node.event('ERROR', f'电机过热：{MOTOR_NAMES[i]} {v} ℃（≥{MOTOR_HOT_LIE:.0f} ℃），自动趴下')
+        if 'motor_hot' not in self.inc_open:   # 没趴成隔一会儿重试，仍是同一次过热
+            self.inc_open['motor_hot'] = self.incident(
+                'motor_hot', f'{MOTOR_NAMES[i]} {v} ℃（≥{MOTOR_HOT_LIE:.0f} ℃），自动趴下', ongoing=True)
         self.background(self.lie_down(f'{MOTOR_NAMES[i]} {v} ℃ 过热，自动', auto='hot'))
 
     def ctrl_watch(self):
@@ -1866,14 +2090,71 @@ class Server(TaughtWeb):
                 self.ctrl_online = False
                 self.node.event('ERROR', '运控离线：后端启动以来没有收到运控状态（/go2w_ctrl/state），'
                                          '站起和出发都不可用。检查运行容器的 control 组和域 0 通信')
+                self.inc_open['ctrl_offline'] = self.incident('ctrl_offline', '后端启动以来没有收到运控状态', ongoing=True)
             return
         if prev and not online:
             self.ctrl_online = False
             self.node.event('ERROR', f'运控离线：超过 {CTRL_STALE:.0f} s 没有收到运控状态（/go2w_ctrl/state），'
                                      '站起和出发都不可用。检查运行容器的 control 组和域 0 通信')
+            self.inc_open['ctrl_offline'] = self.incident(
+                'ctrl_offline', f'超过 {CTRL_STALE:.0f} s 没有收到运控状态', ongoing=True)
         elif not prev and online:
             self.ctrl_online = True
+            self.incident_close('ctrl_offline')
             self.node.event('INFO', '运控已恢复：重新收到运控状态')
+
+    def lidar_watch(self):
+        """每秒一次。建图 / 定位 / 导航在 run 且已稳 LIDAR_GRACE 秒后才判断；档位停了就把没结束的异常收掉。"""
+        L, n, now = self.lidar, self.node, time.monotonic()
+        if not any(self.prof(m) == 'run' for m in P.MODES):
+            if L['bad'] is not None:
+                self.incident_close('lidar_lost')
+                n.event('INFO', f"档位已停，雷达无数据的提醒结束（持续约 {now - L['bad']:.0f} s）")
+            L.update(active=None, bad=None, msg=None)
+            return
+        if L['active'] is None:
+            L['active'] = now
+        if now - L['active'] < LIDAR_GRACE:
+            return
+        stamps = n.rates['/scan'].stamps
+        quiet = now - max(stamps[-1] if stamps else 0.0, L['active'] + LIDAR_GRACE - LIDAR_STALE)
+        if L['bad'] is None:
+            if quiet < LIDAR_STALE:
+                return
+            L['bad'] = now
+            driver = 'livox_lidar_publisher' in set(n.get_node_names())
+            L['msg'] = f'/scan 已经 {quiet:.0f} s 没有数据' if driver else '雷达驱动没有运行（livox_lidar_publisher 不在）'
+            self.inc_open['lidar_lost'] = self.incident('lidar_lost', L['msg'], ongoing=True, ago=quiet,
+                                                        bag='雷达没数据，回溯包里也没有点云，不存')
+            if driver:
+                n.event('ERROR', f"雷达无数据：{L['msg']}，正在检查雷达网络……")
+                asyncio.ensure_future(self.lidar_report(L['bad']))
+            else:
+                n.event('ERROR', f"雷达无数据：{L['msg']}，停止后重开档位")
+        elif quiet < 1.0:
+            self.incident_close('lidar_lost')
+            n.event('INFO', f"雷达已恢复：/scan 又有数据了（断了约 {now - L['bad'] + LIDAR_STALE:.0f} s）")
+            L.update(bad=None, msg=None)
+
+    async def lidar_report(self, since):
+        try:
+            text = await lidar_diagnose()
+        except Exception as e:
+            text = f'诊断失败：{e!r}'
+        L = self.lidar
+        if L['bad'] != since:   # 诊断期间已经恢复 / 档位停了
+            return
+        L['msg'] = f"{L['msg']}。{text}"
+        self.node.event('ERROR', f'雷达无数据：{text}')
+        rid = self.inc_open.get('lidar_lost')
+        rec = self.incidents.get(rid) if rid else None
+        if rec is not None:
+            rec['msg'] = L['msg']
+            self.incidents.changed(rec)   # 存盘 + 推给云端监控页
+
+    def lidar_view(self):
+        L = self.lidar
+        return None if L['bad'] is None else {'since': round(time.monotonic() - L['bad'], 1), 'msg': L['msg']}
 
     def ctrl_view(self):
         if self.ctrl is None:
@@ -1921,12 +2202,15 @@ class Server(TaughtWeb):
             ):
                 raise ValueError('路线包含无效坐标')
             label, manual = point.get('name', ''), point.get('manualHeading', True)
+            note = point.get('note', '')    # 11-18：站点备注（给云端监控页看），老任务没有 = 空
             if not isinstance(label, str) or len(label.strip()) > 40:
                 raise ValueError('站点名称最多 40 个字符')
+            if not isinstance(note, str) or len(note.strip()) > ROUTE_NOTE_MAX:
+                raise ValueError(f'站点备注最多 {ROUTE_NOTE_MAX} 个字符')
             if type(manual) is not bool:
                 raise ValueError('站点朝向类型无效')
             clean.append({'x': point['x'], 'y': point['y'], 'th': point['th'],
-                          'name': label.strip(), 'manualHeading': manual})
+                          'name': label.strip(), 'note': note.strip(), 'manualHeading': manual})
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
 
@@ -2200,6 +2484,8 @@ class Server(TaughtWeb):
         return result
 
     def finish_route(self, route, status, message):
+        if status == 'aborted' and route['status'] == 'active':
+            self.incident('nav_fail', f"巡逻任务「{route['record']['name']}」{message}")   # 先记，任务信息还是执行中的
         route.update(status=status, message=message, ended=time.monotonic())
         route['stop'].set()
         self.node.event('ERROR' if status == 'aborted' else 'INFO', message)
@@ -2595,7 +2881,7 @@ class Server(TaughtWeb):
                 if route['stop'].is_set():
                     await self.aw(handle.cancel_goal_async(), 2.0)
                     return
-                result = n.track_goal(handle, pose)
+                result = n.track_goal(handle, pose, 'route')
                 route['goal'] = dict(zip(('x', 'y', 'th'), pose))
                 stop = asyncio.create_task(route['stop'].wait())
                 done = asyncio.create_task(self.aw(result, 180.0))
@@ -2658,6 +2944,7 @@ class Server(TaughtWeb):
                 'roundTrip': loops is not None, 'loop': route['loop'], 'loops': loops, 'back': route['back'],
                 'progress': progress,
                 'routeId': record['id'], 'pointName': record['points'][i]['name'],
+                'pointNote': record['points'][i].get('note', ''),
                 'message': route['message'], 'elapsed': route.get('ended', time.monotonic()) - route['started']}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------
@@ -2682,7 +2969,7 @@ class Server(TaughtWeb):
 
     def set_mode(self, mode, map_name=None, *, force=False, taught_route=False):
         n = self.node
-        if self.busy or self.map_busy:
+        if self.busy or self.map_busy or self.cont_busy:
             return False, '上一个启停还没完成，稍等几秒'
         if mode is not None and mode not in P.MODES:
             return False, f'没有这个档位：{mode}'
@@ -2717,14 +3004,23 @@ class Server(TaughtWeb):
                     await self.disarm_and_cancel('切换运行档位')
                 # 「停止全部」不走下面的 if mode 分支，所以重置要放在停档位这一侧：
                 # 建图一停，续建的起点位姿和自检结果都不再成立
+                await self.incident_flush('停止' + '、'.join(self.MODE_NAME[m] for m in cur) if cur else '停止巡逻')
                 if 'mapping' in cur:
                     # 停掉之前先存一份：地图只在 slam_toolbox 内存里，一停就没了（11-16 就这样丢过图）
                     t_wait = time.monotonic()
                     while self.autosave['running'] and time.monotonic() - t_wait < 60.0:   # 等正在写的那次写完
                         await asyncio.sleep(0.2)
-                    await self.autosave_now('停止建图前')
+                    if self.map_frozen:
+                        f = self.map_frozen
+                        n.event('INFO', '建图冻结中，停止前不再自动保存' +
+                                (f"：保留 data/maps/{f['kept']}（{time.strftime('%H:%M:%S', time.localtime(f['kept_wall']))}）"
+                                 if f['kept'] else ''))
+                    else:
+                        await self.autosave_now('停止建图前')
                     self.reset_cont('停止建图')
                 ok = await self.procs.stop_modes()   # supervisor 正常停止导航组和巡逻，不影响控制组
+                if 'mapping' in cur:
+                    self.map_frozen = None
                 self.bridge_t, self.bridge_started = -1e9, False   # 不算异常退出；停完马上可以重新拉起
                 await self.refresh_procs()
                 for m in cur:
@@ -2743,6 +3039,7 @@ class Server(TaughtWeb):
             if mode:
                 self.autoloc = {'state': 'idle', 'seq': self.autoloc['seq']}   # 上一轮的自动定位结果作废
                 self.autoloc_reset()   # FAST-LIO 重启，odom 坐标系变了
+                self.map_frozen, n.odom_wild, self.odom_wild_seen = None, None, None
                 # 续建会话跟着建图档位走：档位一换，起点位姿和自检结果都作废。
                 # 不清的话，停掉建图再重开后界面还显示上一个起点位姿，而它已经不对了
                 self.reset_cont('切换运行档位')
@@ -2750,6 +3047,7 @@ class Server(TaughtWeb):
                 self.starting[mode] = time.monotonic()
                 if mode == 'mapping':
                     self.autosave_new_session()
+                    self.cont_blocked = False
                 # 新版网页启动导航时始终启用示教代理：无参考时仍走原规划；有参考自动读取地图YAML。
                 await self.procs.start_mode(mode, map_name, taught_route=(mode == 'navigation' and self.taught_repo.available) or taught_route)
                 await asyncio.sleep(0.3)
@@ -2940,35 +3238,159 @@ class Server(TaughtWeb):
             await self.procs.stop_rollback()
 
     def stuck_tick(self):
-        """导航目标没到、狗却长时间停着不动时，自动保存一段回溯包。"""
+        """导航目标没到、狗却长时间停着不动：记一条「长时受阻」（持续到动起来或导航结束），并自动存回溯包。"""
         n, now = self.node, time.monotonic()
         o = n.odom_pose
         pose = o[:3] if o and now - o[3] < STALE else None
         active = n.nav_active() and bool(n.is_armed()) and not self.estop
         still = self.stuck.update(now, pose, active)
+        if 'stuck' in self.inc_open and not self.stuck.fired:   # 动起来了 / 导航结束：这次卡住结束
+            self.incident_close('stuck')
         if still is None:
             return
-        if not (self.procs_status or {}).get('rollback'):
-            n.event('WARN', f'导航中已经 {still:.0f} 秒没动了，但回溯录制没在运行，没法自动存包')
-            return
-        if now - self.stuck_t < STUCK_COOLDOWN:
-            n.event('WARN', f'导航中已经 {still:.0f} 秒没动了（{STUCK_COOLDOWN:.0f} 秒内已自动存过包，这次不存）')
-            return
-        self.stuck_t = now
-        n.event('WARN', f'导航中已经 {still:.0f} 秒没动了，还没到目标，{STUCK_AFTER:.0f} 秒后自动保存回溯包'
-                        f'（卡住前 {STUCK_BEFORE:.0f} 秒 + 后 {STUCK_AFTER:.0f} 秒）')
+        n.event('WARN', f'导航中已经 {still:.0f} 秒没动了，还没到目标')
+        self.inc_open['stuck'] = self.incident(
+            'stuck', f'导航中原地不动超过 {STUCK_SECONDS:.0f} 秒，还没到目标', ongoing=True, ago=still)
 
-        async def later():
-            await asyncio.sleep(STUCK_AFTER)
-            waited = 0
-            for _ in range(10):   # 正好有人在手动保存时等它存完
-                if not self.rollback_saving:
-                    break
-                await asyncio.sleep(1.0)
-                waited += 1
-            # 等手动保存时多过去的秒数也补上，起点仍是卡住前 STUCK_BEFORE 秒
-            await self.rollback_save('卡住自动保存', STUCK_BEFORE + STUCK_AFTER + waited)
-        self.background(later())
+    # ---------- 异常记录 + 自动录包（incidents.py） ----------
+    def incident_task(self):
+        """正在跑的巡逻任务（异常记录里的 task）；没有 = None。"""
+        r = self.route
+        if not r or r['status'] != 'active':
+            return None
+        rec, i = r['record'], r['index']
+        return {'routeId': rec['id'], 'name': rec['name'], 'point': i + 1, 'pointName': rec['points'][i]['name']}
+
+    def incident(self, typ, msg, ongoing=False, ago=0.0, task=INC_AUTO, bag=True):
+        """记一条异常并安排自动存包，返回 id。不抛异常：会在停车等安全动作的路径上调用。
+        ago = 异常实际开始于多少秒前（卡住是判定时已经停了 8 秒）；task 不传 = 取当前任务。"""
+        n = self.node
+        try:
+            pose = None
+            try:
+                p = n.lookup(BASE_FRAME)
+                if p:
+                    pose = {'x': round(p[0], 3), 'y': round(p[1], 3), 'th': round(p[2], 3), 'frame': n.fixed}
+            except Exception:
+                pass
+            rec = self.incidents.open(typ, msg, robot_id()[0], ts=INC.now_ms() - ago * 1000, pose=pose,
+                                      map_name=self.shown_map(), ongoing=ongoing,
+                                      task=self.incident_task() if task is INC_AUTO else task)
+            if bag is True:
+                self.incident_bag(rec)
+            else:
+                self.incidents.set_bag(rec['id'], 'skipped', msg=bag or '这类异常不存包')
+            if self.incidents.error:
+                n.event('ERROR', self.incidents.error)
+            return rec['id']
+        except Exception as e:
+            n.get_logger().error(f'异常记录失败（{typ}：{msg}）：{e!r}')
+            return None
+
+    def incident_close(self, key):
+        rid = self.inc_open.pop(key, None)
+        if rid:
+            try:
+                self.incidents.close(rid)
+            except Exception as e:
+                self.node.get_logger().error(f'异常记录结束失败（{key}）：{e!r}')
+
+    def goal_failed(self, pose):
+        """单点导航目标被 Nav2 放弃（rclpy 线程经 call_soon_threadsafe 转过来）。"""
+        self.incident('nav_fail', f'导航目标 ({pose[0]:.2f}, {pose[1]:.2f}) 失败：Nav2 放弃了这个目标')
+
+    def incident_bag(self, rec):
+        """给这条异常安排自动存包：并进已计划的包 / 新计划一个 / 说明为什么不存。"""
+        L, n, rid, typ, label = self.incidents, self.node, rec['id'], rec['type'], rec['label']
+        now = time.monotonic()
+        if not (self.procs_status or {}).get('rollback'):
+            L.set_bag(rid, 'skipped', msg='回溯录制没在运行（建图 / 定位 / 导航都没开，或回溯被关掉）')
+            n.event('WARN', f'{label}：回溯录制没在运行，没法自动存包')
+            return
+        p = self.inc_save
+        if p and p['at'] - now >= INC_MERGE:
+            p['ids'].append(rid)
+            L.set_bag(rid, 'pending', msg='和前面的异常存进同一个包')
+            return
+        if now - self.inc_bag_t.get(typ, -1e9) < STUCK_COOLDOWN:
+            L.set_bag(rid, 'skipped', msg=f'{STUCK_COOLDOWN:.0f} 秒内已为同类异常自动存过包')
+            n.event('WARN', f'{label}：{STUCK_COOLDOWN:.0f} 秒内已为同类异常自动存过包，这次不存')
+            return
+        self.inc_bag_t[typ] = now
+        p = self.inc_save = {'at': now + STUCK_AFTER, 't0': now, 'ids': [rid], 'done': asyncio.Event()}
+        n.event('INFO', f'{label}：{STUCK_AFTER:.0f} 秒后自动保存回溯包（异常前 {STUCK_BEFORE:.0f} 秒 + 后 {STUCK_AFTER:.0f} 秒）')
+        self.background(self.incident_save(p))
+
+    async def incident_save(self, p):
+        try:
+            await self._incident_save(p)
+        finally:
+            p['done'].set()
+
+    async def incident_flush(self, why):
+        """停档位前：还在等「异常后 15 秒」的包马上存掉——档位一停回溯录制就跟着停，到点时已经没东西可存
+        （11-19：摔倒后照提示马上停止建图，就会这样丢包）。"""
+        p = self.inc_save
+        if not p or p['done'].is_set():
+            return
+        left = p['at'] - time.monotonic()
+        if left > 0:
+            self.node.event('INFO', f'{why}：先把异常回溯包存掉（异常后只录到 {STUCK_AFTER - left:.0f} 秒）')
+            p['at'] = time.monotonic()
+        try:
+            await asyncio.wait_for(p['done'].wait(), ROLLBACK_SAVE_TIMEOUT + 15.0)
+        except asyncio.TimeoutError:
+            self.node.event('WARN', f'{why}：异常回溯包没存完，继续停止')
+
+    async def _incident_save(self, p):
+        L = self.incidents
+        while time.monotonic() < p['at']:          # 可能被 incident_flush 提前
+            await asyncio.sleep(min(0.2, max(0.0, p['at'] - time.monotonic())))
+        if self.inc_save is p:
+            self.inc_save = None          # 从现在起的新异常另起一个包
+        for _ in range(10):               # 正好有人在手动保存时等它存完
+            if not self.rollback_saving:
+                break
+            await asyncio.sleep(1.0)
+        for rid in p['ids']:
+            L.set_bag(rid, 'saving')
+        labels = '、'.join(dict.fromkeys(r['label'] for r in map(L.get, p['ids']) if r))
+        try:
+            # 起点固定在第一条异常前 STUCK_BEFORE 秒；等手动保存多过去的秒数也算进去
+            ok, msg = await self.rollback_save(f'异常自动保存：{labels}', STUCK_BEFORE + time.monotonic() - p['t0'])
+        except Exception as e:
+            ok, msg = False, f'{e!r}'
+        name = self.rollback_last if ok else None
+        for rid in p['ids']:
+            L.set_bag(rid, 'saved' if ok else 'failed', name=name, msg='' if ok else msg)
+        if ok and name:
+            # 包目录里也放一份异常说明：包被上传 / 拷走后也知道它为什么存的
+            try:
+                recs = [r for r in map(L.get, p['ids']) if r]
+                with open(os.path.join(DATA, 'bags', name, 'incidents.json'), 'w', encoding='utf-8') as f:
+                    json.dump(recs, f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                self.node.get_logger().warn(f'包 {name} 里写异常说明失败：{e!r}')
+
+    def incident_push(self, rec):
+        data = json.dumps({'t': 'incident', 'item': rec}, ensure_ascii=False)
+        for ws in list(self.clients):
+            self.tx_put(ws, data)
+
+    def incidents_message(self):
+        return json.dumps({'t': 'incidents', 'items': self.incidents.recent(INC_PUSH)}, ensure_ascii=False)
+
+    async def api_incidents(self, req):
+        """GET /api/incidents?limit=50&before=<ts 毫秒>：最新的在前，翻页时 before = 上一页最后一条的 ts。"""
+        try:
+            limit = max(1, min(500, int(req.query.get('limit', 50))))
+            before = int(req.query['before']) if req.query.get('before') else None
+        except ValueError:
+            return web.json_response({'error': 'limit / before 需要是整数'}, status=400,
+                                     headers={'Access-Control-Allow-Origin': '*'})
+        return web.json_response({'items': self.incidents.recent(limit, before)},
+                                 dumps=lambda o: json.dumps(o, ensure_ascii=False),
+                                 headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
     async def rollback_save(self, who, seconds=ROLLBACK_SECONDS):
         if not (self.procs_status or {}).get('rollback'):
@@ -3004,6 +3426,7 @@ class Server(TaughtWeb):
                     b = next((x for x in self.bags if x['name'] == name), {})
                     info = f"{b.get('dur') or 0:.0f} 秒，{b.get('size', 0):.0f} MB"
                     self.node.event('INFO', f'已保存回溯 {name}（{info}，{who}）')
+                    self.rollback_last = name
                     return True, f'已保存回溯 {name}（{info}）'
                 await asyncio.sleep(0.1)
             self.node.event('ERROR', f'回溯保存超时（{ROLLBACK_SAVE_TIMEOUT:.0f} s），看 data/logs/rollback.log')
@@ -3097,7 +3520,7 @@ class Server(TaughtWeb):
             return None
         return {'name': a['name'], 'ago': (time.monotonic() - a['t']) if a['wall'] else None, 'wall': a['wall'],
                 'count': a['count'], 'err': a['err'], 'running': a['running'],
-                'period': self.autosave_period(), 'on': self.prof('mapping') == 'run'}
+                'period': self.autosave_period(), 'on': self.prof('mapping') == 'run', 'frozen': self.map_frozen}
 
     def autosave_period(self):
         # 单次存图（slam 写 posegraph 时会锁住建图）超过周期的 1/10 就拉长间隔，免得拖慢 slam
@@ -3125,7 +3548,9 @@ class Server(TaughtWeb):
             return
         if not a['name']:
             self.autosave_new_session()   # 后端重启时建图已经在跑
-        if a['running'] or self.busy or self.map_busy or self.map_loading or self.cont_busy:
+        if self.map_frozen:
+            return        # 冻结了：最近那份好的不能再被覆盖
+        if a['running'] or self.busy or self.map_busy or self.map_loading or self.cont_busy or self.cont_blocked:
             return
         now = time.monotonic()
         problem = self.autosave_problem()
@@ -3141,10 +3566,16 @@ class Server(TaughtWeb):
     async def autosave_now(self, reason):
         """存一次。reason=None 是定时保存（只在地图有变化时存、成功不刷日志）。返回 (ok, msg)。"""
         a, n = self.autosave, self.node
-        if a['running']:
+        if a['running'] or self.map_busy:
             return False, '自动保存正在进行'
         if not a['name']:
             return False, '没有在建图'
+        if self.map_frozen:
+            return False, '建图已冻结（摔倒 / 里程计异常），自动保存暂停，最近一份好的不再覆盖'
+        if not await self.mapping_save_allowed():
+            return False, '续建还在验证，暂停自动保存'
+        if a['running'] or self.map_busy:
+            return False, '自动保存正在进行'
         raw, crc = n.map_raw, n.map_crc
         if raw is None:
             return False, '还没有收到 /map'
@@ -3168,7 +3599,10 @@ class Server(TaughtWeb):
                     raise RuntimeError(f'slam_toolbox 没有写出 {name}{ext}')
             grid, res_m, ox, oy = raw
             await asyncio.get_running_loop().run_in_executor(None, mapfile.write, tmp, grid, res_m, ox, oy)
+            if self.map_frozen:   # 写盘期间冻结了：这一份可能已经是坏的，不覆盖
+                raise RuntimeError('写盘期间建图被冻结，这一份没有采用')
             base = os.path.join(maps_dir, name)
+            self.autosave_keep_prev(maps_dir, name)
             for ext in ('.posegraph', '.data', '.pgm', '.yaml'):   # yaml 最后：列表里出现时其余文件已经齐了
                 os.replace(tmp + ext, base + ext)
                 if hasattr(os, 'geteuid') and os.geteuid() == 0:
@@ -3195,53 +3629,96 @@ class Server(TaughtWeb):
         self.maps = P.list_maps(maps_dir)
         return True, f'已自动保存 {name}'
 
+    @staticmethod
+    def autosave_keep_prev(maps_dir, name):
+        """覆盖前把现有的 <名字>.* 挪成 <名字>_prev.*（yaml 里的 image 跟着改），只留一份。"""
+        base, prev = os.path.join(maps_dir, name), os.path.join(maps_dir, name + AUTOSAVE_PREV)
+        if not os.path.isfile(base + '.yaml'):
+            return
+        try:
+            if os.path.exists(prev + '.yaml'):
+                os.remove(prev + '.yaml')            # 先让旧的 _prev 从地图列表里消失
+            for ext in ('.pgm', '.posegraph', '.data'):
+                if os.path.isfile(base + ext):
+                    os.replace(base + ext, prev + ext)
+            with open(base + '.yaml', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            lines = [f'image: {name}{AUTOSAVE_PREV}.pgm' if ln.startswith('image:') else ln for ln in lines]
+            with open(prev + '.yaml.tmp', 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+            os.replace(prev + '.yaml.tmp', prev + '.yaml')
+            os.remove(base + '.yaml')
+        except OSError:
+            pass   # 留不下上一份不影响这次保存
+
     def autosave_prune(self):
-        """只留最近 AUTOSAVE_KEEP 次建图的自动保存；被路线用到的、正在用的不删。"""
+        """只留最近 AUTOSAVE_KEEP 次建图的自动保存，旧的挪进回收站（data/maps/.trash，和「管理地图」删除同一处）。
+        只认网页自己起的名字（is_autosave）：续建 / 编辑 / 手动保存出来的图哪怕名字以 autosave_ 开头也不动。
+        正在用的、被路线引用的、续建正在拿来当基准或目标的不动。"""
         maps_dir = os.path.join(DATA, 'maps')
         try:
             files = os.listdir(maps_dir)
         except OSError:
             return
-        names = sorted({f.split('.', 1)[0] for f in files if f.startswith(AUTOSAVE_PREFIX) and f.endswith('.yaml')})
-        keep = set(names[-AUTOSAVE_KEEP:]) | {self.autosave['name'], self.node.map_current}
-        keep |= {r.get('map') for r in self.routes.values()}
+        names = sorted({f[:-len('.yaml')] for f in files if f.endswith('.yaml') and is_autosave(f[:-len('.yaml')])})
+        sess = lambda nm: nm[:-len(AUTOSAVE_PREV)] if nm.endswith(AUTOSAVE_PREV) else nm   # _prev 跟着本次建图走
+        keep_sess = set(sorted({sess(nm) for nm in names})[-AUTOSAVE_KEEP:]) | {self.autosave['name']}
+        keep = {self.node.map_current, self.node.map_loaded} | {r.get('map') for r in self.routes.values()}
+        keep |= set(self.map_in_use()) | set(self.cont_hold)
+        if self.cont:
+            keep |= {self.cont.get('base'), self.cont.get('name')}
+        trash, stamp = os.path.join(maps_dir, '.trash'), time.strftime('%Y%m%d_%H%M%S')
         for name in names:
-            if name in keep:
+            if name in keep or sess(name) in keep_sess:
                 continue
-            for f in files:
-                if f.split('.', 1)[0] == name:
-                    try:
-                        os.unlink(os.path.join(maps_dir, f))
-                    except OSError:
-                        pass
-            self.node.event('INFO', f'删掉较早的建图自动保存 {name}（只留最近 {AUTOSAVE_KEEP} 次）')
+            try:
+                self.trash_map(maps_dir, name, os.path.join(trash, f'{stamp}_{name}'), [], None)
+            except OSError as e:
+                self.node.event('WARN', f'清理较早的建图自动保存 {name} 失败：{e}')
+                continue
+            self.node.event('INFO', f'较早的建图自动保存 {name} 挪进回收站 data/maps/.trash'
+                                    f'（只留最近 {AUTOSAVE_KEEP} 次，{self.MAP_TRASH_DAYS} 天后清掉）')
+        self.purge_trash(trash, self.MAP_TRASH_DAYS)
 
     async def save_map(self, name):
+        if is_autosave(name):
+            return False, 'autosave_月日_时分秒 这种名字留给建图自动保存（会被定期清理），请换个名字'
+        if self.map_busy or self.autosave['running']:
+            return False, '地图正在保存，请稍等'
+        self.map_busy = True
+        try:
+            return await self._save_map(name)
+        finally:
+            self.map_busy = False
+
+    async def _save_map(self, name):
         if self.busy or self.map_loading:
             return False, '档位或地图正在切换，请稍等'
         if self.prof('mapping') != 'run':
             return False, '保存地图需要「建图」正在运行'
+        if not await self.mapping_save_allowed():
+            return False, '续建还在验证，通过自检后才能保存'
+        if self.map_frozen:
+            f = self.map_frozen
+            self.node.event('WARN', f"在建图冻结状态下保存 {name}：地图停在 "
+                            f"{time.strftime('%H:%M:%S', time.localtime(f['wall']))}（{f['reason']}）" +
+                            ('；里程计飘过，保存后先检查墙有没有错位' if f['wild'] else ''))
         if not P.SAFE_NAME.match(name):
             return False, '地图名只能用字母、数字、下划线和减号'
         self.maps = P.list_maps(os.path.join(DATA, 'maps'))
         if any(m['name'] == name for m in self.maps):
             return False, f'已经有同名地图 {name}，换个名字（不会覆盖）'
         self.node.event('INFO', f'保存地图 {name}……')
-        self.map_busy = True
-        try:
-            if await self.procs.save_map(name):
-                self.maps = P.list_maps(os.path.join(DATA, 'maps'))
-                self.node.event('INFO', f'地图已保存：data/maps/{name}')
-                if MAPPING_VIEW in self.map_views:   # 建图时调好的显示方向带给新地图
-                    await self.set_view(name, self.map_views[MAPPING_VIEW])
-                return True, f'地图已保存：{name}'
-            return False, '保存失败：' + (P.tail(os.path.join(DATA, 'logs', 'save_map.log'), 6) or '看 data/logs/save_map.log')
-        finally:
-            self.map_busy = False
+        if await self.procs.save_map(name):
+            self.maps = P.list_maps(os.path.join(DATA, 'maps'))
+            self.node.event('INFO', f'地图已保存：data/maps/{name}')
+            if MAPPING_VIEW in self.map_views:   # 建图时调好的显示方向带给新地图
+                await self.set_view(name, self.map_views[MAPPING_VIEW])
+            return True, f'地图已保存：{name}'
+        return False, '保存失败：' + (P.tail(os.path.join(DATA, 'logs', 'save_map.log'), 6) or '看 data/logs/save_map.log')
 
     # ---------- 续建（docs/地图续建.md） ----------
-    # 一次续建 = 基准图 + 新图名字 + 起点位姿 + 自检。四步都是显式动作，不串成一个大流程：
-    # 起点位姿给错不会报错，只能靠人在中间看一眼自检结果。
+    # 定位、加载与首次自检都完成后才开始持续采集。
     PARKING_FILE = 'parkings.json'
 
     def parkings(self):
@@ -3309,7 +3786,7 @@ class Server(TaughtWeb):
         c = self.cont
         return {'active': True, 'base': c['base'], 'name': c['name'], 'source': c['source'],
                 'pose': c['pose'], 'note': c['note'], 'warn': c['warn'],
-                'check': c.get('check'), 'elapsed': round(time.monotonic() - c['started'], 1)}
+                'ready': c['ready'], 'check': c.get('check'), 'elapsed': round(time.monotonic() - c['started'], 1)}
 
     def cont_preflight(self, base):
         """续建前能不能开始。不动机器人，纯查文件。"""
@@ -3340,19 +3817,6 @@ class Server(TaughtWeb):
             return False, '；'.join(reasons), detail
         return True, ('可以续建' + ('（注意：' + '；'.join(warns) + '）' if warns else '')), detail
 
-    def _base_grid(self, name):
-        """基准图的栅格，判断起点在不在覆盖范围内。
-
-        mapfile.load 返回的是 dict（grid/res/ox/oy），不是 map_overlap_check.BaseMap。
-        这里包一层 with_inside：只要 (ox, oy, w, h, res) 就够了，不需要 BaseMap 全套。
-        """
-        try:
-            rec = mapfile.load(os.path.join(DATA, 'maps', f'{name}.yaml'))
-        except (OSError, ValueError, KeyError) as e:
-            raise RuntimeError(f'读不出基准图 {name}：{e}') from e
-        h, w = rec['grid'].shape
-        return (rec['ox'], rec['oy'], w, h, rec['res'])
-
     def _slice_now(self):
         for d in CONFIG_DIRS:
             if d:
@@ -3361,7 +3825,16 @@ class Server(TaughtWeb):
                     return got, os.path.join(d, 'pcl2scan_slam.yaml')
         return MM.current_slice(config_dir='/nonexistent')
 
-    async def _globloc_now(self, base):
+    def _base_grid(self, name, rec=None):
+        if rec is None:
+            try:
+                rec = mapfile.load(os.path.join(DATA, 'maps', name + '.yaml'))
+            except (OSError, ValueError, KeyError) as e:
+                raise RuntimeError(f'读不出基准图 {name}：{e}') from e
+        h, w = rec['grid'].shape
+        return rec['ox'], rec['oy'], w, h, rec['res']
+
+    async def _globloc_now(self, base, rec=None):
         """拿当前静止 scan 在**基准图**上做全局定位，返回 globloc 的结果 dict 或 None。
 
         为什么不用 n.map_raw：建图档位跑着的时候 /map 是 slam_toolbox 的实时图（此刻还是空的
@@ -3373,7 +3846,7 @@ class Server(TaughtWeb):
         if scans is None:
             return {'error': f'拿不到静止的激光（{why}）：让机器人停稳几秒再点'}
         try:
-            rec = mapfile.load(os.path.join(DATA, 'maps', f'{base}.yaml'))
+            rec = rec or mapfile.load(os.path.join(DATA, 'maps', f'{base}.yaml'))
         except (OSError, ValueError, KeyError) as e:
             return {'error': f'读不出基准图 {base}：{e}'}
         # globloc 要 OccupancyGrid 的原始 int8（未知是 -1），mapfile.load 给的正是这个口径
@@ -3401,139 +3874,205 @@ class Server(TaughtWeb):
             except OSError:
                 pass
 
-    async def set_slam_paused(self, want):
-        """暂停 / 恢复 slam_toolbox 收新 scan。
+    async def set_scan_budget(self, budget):
+        if self.map_frozen and budget != 0:
+            raise RuntimeError(f"建图已冻结（{self.map_frozen['reason']}），不能恢复采集")
+        await self.gate_set(budget)
+        self.cont_blocked = budget != -1
 
-        `pause_new_measurements` 是**切换**服务（上游 pauseNewMeasurementsCallback 里是
-        `state_.set(NEW_MEASUREMENTS, !curr_state)`），盲目调一次会把状态翻过来。所以先读
-        镜像参数 `paused_new_measurements`（上游在同一个回调里 set_parameter），不一样才翻，
-        翻完再读一次确认。读不到就明确报错，不猜。
-        """
+    async def gate_set(self, budget):
+        cli = self.node.scan_gate_set
+        if not cli.service_is_ready():
+            raise RuntimeError('建图扫描闸门不可用，请更新运行镜像并重开建图')
+        p = Parameter()
+        p.name = 'scan_budget'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=budget)
+        req = SetParameters.Request()
+        req.parameters = [p]
+        response = await self.aw(cli.call_async(req))
+        if len(response.results) != 1 or not response.results[0].successful:
+            raise RuntimeError('建图扫描闸门没有应用新状态')
+
+    async def mapping_save_allowed(self):
+        if self.cont_blocked or self.cont_busy:
+            return False
+        if self.map_frozen:
+            return True   # 冻结时闸门是故意关的，地图停在冻结那一刻，允许手动另存
+        cli = self.node.scan_gate_get
+        if not cli.service_is_ready():
+            # 普通建图允许旧运行镜像，续建要求有扫描闸门。
+            return True
+        req = GetParameters.Request()
+        req.names = ['scan_budget']
+        try:
+            values = (await self.aw(cli.call_async(req))).values
+            return (not self.cont_blocked and not self.cont_busy and len(values) == 1
+                    and values[0].type == ParameterType.PARAMETER_INTEGER
+                    and values[0].integer_value == -1)
+        except Exception:
+            return False
+
+    def cont_scan_ready(self):
+        scans, why = self.autoloc_scans()
+        if scans is None:
+            raise RuntimeError(why)
         n = self.node
-        cli = getattr(n, 'pause_cli', None)
-        param_cli = getattr(n, 'slam_param_cli', None)
-        if cli is None or param_cli is None:
-            raise RuntimeError('这个镜像里的 slam_toolbox 没有 pause 接口')
-        if not cli.service_is_ready() or not param_cli.service_is_ready():
-            raise RuntimeError('slam_toolbox 还没起来')
+        odom = self.fresh_odom()
+        if odom is None or not n.healthy or time.monotonic() - n.healthy_t >= STALE:
+            raise RuntimeError('里程计不健康或没有新数据，停稳并检查里程计后再试')
+        return odom
 
-        async def paused_now():
-            req = GetParameters.Request()
-            req.names = ['paused_new_measurements']
-            r = await self.aw(param_cli.call_async(req), 3.0)
-            values = getattr(r, 'values', None) or []
-            if not values or values[0].type == ParameterType.PARAMETER_NOT_SET:
-                return None
-            return bool(values[0].bool_value)
+    @staticmethod
+    def cont_same_pose(first, other):
+        return (math.hypot(first[0] - other[0], first[1] - other[1]) <= 0.05
+                and abs(MC.yaw_diff(first[2], other[2])) <= math.radians(3))
 
-        cur = await paused_now()
-        if cur is None:
-            raise RuntimeError('读不到 paused_new_measurements，无法确认扫描状态')
-        if cur == bool(want):
-            return
-        await self.aw(cli.call_async(SlamPause.Request()), 3.0)
-        await asyncio.sleep(0.3)
-        after = await paused_now()
-        if after is None or after != bool(want):
-            raise RuntimeError(f'切换扫描状态没生效（想要 {"暂停" if want else "恢复"}，现在是 {after}）')
+    async def cont_wait_map(self, version, base_grid):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            seq, loaded = self.node.map_sample
+            if seq > version:
+                version = seq
+                if loaded is not None and await asyncio.to_thread(MC.matches_loaded_grid, base_grid, loaded):
+                    return
+            await asyncio.sleep(0.05)
+        raise RuntimeError('加载后没有收到与基准图相符的 SLAM 地图')
+
+    async def cont_probe(self, odom):
+        n = self.node
+        recent = list(n.scan_evidence)
+        newest = recent[-1][0] if recent else (0, 0)
+        sent_at = time.monotonic()
+        # Humble 的首帧可以绕过 pause_new_measurements。输入闸门只转发一帧，
+        # 后续扫描在位姿和贴合率都确认前不会进入 SLAM。
+        await self.set_scan_budget(1)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            for stamp, received, pose in reversed(list(n.slam_poses)):
+                if received < sent_at or stamp <= newest:
+                    continue
+                for scan_stamp, t, pts, still, scan_odom in reversed(list(n.scan_evidence)):
+                    if scan_stamp != stamp or t < sent_at:
+                        continue
+                    if not still or not self.cont_same_pose(odom, scan_odom):
+                        raise RuntimeError('验证帧采集时机器人已移动或里程计不可用')
+                    if not all(math.isfinite(v) for v in pose):
+                        raise RuntimeError('SLAM 输出了无效位姿')
+                    return pts, pose
+            await asyncio.sleep(0.05)
+        raise RuntimeError('没有收到与验证扫描时间一致的 SLAM 位姿')
 
     async def cont_start(self, base, name, pose, source, reason):
-        """开一次续建：定起点位姿 → 暂停收 scan → 反序列化基准图 → 恢复收 scan。"""
         n = self.node
-        if self.cont_busy:
-            return False, '上一次续建操作还没完成'
-        if self.busy or self.map_busy or self.map_loading:
-            return False, '档位或地图正在切换，请稍等'
+        if self.cont_busy or self.busy or self.map_busy or self.map_loading or self.autosave['running']:
+            return False, '档位、续建或保存操作正在进行，请稍等'
         if self.prof('mapping') != 'run':
-            return False, '续建要先让「建图」跑起来（slam_toolbox 在 mapping 档）'
+            return False, '续建要先让「建图」跑起来'
+        if self.cont and self.cont['ready']:
+            return False, '续建正在采集，请先保存或放弃'
         if not isinstance(base, str) or not P.SAFE_NAME.fullmatch(base):
             return False, '基准图名不合法'
-        if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
-            return False, '新图名只能用字母、数字、下划线和减号'
-        if name == base:
-            return False, '续建必须另存新名字，不能覆盖基准图'
-        if source not in (None, 'manual'):
-            return False, '起点来源只能是自动（停车点 → 自动定位）或 manual'
+        if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name) or name == base:
+            return False, '续建请填写一个不同的合法地图名'
+        if is_autosave(name):
+            return False, 'autosave_月日_时分秒 这种名字留给建图自动保存（会被定期清理），请换个名字'
+        if source not in (None, 'manual', 'parking'):
+            return False, '起点来源只能是自动定位、手动起点或停车点'
         if source == 'manual':
             if not (isinstance(pose, (list, tuple)) and len(pose) == 3
                     and all(isinstance(v, (int, float)) and not isinstance(v, bool)
                             and math.isfinite(v) for v in pose)):
                 return False, '手动起点要给 [x, y, 朝向(弧度)] 三个有限数'
-            pose = [float(pose[0]), float(pose[1]), float(pose[2])]
+            pose = [float(v) for v in pose]
         ok, msg, detail = self.cont_preflight(base)
         if not ok:
             return False, msg, detail
+        if any(m['name'] == name for m in P.list_maps(os.path.join(DATA, 'maps'))):
+            return False, f'已存在地图 {name}，请换个名字'
+
         self.cont_busy = True
-        n.event('INFO', f"续建：{base} → {name}，正在定起点位姿"
-                        f"{'（手动）' if source == 'manual' else '（停车点 → 自动定位，机器人保持静止）'}")
+        self.cont_hold = (base, name)
+        payload = {}
+        phase = 'pause'
         try:
-            # 决定起点位姿。source='manual' 表示人明确指定，跳过前两级
-            globloc = None
-            if source != 'manual':
-                robot = n.lookup(BASE_FRAME) if n.fixed == 'map' else None
-                parking = self.parkings().get(base)
-                if not (parking and MC.choose_parking(parking, robot)[0]):
-                    globloc = await self._globloc_now(base)
-                settled = MC.settle(parking, robot, globloc,
-                                    manual=pose if source == 'manual' else None,
-                                    force='manual' if source == 'manual' else None)
-            else:
-                settled = MC.settle(None, None, None, manual=pose, force='manual')
+            await self.set_scan_budget(0)
+            self.cont = None
+            phase = 'base'
+            base_grid = mapfile.load(os.path.join(DATA, 'maps', base + '.yaml'))
+            if abs(base_grid['oyaw']) > 1e-6:
+                raise RuntimeError('基准图的栅格原点带旋转，请选择原始 SLAM 地图')
+            phase = 'scan'
+            odom = self.cont_scan_ready()
+            parking = self.parkings().get(base) if source == 'parking' else None
+            if source == 'parking' and not MC.choose_parking(parking)[0]:
+                return False, '这张图没有记录停车点，采集已暂停'
+            phase = 'localize'
+            globloc = await self._globloc_now(base, base_grid) if source is None else None
+            settled = MC.settle(parking, None, globloc, manual=pose, force=source or 'globloc')
+            diagnostics = MC.location_diagnostics(globloc)
+            payload = {'base': base, 'source': settled['source'], 'pose': settled['pose'],
+                       'warn': settled['warn'], 'tried': settled['tried'], **diagnostics}
+            if diagnostics.get('ratio') is not None:
+                n.event('INFO', f"续建 {base} 定位分数 {diagnostics['score']:.4f}，"
+                        f"次优/最优 {diagnostics['ratio']:.4f}，候选 {diagnostics['candidates']}")
             if not settled['source']:
-                why = '；'.join(f'{MC.SOURCE_NOTE[k]}：{v}' for k, v in settled['tried'])
-                hint = ''
-                cand = None
-                if isinstance(globloc, dict) and all(k in globloc for k in ('x', 'y', 'th')):
-                    # 不可信的候选也报出来，只当参考：歧义时它可能是两处之一，不能直接拿去用
-                    cand = [float(globloc['x']), float(globloc['y']), float(globloc['th'])]
-                    hint = (f'；自动定位最接近的是 ({cand[0]:.2f}, {cand[1]:.2f}, '
-                            f'{math.degrees(cand[2]):.0f}°)，只供参考')
-                return False, (f'定不了起点位姿（{why or settled["note"]}{hint}）。'
-                               f'换个特征多的位置再试，或者用「手动起点」'), {'tried': settled['tried'],
-                                                                     'candidate': cand}
-            base_grid = self._base_grid(base)
-            good, why = MC.check_start(base_grid, settled['pose'])
+                if len(diagnostics.get('candidates', [])) > 1:
+                    ref = base_grid
+                    stride = max(1, math.ceil(max(ref['grid'].shape) / 180))
+                    grid = ref['grid']
+                    rows, cols = grid.shape
+                    padded = np.pad(grid, ((0, -rows % stride), (0, -cols % stride)), constant_values=-1)
+                    view = padded.reshape(math.ceil(rows / stride), stride,
+                                          math.ceil(cols / stride), stride).max(axis=(1, 3))
+                    h, w = view.shape
+                    payload['preview'] = {'w': w, 'h': h, 'res': ref['res'] * stride,
+                                          'ox': ref['ox'], 'oy': ref['oy'],
+                                          'grid': base64.b64encode(view.tobytes()).decode('ascii')}
+                return False, f"续建已暂停：{settled['tried'][-1][1]}。请换个视角或给出手动起点", payload
+            good, why = MC.check_start(self._base_grid(base, base_grid), settled['pose'])
             if not good:
-                return False, why, {'pose': settled['pose'], 'source': settled['source']}
+                return False, why, payload
+            if not self.cont_same_pose(odom, self.cont_scan_ready()):
+                raise RuntimeError('定位期间机器人已移动，请停稳重试')
 
-            # 先暂停：反序列化之前进来几帧 scan 会先建出少量新节点，之后清不掉
-            paused = False
-            try:
-                await self.set_slam_paused(True)
-                paused = True
-            except Exception as e:
-                n.event('WARN', f'没能暂停收 scan（{e}）：反序列化前可能有几帧新节点')
-            try:
-                await self.aw(n.deserialize_posegraph(base, settled['pose']), 30.0)
-            except Exception as e:
-                if paused:
-                    try:
-                        await self.set_slam_paused(False)
-                    except Exception:
-                        pass
-                return False, f'反序列化失败：{e}'
-            finally:
-                if paused:
-                    try:
-                        await self.set_slam_paused(False)
-                    except Exception as e:
-                        n.event('ERROR', f'恢复收 scan 失败（{e}）：机器人现在采不了新数据')
-
-            gl = None
-            if globloc and 'score' in globloc:
-                gl = {'score': globloc.get('score'), 'ratio': globloc.get('ratio')}
-            self.cont = {'base': base, 'name': name, 'source': settled['source'],
-                         'pose': settled['pose'], 'note': settled['note'], 'warn': settled['warn'],
-                         'reason': reason if isinstance(reason, str) else None,
-                         'globloc': gl, 'check': None, 'started': time.monotonic()}
-            note = f"续建已开始：基准 {base} → 新图 {name}，起点 {settled['note']}"
-            n.event('WARN' if settled['warn'] else 'INFO', f'{note}（{self.remote(self.owner) if self.owner else "网页"}）')
-            if settled['warn']:
-                n.event('WARN', settled['warn'])
-            return True, note, {'source': settled['source'], 'pose': settled['pose'],
-                                'warn': settled['warn'], 'tried': settled['tried'], 'detail': detail}
+            phase = 'load'
+            self.cont = {'base': base, 'name': name, 'source': settled['source'], 'pose': settled['pose'],
+                         'note': settled['note'], 'warn': settled['warn'], 'reason': reason,
+                         'globloc': diagnostics or None, 'check': None, 'started': time.monotonic(),
+                         'ready': False}
+            # 给闸门关闭前已经进入 TF 队列的帧留出处理时间。反序列化会替换当前图。
+            await asyncio.sleep(0.25)
+            version = n.map_sample[0]
+            await self.aw(n.deserialize_posegraph(base, settled['pose']), 30.0)
+            await self.cont_wait_map(version, base_grid)
+            if not self.cont_same_pose(odom, self.cont_scan_ready()):
+                raise RuntimeError('加载基准图期间机器人已移动，请停稳重试')
+            phase = 'probe'
+            points, measured = await self.cont_probe(odom)
+            phase = 'check'
+            report = await self.cont_measure(base, points, measured)
+            self.cont_record_check(report, measured)
+            if not report['ok']:
+                return False, report['reason'], dict(payload, check=report)
+            if not self.cont_same_pose(odom, self.cont_scan_ready()):
+                raise RuntimeError('验证期间机器人已移动，请停稳重试')
+            phase = 'resume'
+            await self.set_scan_budget(-1)
+            self.cont['ready'] = True
+            return True, f"自检通过，开始续建 {base} → {name}", dict(payload, check=report)
+        except Exception as e:
+            if self.cont_blocked:
+                try:
+                    await self.set_scan_budget(0)
+                except Exception as gate_error:
+                    n.event('ERROR', f'确认续建闸门关闭失败：{gate_error}')
+            msg = str(e) or '操作超时'
+            if self.cont:
+                self.cont['check'] = {'ok': False, 'reason': msg, 'code': phase}
+            return False, msg, dict(payload, code=phase)
         finally:
             self.cont_busy = False
+            self.cont_hold = ()
 
     def _tool_script(self, name):
         """找工具脚本。扩展坞上 release 里是 web/current/tools，仓库里是 scripts/calib。
@@ -3548,75 +4087,89 @@ class Server(TaughtWeb):
                 return os.path.abspath(p)
         raise RuntimeError(f'找不到 {name}（试过 {"; ".join(cands)}）')
 
-    async def cont_check(self):
-        """续建自检：把现在扫到的墙按机器人在 slam 里的当前位姿摆到基准图上，量贴合率。
-
-        必须做，因为反序列化服务本身不可信：上游读文件失败也 `return true`，而且 response
-        是空结构。唯一的判据就是重新量一次贴合率。
-
-        11-17 起不用再停在起点：起点给错的后果是 slam 的 map 坐标系整体偏离基准图，机器人开到
-        哪都带着这个偏差，所以用当前位姿在任何能看到旧墙的地方都量得出来（存图前量还更贴近
-        最终结果）。拿不到 map 坐标系的位姿时才退回起点位姿（这时机器人应当还没动）。
-        """
-        n = self.node
-        if not self.cont:
-            return False, '没有正在进行的续建'
-        if self.prof('mapping') != 'run':
-            return False, '建图没有在跑，量不到 scan'
-        scans, why = self.autoloc_scans()
-        if scans is None:
-            return False, f'拿不到可用的 scan（{why}）'
-        start = self.cont['pose']
-        cur = n.lookup(BASE_FRAME)          # scan 是静止时的，取现在的位姿就对得上
-        at = 'current' if cur is not None and n.fixed == 'map' else 'start'
-        pose = cur if at == 'current' else start
-        pts = np.concatenate(scans).astype(np.float32)
+    async def cont_measure(self, base, pts, pose):
         c, s = math.cos(pose[2]), math.sin(pose[2])
         world = np.stack([pose[0] + c * pts[:, 0] - s * pts[:, 1],
                           pose[1] + s * pts[:, 0] + c * pts[:, 1]], 1)
-        fd, path = tempfile.mkstemp(prefix='go2w_cont_check_', suffix='.npz')
-        os.close(fd)
-        try:
+        with tempfile.TemporaryDirectory(prefix='go2w_cont_check_') as tmp:
+            path = os.path.join(tmp, 'scan.npz')
             np.savez(path, pts=world.astype(np.float32))
-            script = self._tool_script('map_overlap_check.py')
-            base_yaml = os.path.join(DATA, 'maps', f"{self.cont['base']}.yaml")
             proc = await asyncio.create_subprocess_exec(
-                'nice', '-n', '10', 'python3', script, base_yaml, path, '--json',
-                f'--pivot={pose[0]:.4f},{pose[1]:.4f}',   # 角度修正绕起点转，不是绕地图原点
+                'nice', '-n', '10', 'python3', self._tool_script('map_overlap_check.py'),
+                os.path.join(DATA, 'maps', base + '.yaml'), path, '--json', '--require-aligned',
+                f'--pivot={pose[0]:.4f},{pose[1]:.4f}',
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             try:
-                out, err = await asyncio.wait_for(proc.communicate(), 90.0)
+                out, err = await asyncio.wait_for(proc.communicate(), 25.0)
             except asyncio.TimeoutError:
                 proc.kill()
-                return False, '自检 90 s 内没有算完'
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+                await proc.wait()
+                raise RuntimeError('自检 25 秒内没有算完')
         if proc.returncode not in (0, 1):
-            lines = err.decode(errors='replace').strip().splitlines()
-            return False, '自检失败：' + (lines[-1] if lines else f'退出码 {proc.returncode}')
+            raise RuntimeError(err.decode(errors='replace').strip() or f'自检退出码 {proc.returncode}')
         try:
-            report = json.loads(out.decode().strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return False, '自检没有输出可解析的结果'
-        report['at'] = at
-        report['at_pose'] = [round(float(v), 3) for v in pose]
-        moved = math.hypot(pose[0] - start[0], pose[1] - start[1]) > 0.5
-        if not report.get('ok'):
-            fix = MC.start_fix(start, pose, report.get('correction'))
+            return json.loads(out.decode().strip().splitlines()[-1])
+        except (ValueError, IndexError) as e:
+            raise RuntimeError('自检没有输出可解析的结果') from e
+
+    def cont_record_check(self, report, pose):
+        report['at'] = 'current'
+        report['at_pose'] = [round(v, 3) for v in pose]
+        if report.get('code') == 'pose_offset':
+            fix = MC.start_fix(self.cont['pose'], pose, report.get('correction'))
             if fix is not None:
-                # 修正量是绕当前位置算的，换算成「起点该给多少」，下次开始续建直接用
                 report['start_fix'] = [round(v, 3) for v in fix]
-                report['reason'] = (report.get('reason', '') + f'；换算到起点应为 ({fix[0]:.2f}, {fix[1]:.2f}, '
-                                    f'{math.degrees(fix[2]):.0f}°)')
-            if moved:
-                report['reason'] = report.get('reason', '') + '（自检要站在能看到基准图旧墙的地方，全是新区域时量不准）'
         self.cont['check'] = report
-        ok = bool(report.get('ok'))
-        n.event('INFO' if ok else 'ERROR', f"续建自检{'通过' if ok else '不通过'}：{report.get('reason', '')}")
-        return ok, report.get('reason', ''), report
+        self.node.event('INFO' if report['ok'] else 'WARN',
+                        f"续建自检 {self.cont['source']}：{report['reason']} "
+                        f"fit={report.get('fit')} fit_best={report.get('fit_best')} "
+                        f"coverage={report.get('wall_coverage')} correction={report.get('correction')}")
+
+    async def cont_check(self):
+        if not self.cont:
+            return False, '没有正在进行的续建'
+        if self.cont_busy or self.busy or self.map_busy:
+            return False, '续建或保存操作正在进行，请稍等'
+        if not self.cont['ready']:
+            check = self.cont.get('check')
+            return False, (check or {}).get('reason', '续建已暂停，请重新定位后开始'), check
+        self.cont_busy = True
+        try:
+            odom = self.cont_scan_ready()
+            await self.set_scan_budget(0)
+            n = self.node
+            now = time.monotonic()
+            for stamp, t, pts, still, scan_odom in reversed(list(n.scan_evidence)):
+                if not still or now - t >= 0.5 or not self.cont_same_pose(odom, scan_odom):
+                    continue
+                try:
+                    tf = n.tf.lookup_transform('map', BASE_FRAME, rclpy.time.Time(
+                        seconds=stamp[0], nanoseconds=stamp[1])).transform
+                except Exception:
+                    continue
+                tr = tf.translation
+                pose = (tr.x, tr.y, yaw_of(tf.rotation))
+                report = await self.cont_measure(self.cont['base'], pts, pose)
+                self.cont_record_check(report, pose)
+                self.cont['ready'] = False
+                if report['ok']:
+                    if not self.cont_same_pose(odom, self.cont_scan_ready()):
+                        raise RuntimeError('自检期间机器人已移动，请停稳重试')
+                    await self.set_scan_budget(-1)
+                    self.cont['ready'] = True
+                return report['ok'], report['reason'], report
+            raise RuntimeError('没有与当前扫描时间对应的地图位姿，请停稳后重试')
+        except Exception as e:
+            self.cont['ready'] = False
+            self.cont['check'] = {'ok': False, 'code': 'check', 'reason': str(e)}
+            try:
+                await self.set_scan_budget(0)
+            except Exception as gate_error:
+                self.cont_blocked = True
+                self.node.event('ERROR', f'暂停续建失败，请停止建图：{gate_error}')
+            return False, str(e), self.cont['check']
+        finally:
+            self.cont_busy = False
 
     async def cont_finish(self, reason):
         """收工：另存新名字 → 写 meta.json → 把路线指到新图。基准图一个字节都不动。"""
@@ -3624,13 +4177,13 @@ class Server(TaughtWeb):
         c = self.cont
         if not c:
             return False, '没有正在进行的续建'
-        if not c.get('check') or not c['check'].get('ok'):
+        if not c['ready'] or not c.get('check') or not c['check'].get('ok'):
             return False, '先跑自检并通过（起点位姿不对就存图，等于把双线墙固化下来）'
-        if self.busy or self.map_busy:
+        if self.busy or self.map_busy or self.cont_busy or self.autosave['running']:
             return False, '档位或地图正在切换，请稍等'
         self.map_busy = True
         try:
-            ok, msg = await self.save_map(c['name'])
+            ok, msg = await self._save_map(c['name'])
             if not ok:
                 return False, msg
             maps_dir = os.path.join(DATA, 'maps')
@@ -3687,7 +4240,7 @@ class Server(TaughtWeb):
                                f'加载 {base} 并定好位后记，或者续建自检通过后再记')
             if c['base'] != base:
                 return False, f"正在续建的基准是 {c['base']}，不是 {base}：停车点要记在对应的基准图上"
-            if not (c.get('check') or {}).get('ok'):
+            if not c['ready'] or not (c.get('check') or {}).get('ok'):
                 return False, '续建还没自检通过：起点位姿没确认之前，map 坐标系不一定和基准图对得上'
             return True, ''
         if self.prof('navigation') == 'run' or self.prof('localization') == 'run':
@@ -3738,14 +4291,19 @@ class Server(TaughtWeb):
         return True
 
     async def cont_abort(self):
-        """放弃这次续建。**已经建进去的节点清不掉**——这是 slam_toolbox 的硬限制，
-        所以要说清楚：想干净就只能重启建图档位。"""
+        if self.cont_busy or self.busy or self.map_busy:
+            return False, '续建或保存操作正在进行，请稍等'
         if not self.cont:
             return False, '没有正在进行的续建'
-        self.cont = None
-        self.node.event('WARN', '已放弃这次续建：建图档位里已有的节点不会消失，'
-                                '想要干净的地图请停掉建图再重新开始')
-        return True, '已放弃；建图档位里已有的节点仍在，要干净就停掉建图重开'
+        self.cont_busy = True
+        try:
+            await self.set_scan_budget(0)
+            self.reset_cont('手动放弃')
+            return True, '本次续建已暂停；可以重新选择基准图续建'
+        except Exception as e:
+            return False, f'没能暂停扫描，请停止建图：{e}'
+        finally:
+            self.cont_busy = False
 
     async def align_map(self, source, name, angle):
         if self.busy or self.map_loading:
@@ -3869,7 +4427,7 @@ class Server(TaughtWeb):
             return False, '没有选要删除的地图'
         if len(names) > 200 or len(set(names)) != len(names) or not all(isinstance(x, str) and P.SAFE_NAME.fullmatch(x) for x in names):
             return False, '地图名不对'
-        if self.map_loading or self.map_busy:
+        if self.map_loading or self.map_busy or self.cont_busy:
             return False, '地图正在切换或保存，请稍等'
         if self.autosave.get('running'):
             return False, '正在自动保存地图，请几秒后再删'
@@ -4130,6 +4688,7 @@ class Server(TaughtWeb):
         try:
             self.tx_put(ws, self.routes_message(), 'routes')
             self.tx_put(ws, self.views_message(), 'views')
+            self.tx_put(ws, self.incidents_message(), 'incidents')
             taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
             if taught_map:
                 c['taught_map'] = taught_map
@@ -4190,7 +4749,9 @@ class Server(TaughtWeb):
     async def lose_owner(self, reason, owner=None):
         n = self.node
         if self.route_running() or n.is_armed() or n.nav_active():
+            task = self.incident_task()      # 停车会结束任务：先取任务信息
             await self.disarm_and_cancel(reason)
+            self.incident('safety_stop', reason, task=task)
         if owner is not None:
             await self.taught_owner_lost(owner, reason)
 
@@ -4275,20 +4836,29 @@ class Server(TaughtWeb):
                 if self.route and self.route['status'] == 'active':
                     reason = self.route_blocker(self.owner, self.route['record'])
                     if reason:
+                        task = self.incident_task()
                         await self.disarm_and_cancel(reason)
+                        if not self.estop:      # 急停叫停的任务已经记成「急停」
+                            self.incident('safety_stop', f'巡逻任务被叫停：{reason}', task=task)
                 elif k % 2 == 0 and n.nav_active() and self.ctrl_op != 'down':
                     # 单个导航目标 / 巡逻中机器狗掉进 Passive（遥控器 LT+B、摔倒保护）：取消，别让 Nav2 对着趴着的狗一直发速度
                     s, _, _ = self.ctrl_get()
                     if s is not None and s != 'Velocity':
                         await self.disarm_and_cancel(f'机器狗不在行走状态（运控状态 {s}）')
+                        self.incident('safety_stop', f'导航中机器狗不在行走状态（运控状态 {s}），已取消导航并上锁')
+                if k % 2 == 0:
+                    self.fall_tick()
                 if k % 5 == 0:
                     self.hot_tick()
                     self.idle_tick()
                     self.ctrl_watch()
+                if k % 10 == 0:
+                    self.lidar_watch()
                 # 急停期间底盘被其他客户端解锁 → 再次上锁。
                 # 只认急停 1 s 之后收到的「已解锁」，避免把上锁之前的旧状态当成又被解锁
                 if self.estop and n.is_armed() and n.armed_t > self.estop_t + 1.0 and k % 5 == 0:
                     await self.disarm_and_cancel('急停期间底盘被解锁')
+                    self.incident('safety_stop', '急停期间底盘被别处解锁，已重新上锁')
                 if k % 50 == 0:
                     n.fetch_params()
             except Exception as e:  # 安全检查不能因为一次异常停掉
@@ -4339,7 +4909,9 @@ class Server(TaughtWeb):
                               autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
-                              cont=self.cont_state(), autosave=self.autosave_view(), webVersion=self.version)
+                              cont=self.cont_state(), contBusy=self.cont_busy,
+                              contPaused=self.cont_blocked and self.prof('mapping') == 'run',
+                              autosave=self.autosave_view(), lidar=self.lidar_view(), webVersion=self.version)
                     st.update(taughtAvailable=self.taught_repo.available,
                               taughtNavigation='taught_route' in n.get_node_names())
                     await self.send_all(json.dumps(st), key='state')
@@ -4366,11 +4938,14 @@ class Server(TaughtWeb):
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         self.taught_routes(app)
+        app.router.add_get('/api/incidents', self.api_incidents)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):
                 app.router.add_static(f'/{sub}/', os.path.join(self.static_dir, sub))
 
         async def start(a):
+            self.loop = asyncio.get_running_loop()
+            self.node.on_goal_fail = lambda pose: self.loop.call_soon_threadsafe(self.goal_failed, pose)
             a['tasks'] = [asyncio.create_task(self.broadcast()), asyncio.create_task(self.safety()),
                           asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor()),
                           asyncio.create_task(self.taught_loop())]

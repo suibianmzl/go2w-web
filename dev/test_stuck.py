@@ -41,53 +41,38 @@ def watch():
 
 
 async def tick():
-    events, saves = [], []
+    """stuck_tick 只负责判定和开 / 关「长时受阻」异常；存包逻辑在 test_incidents.py。"""
+    opened, closed = [], []
     t0 = W.time.monotonic()
     node = types.SimpleNamespace(odom_pose=(1.0, 2.0, 0.0, t0), nav_active=lambda: True, is_armed=lambda: True,
-                                 event=lambda lv, msg: events.append((lv, msg)))
-    s = types.SimpleNamespace(node=node, estop=False, procs_status={'rollback': True}, rollback_saving=False,
-                              stuck=W.StuckWatch(seconds=0.2), stuck_t=-W.STUCK_COOLDOWN, pending=set())
-    s.background = lambda c: W.Server.background(s, c)
-
-    async def save(who, seconds=None):
-        saves.append(who)
-        secs.append(seconds)
-    secs = []
-    s.rollback_save = save
-    W.STUCK_AFTER = 0.1
+                                 event=lambda lv, msg: None)
+    s = types.SimpleNamespace(node=node, estop=False, inc_open={}, stuck=W.StuckWatch(seconds=0.2))
+    s.incident = lambda typ, msg, ongoing=False, ago=0.0: opened.append((typ, ongoing, ago)) or f'id{len(opened)}'
+    s.incident_close = lambda key: closed.append(s.inc_open.pop(key, None))
     tick = lambda: W.Server.stuck_tick(s)
-    tick()
-    await asyncio.sleep(0.25)
-    node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic())
-    tick()
-    await asyncio.sleep(0.2)
-    check('卡住后自动保存', saves == ['卡住自动保存'])
-    check(f'存 前 15 秒 + 后 0.1 秒 {secs}', secs == [W.STUCK_BEFORE + 0.1])
-    check('先报警告', any(lv == 'WARN' and '没动' in m for lv, m in events))
-    # 冷却期内再次卡住：只报警告不存
-    s.stuck = W.StuckWatch(seconds=0.2)
-    tick(); await asyncio.sleep(0.25); node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic()); tick()
-    await asyncio.sleep(0.2)
-    check('冷却期内不重复存', len(saves) == 1 and '这次不存' in events[-1][1])
+    still = lambda: setattr(node, 'odom_pose', (*node.odom_pose[:3], W.time.monotonic()))   # 原地不动，只刷新时间
+    tick(); await asyncio.sleep(0.25); still(); tick()
+    check('卡住记一条持续中的异常', len(opened) == 1 and opened[0][0] == 'stuck' and opened[0][1] is True)
+    check(f'开始时间往前推已停的秒数 {opened[0][2]:.2f}', opened[0][2] >= 0.2)
+    still(); tick()
+    check('还卡着不重复记、不结束', len(opened) == 1 and not closed)
+    node.odom_pose = (1.5, 2.0, 0.0, W.time.monotonic()); tick()
+    check('动起来就结束这条异常', closed == ['id1'] and 'stuck' not in s.inc_open)
+    tick(); await asyncio.sleep(0.25); still(); tick()
+    check('再卡住记新的一条', len(opened) == 2)
+    node.nav_active = lambda: False; tick()
+    check('导航结束也结束', closed == ['id1', 'id2'])
     # 没解锁 / 急停 / odom 过期都不算
     for name, setup in [('上锁不算', lambda: setattr(node, 'is_armed', lambda: False)),
-                        ('急停不算', lambda: setattr(s, 'estop', True)),
-                        ('odom 过期不算', lambda: setattr(node, 'odom_pose', (1.0, 2.0, 0.0, W.time.monotonic() - 10)))]:
-        node.is_armed, s.estop, s.stuck_t, n0 = (lambda: True), False, -W.STUCK_COOLDOWN, len(saves)
+                        ('急停不算', lambda: setattr(s, 'estop', True))]:
+        node.nav_active, node.is_armed, s.estop, n0 = (lambda: True), (lambda: True), False, len(opened)
         s.stuck = W.StuckWatch(seconds=0.2)
-        node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic())
-        setup()
-        tick(); await asyncio.sleep(0.25)
-        if name != 'odom 过期不算':
-            node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic())
-        tick(); await asyncio.sleep(0.2)
-        check(name, len(saves) == n0)
-    # 回溯没在跑：只报警告
-    node.is_armed, s.estop, s.stuck_t, s.procs_status = (lambda: True), False, -W.STUCK_COOLDOWN, {}
+        setup(); still(); tick(); await asyncio.sleep(0.25); still(); tick()
+        check(name, len(opened) == n0)
+    node.is_armed, s.estop, n0 = (lambda: True), False, len(opened)
     s.stuck = W.StuckWatch(seconds=0.2)
-    node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic()); tick(); await asyncio.sleep(0.25)
-    node.odom_pose = (1.0, 2.0, 0.0, W.time.monotonic()); tick(); await asyncio.sleep(0.2)
-    check('回溯没在跑时只报警告', len(saves) == 1 and '回溯录制没在运行' in events[-1][1])
+    node.odom_pose = (1.5, 2.0, 0.0, W.time.monotonic() - 10); tick(); await asyncio.sleep(0.25); tick()
+    check('odom 过期不算', len(opened) == n0)
 
 
 watch()

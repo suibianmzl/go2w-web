@@ -429,6 +429,8 @@
             <div class="step-h"><div class="step-n"><span>4</span></div><div class="step-t">保存地图<span class="step-s" id="mpSaveSub"></span></div></div>
             <div class="step-b">
               <p class="hint">不会覆盖同名地图；可以多次保存，每次存成一个新名字（保存后自动换成下一个名字）。</p>
+              <p class="hint warn" id="mpFrozen" hidden></p>
+              <div class="inrow" id="mpFrozenRow" hidden><button class="btn sm" id="mapResume">继续建图</button></div>
               <p class="hint" id="mpAuto" hidden></p>
               <div class="inrow"><input id="mapName" aria-label="地图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="saveMap">保存</button></div>
             </div>
@@ -439,10 +441,12 @@
               <p class="hint">在已有地图上继续采集，把新区域并进同一张图（扩范围、补盲区、补新开的门洞）。<b>只能加不能删</b>：挪走的家具在旧图里仍然占着位置。续建永远另存新名字，基准图不动。</p>
               <div class="inrow"><select id="contBase" aria-label="续建基准图"></select><button class="btn sm" id="contPre" title="只查文件，不动机器人">检查基准</button></div>
               <div class="inrow"><input id="contName" aria-label="续建后的新图名" maxlength="40" spellcheck="false"><button class="btn sm pri" id="contStart" disabled>开始续建</button></div>
-              <p class="hint">自动定位不行时，手动给起点：x、y 是基准图坐标（可以先在导航 / 定位里加载这张图，鼠标停在机器人位置看左下角读数），朝向是相对地图 x 轴逆时针的角度。手动起点没有自动校验，开始后一定要自检。</p>
+              <div class="inrow"><button class="btn sm" id="contStartParking" disabled>从停车点开始</button></div>
+              <p class="hint">自动定位不确定时，可选候选或手动输入基准图坐标。朝向从地图 x 轴逆时针计算。自检通过后开始采集。</p>
               <div class="inrow cont-manual"><input id="contMx" type="number" step="0.01" placeholder="x" aria-label="手动起点 x"><input id="contMy" type="number" step="0.01" placeholder="y" aria-label="手动起点 y"><input id="contMyaw" type="number" step="1" placeholder="朝向°" aria-label="手动起点朝向（度）"><button class="btn sm" id="contStartManual" disabled title="用左边填的 x、y、朝向作为起点开始续建">手动开始</button></div>
-              <div class="inrow"><button class="btn sm ghost" id="contPark" title="把机器人现在的位置记成这张图的续建停车点：下次停在这儿就直接用，不用重新定位">把当前位置记成停车点</button><button class="btn sm ghost" id="contParkClear" title="删掉这张图的续建停车点">删除停车点</button></div>
+              <div class="inrow"><button class="btn sm ghost" id="contPark" title="保存当前位置，供从停车点开始时使用">把当前位置记成停车点</button><button class="btn sm ghost" id="contParkClear" title="删掉这张图的续建停车点">删除停车点</button></div>
               <div class="meta" id="contStatus"></div>
+              <div id="contCandidates" hidden><canvas id="contCandidateMap" aria-label="基准图上的起点候选" style="width:100%;max-width:300px"></canvas><div class="inrow" id="contCandidateChoices"></div></div>
               <div class="inrow" id="contRow" hidden><button class="btn sm" id="contCheck">自检</button><button class="btn sm pri" id="contFinish" disabled>收工保存</button><button class="btn sm ghost" id="contAbort">放弃</button></div>
             </div>
           </div>

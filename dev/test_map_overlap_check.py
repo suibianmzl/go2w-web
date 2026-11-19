@@ -73,6 +73,38 @@ class OverlapCheckTests(unittest.TestCase):
         self.assertTrue(report['ok'], report['reason'])
         self.assertGreaterEqual(report['fit'], M.MIN_FIT)
 
+    def test_live_check_accepts_correct_pose_with_new_clutter(self):
+        self.truth = (-5.0, 0.0)
+        scene = build_map()
+        scene.grid[93:192, 124:126] = 100
+        scan = scan_at(scene, *self.truth)
+        pts = M.thin(place(scan, *self.truth, 0.0))
+        report = M.check(self.map, pts, pivot=self.truth, require_aligned=True)
+        self.assertTrue(report['ok'], report['reason'])
+        self.assertLess(report['fit'], M.MIN_FIT)
+
+    def test_live_check_requires_current_pose_to_be_aligned(self):
+        self.truth = (-5.0, 0.0)
+        pose = (-4.70, 0.0)
+        pts = M.thin(place(scan_at(self.map, *self.truth), *pose, 0.0))
+        report = M.check(self.map, pts, pivot=pose, require_aligned=True)
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['code'], 'pose_offset')
+        self.assertGreaterEqual(report['fit_best'], M.MIN_FIT)
+
+    def test_live_check_requires_old_wall_coverage(self):
+        unknown = M.BaseMap(np.full_like(self.map.grid, -1), self.map.res, self.map.ox, self.map.oy)
+        report = M.check(unknown, M.thin(self.base_scan), pivot=self.truth, require_aligned=True)
+        self.assertEqual(report['code'], 'insufficient_overlap')
+
+    def test_live_check_rejects_unconstrained_parallel_walls(self):
+        grid = np.zeros((400, 800), dtype=np.int8)
+        grid[160:162] = grid[238:240] = 100
+        hall = M.BaseMap(grid, .05, -20., -10.)
+        scan = scan_at(hall, 0., 0., rmax=10.)
+        report = M.check(hall, M.thin(scan), pivot=(0., 0.), require_aligned=True)
+        self.assertEqual(report['code'], 'ambiguous_overlap', report)
+
     def test_small_shift_tolerated(self):
         # 0.15 m 在 slam_toolbox 的扫描匹配窗口（0.5 m）内，会自己纠回来，不该拦
         report = self.run_at(dx=0.15)

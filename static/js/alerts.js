@@ -63,7 +63,9 @@ export function setupAlerts(store, bus){
     const anyMode = Object.keys(MODE_NODES).some(run);
     if (anyMode && !stackBad && nodeUp('livox_lidar_publisher') && hz('/scan') === 0){
       stackBad = true;
-      add('scan', 'crit', '没有激光数据', '雷达驱动在运行，但 /scan 没有数据。', '检查 MID360 的网线和供电；雷达刚上电要等十几秒。', 4, true);
+      // 后端判定后带着网络诊断（雷达不在网上 / 网络通但没点云），同时写进 web.log 和异常记录
+      add('scan', 'crit', '没有激光数据', store.lidar?.msg ? `${store.lidar.msg}。` : '雷达驱动在运行，但 /scan 没有数据。',
+        '检查 MID360 的网线和供电；雷达刚上电要等十几秒。', 4, true);
     }
     if (anyMode && !stackBad && !store.odomOk){
       add('odom', 'crit', '里程计不可用', 'FAST-LIO 没有输出，或 /odom_healthy 报告不健康。', '机器人保持静止等一会儿；不行就停止后重新启动这个档位。', 4, true);

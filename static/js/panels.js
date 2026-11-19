@@ -413,7 +413,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#alignReset').disabled = busy || (Math.abs(a.angle) < 1e-6 && !a.points.length);
     $('#saveAlignedMap').disabled = busy || !run('mapping') || Math.abs(Math.atan(Math.tan(a.angle))) < 1e-4;
     $('#saveAlignedMap').textContent = busy ? '保存中…' : '保存对齐地图';
-    $('#saveMap').disabled = busy;
+    $('#saveMap').disabled = busy || store.contPaused || store.contBusy;
     $('#mapName').disabled = busy;
   }
   /* ---------- 续建 ---------- */
@@ -433,38 +433,44 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     }
     const base = $('#contBase').value;
     const nameIn = $('#contName');
-    if (!nameIn.value && base) nameIn.value = `${base}_c1`;
+    // 自动保存当基准时别沿用 autosave_ 前缀：续建结果是正式地图，不该看着像自动保存（11-19 被清理误删过）
+    if (!nameIn.value && base) nameIn.value = `${base.replace(/^autosave_/, 'map_')}_c1`;
     $('#contPre').disabled = busy || !base;
-    const starting = !!store.contStarting || (!c && Date.now() - (store.contStartOkAt || 0) < 3000);
-    $('#contStart').disabled = busy || starting || !run('mapping') || !base || !!c;
+    const starting = store.contBusy || !!store.contStarting || (!c && Date.now() - (store.contStartOkAt || 0) < 3000);
+    const canStart = !busy && !starting && run('mapping') && !!base && !c?.ready;
+    $('#contStart').disabled = !canStart;
+    $('#contStartParking').disabled = !canStart;
     $('#contStart').textContent = starting ? '正在开始…' : '开始续建';
     const manual = contManualPose();
-    $('#contStartManual').disabled = busy || starting || !run('mapping') || !base || !!c || !manual;
-    ['#contMx', '#contMy', '#contMyaw'].forEach(id => { $(id).disabled = busy || !!c; });
+    $('#contStartManual').disabled = !canStart || !manual;
+    ['#contMx', '#contMy', '#contMyaw'].forEach(id => { $(id).disabled = !canStart; });
     // 停车点记在基准图坐标系里。建图档刚启动时 map 系是 slam_toolbox 新建的，此刻记下来的位置是错的，
     // 而且不会报错——所以只在「导航 / 定位加载了这张图且定好位」或「续建这张图并自检通过」时放开（后端同样把关）
     const parkWhy = parkingBlocked(base, c);
     const pk = $('#contPark');
-    pk.disabled = busy || !base || !!parkWhy;
-    pk.title = parkWhy || '把机器人现在的位置记成这张图的续建停车点：下次停在这儿就直接用，不用重新定位';
+    pk.disabled = busy || starting || !base || !!parkWhy;
+    pk.title = parkWhy || '保存当前位置，供「从停车点开始」使用';
     $('#contRow').hidden = !c;
-    $('#contCheck').disabled = !c || busy;
-    $('#contFinish').disabled = !c || busy || !c.check?.ok;
-    $('#contAbort').disabled = !c;
+    $('#contCheck').disabled = !c?.ready || busy || starting;
+    $('#contFinish').disabled = !c?.ready || busy || starting || !c.check?.ok;
+    $('#contAbort').disabled = !c || starting;
     const st = $('#contStatus');
     let text = '';
-    if (c){
+    if (starting){
+      text = '正在定位、加载基准图并验证旧墙，请保持静止…';
+      st.classList.remove('warn');
+    } else if (c){
       const chk = c.check;
       text = `${c.base} → ${c.name} · 起点 ${c.source === 'parking' ? '停车点' : c.source === 'globloc' ? '自动定位' : '手动'}`
         + ` (${c.pose[0].toFixed(2)}, ${c.pose[1].toFixed(2)}, ${(c.pose[2]*180/Math.PI).toFixed(0)}°)`
-        + (chk ? (chk.ok ? ` · 自检通过（贴合率 ${(chk.fit*100).toFixed(0)}%）` : ` · 自检没通过：${chk.reason || ''}`) : ' · 还没自检')
+        + (chk ? (chk.ok ? ` · 自检通过（贴合率 ${(chk.fit*100).toFixed(0)}%）` : ` · 采集已暂停：${chk.reason || ''}`) : ' · 正在验证')
         + (c.warn ? ` · ${c.warn}` : '');
       st.classList.toggle('warn', !!c.warn || (chk && !chk.ok));
-    } else if (starting){
-      text = '正在定起点位姿并加载基准图（一般 5–15 s），机器人保持静止，不要遥控……';
-      st.classList.remove('warn');
     } else if (store.contErr){
       text = '没开始：' + store.contErr;
+      st.classList.add('warn');
+    } else if (store.contPaused && run('mapping')){
+      text = '采集已暂停，可以更换基准图或重新给起点。';
       st.classList.add('warn');
     } else if (store.contPre){
       const p = store.contPre;
@@ -477,6 +483,45 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       st.classList.remove('warn');
     }
     if (st.textContent !== text) st.textContent = text;
+    renderContCandidates(canStart && store.contResult?.base === base ? store.contResult : null);
+  }
+  let drawnCandidates = null;
+  function renderContCandidates(result){
+    const panel = $('#contCandidates');
+    panel.hidden = !result?.preview;
+    if (panel.hidden || drawnCandidates === result) return;
+    drawnCandidates = result;
+    const { w, h, res, ox, oy, grid } = result.preview;
+    const canvas = $('#contCandidateMap'), scale = Math.min(4, 300 / w);
+    canvas.width = Math.round(w * scale); canvas.height = Math.round(h * scale);
+    const ctx = canvas.getContext('2d'), cells = atob(grid);
+    const colors = ['#167caa', '#ae5334'];
+    ctx.save();
+    ctx.scale(scale, scale);
+    for (let i = 0; i < cells.length; i++){
+      const value = cells.charCodeAt(i);
+      ctx.fillStyle = value === 255 ? '#a1a9b4' : value >= 65 ? '#25313d' : '#eaf0f5';
+      ctx.fillRect(i % w, h - 1 - Math.floor(i / w), 1.1, 1.1);
+    }
+    ctx.restore();
+    $('#contCandidateChoices').replaceChildren(...result.candidates.map(({ pose, score }, i) => {
+      const [x, y, yaw] = pose, px = (x - ox) / res * scale, py = (h - (y - oy) / res) * scale;
+      ctx.fillStyle = ctx.strokeStyle = colors[i];
+      ctx.beginPath(); ctx.arc(px, py, 7, 0, 2 * Math.PI); ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + 15 * Math.cos(yaw), py - 15 * Math.sin(yaw)); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(i + 1), px, py);
+      const button = document.createElement('button');
+      button.className = 'btn sm';
+      button.textContent = `用候选 ${i + 1}（${score.toFixed(2)}）`;
+      button.onclick = () => {
+        $('#contMx').value = x.toFixed(3); $('#contMy').value = y.toFixed(3);
+        $('#contMyaw').value = (yaw * 180 / Math.PI).toFixed(1);
+        renderCont();
+      };
+      return button;
+    }));
   }
   function contManualPose(){
     const v = ['#contMx', '#contMy', '#contMyaw'].map(id => $(id).value.trim());
@@ -489,7 +534,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     if (run('mapping')){
       if (!c) return '建图档里还没开始续建：此刻的地图坐标是新建的，不是基准图的，记下来会是错的。请在导航 / 定位里定好位后记，或续建自检通过后记';
       if (c.base !== base) return `正在续建的基准是 ${c.base}，不是 ${base}`;
-      if (!c.check?.ok) return '续建自检通过后才能记停车点';
+      if (!c.ready || !c.check?.ok) return '续建自检通过后才能记停车点';
       return '';
     }
     if (run('navigation') || run('localization')){
@@ -508,11 +553,13 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     actions.contStart($('#contBase').value, $('#contName').value.trim(), p, 'manual');
   };
   $('#contPre').onclick = () => actions.contPreflight($('#contBase').value);
-  $('#contBase').onchange = () => { contBaseFilled = null; $('#contName').value = ''; store.contPre = null; store.contErr = null; renderCont(); };
+  $('#contBase').onchange = () => { contBaseFilled = null; $('#contName').value = ''; store.contPre = null; store.contErr = null; store.contResult = null; renderCont(); };
   $('#contStart').onclick = () => actions.contStart($('#contBase').value, $('#contName').value.trim(), null, null);
+  $('#contStartParking').onclick = () => actions.contStart($('#contBase').value, $('#contName').value.trim(), null, 'parking');
   $('#contPark').onclick = () => actions.contParking($('#contBase').value, false);
   $('#contParkClear').onclick = () => actions.contParking($('#contBase').value, true);
   $('#contCheck').onclick = () => actions.contCheck();
+  $('#mapResume').onclick = () => actions.mapResume();
   $('#contFinish').onclick = () => actions.contFinish(null);
   $('#contAbort').onclick = () => actions.contAbort();
   // 录包 topic 下拉多选：记「取消勾选的」，默认一个都没取消 = 全选 = *（之后新冒出来的 topic 也录）；
