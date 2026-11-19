@@ -256,6 +256,10 @@ async def test_cloud_gateway():
                 viewer_token = parse_rtc_token(viewer_config['token'])
                 assert PRIV_SUBSCRIBE_STREAM in viewer_token.privileges
                 assert PRIV_PUBLISH_STREAM not in viewer_token.privileges
+                other_viewer = await (await session.get(
+                    base + '/quadruped/rtc/config?role=viewer&robot_id=go2w-02')).json()
+                assert other_viewer['room_id'] == 'go2w-02'
+                assert other_viewer['publisher_id'] == 'go2w-02-camera'
 
                 robot = await session.ws_connect(base + '/quadruped/robot/ws')
                 robot_reader = Reader(robot)

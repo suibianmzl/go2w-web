@@ -1293,7 +1293,7 @@ class CloudGateway:
         publisher_id = f'{robot_id}-camera'
         user_id = publisher_id if role == 'robot' else f'browser-{uuid.uuid4().hex[:12]}'
         expire_at = int(time.time()) + self.rtc_ttl
-        room_id = self.rtc_room_id if robot_id == self.default_robot_id else robot_id
+        room_id = robot_id
         token = AccessToken(self.rtc_app_id, self.rtc_app_key, room_id, user_id)
         token.expire_time(expire_at)
         if role == 'robot':

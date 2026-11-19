@@ -24,15 +24,31 @@ def read_failures():
         return 0
 
 
+def target_robot(health):
+    robots = [
+        robot for robot in health.get('robots', [])
+        if robot.get('online') and robot.get('video_upload_enabled') is not False
+    ]
+    robots.sort(key=lambda robot: (
+        -int(robot.get('browsers') or 0),
+        str(robot.get('robot_id') or ''),
+    ))
+    return robots[0] if robots else None
+
+
 def main():
     try:
         health = read_json(HEALTH_URL)
     except Exception:
         return
 
-    healthy = (
-        health.get('robot_online') is True
-        and int(health.get('camera_sources') or 0) > 0
+    robot = target_robot(health)
+    publisher = robot.get('rtc_publisher', {}) if robot else {}
+    healthy = bool(
+        robot
+        and robot.get('camera_source')
+        and int(publisher.get('videoWidth') or 0) > 0
+        and int(publisher.get('readyState') or 0) >= 2
     )
     if healthy:
         STATE.write_text('0\n', encoding='ascii')

@@ -2,9 +2,30 @@
 set -euo pipefail
 
 browser=$(command -v google-chrome-stable || command -v google-chrome)
-robot_id=${GO2W_DEFAULT_ROBOT_ID:-go2w-01}
+gateway_url=${GO2W_GATEWAY_URL:-http://127.0.0.1:8080}
+robot_id=$(
+  python3 -c '
+import json
+import sys
+import urllib.request
+
+with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+    payload = json.load(response)
+robots = [
+    robot for robot in payload.get("robots", [])
+    if robot.get("online") and robot.get("video_upload_enabled") is not False
+]
+robots.sort(key=lambda robot: (
+    -int(robot.get("browsers") or 0),
+    str(robot.get("robot_id") or ""),
+))
+if not robots:
+    raise SystemExit("no online robot")
+print(robots[0]["robot_id"])
+' "${gateway_url%/}/quadruped/api/robots"
+)
 if [[ ! "$robot_id" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
-  echo "invalid GO2W_DEFAULT_ROBOT_ID: $robot_id" >&2
+  echo "invalid online robot id: $robot_id" >&2
   exit 1
 fi
 profile=$(mktemp -d /tmp/go2w-cloud-rtc-chrome.XXXXXX)
