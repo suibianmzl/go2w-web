@@ -570,6 +570,11 @@ async def test_browser_authentication():
                     json={'token': 'wrong-token'},
                 )
                 assert rejected.status == 401
+                unicode_token = await session.post(
+                    base + '/auth/login',
+                    json={'token': '错误的访问令牌'},
+                )
+                assert unicode_token.status == 401
                 try:
                     await session.ws_connect(base + '/quadruped/ws')
                     raise AssertionError('unauthenticated browser WebSocket connected')
@@ -578,7 +583,7 @@ async def test_browser_authentication():
 
                 accepted = await session.post(
                     base + '/auth/login',
-                    json={'token': 'test-access-token'},
+                    json={'token': '云端Web访问Token：test-access-token'},
                 )
                 assert accepted.status == 200
                 assert (await accepted.json())['ok'] is True

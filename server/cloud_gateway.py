@@ -174,6 +174,15 @@ class CloudGateway:
         return target
 
     @staticmethod
+    def normalize_access_token(value):
+        token = str(value or '').strip()
+        for prefix in ('GO2W_ACCESS_TOKEN=', '云端Web访问Token：', '云端Web访问Token:'):
+            if token.startswith(prefix):
+                token = token[len(prefix):].strip()
+                break
+        return token.strip().strip('"\'')
+
+    @staticmethod
     def request_uses_https(req):
         forwarded = req.headers.get('X-Forwarded-Proto', '').split(',', 1)[0].strip().lower()
         return req.secure or forwarded == 'https'
@@ -1190,8 +1199,17 @@ class CloudGateway:
             payload = await req.json()
         except (TypeError, ValueError):
             raise web.HTTPBadRequest(text='invalid JSON')
-        token = str(payload.get('token') or '') if isinstance(payload, dict) else ''
-        if not token or not hmac.compare_digest(token, self.access_token):
+        token = self.normalize_access_token(
+            payload.get('token') if isinstance(payload, dict) else ''
+        )
+        configured = self.normalize_access_token(self.access_token)
+        if (
+            not token
+            or not hmac.compare_digest(
+                token.encode('utf-8'),
+                configured.encode('utf-8'),
+            )
+        ):
             await asyncio.sleep(0.2)
             return web.json_response(
                 {'ok': False, 'message': 'Token 无效'},
