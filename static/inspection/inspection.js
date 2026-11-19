@@ -40,13 +40,7 @@ const INSPECTION_NODES = [
   {
     code:'04',
     name:'返回起点',
-    cot:[
-      '已获取返回起点的导航路径',
-      '已识别门禁打开，正在通过',
-      '已识别大门打开，正在通过',
-      '识别到台阶，正在通过',
-      '已到达起点，返回待机位置',
-    ],
+    cot:['正在返回起点中'],
   },
 ];
 
@@ -193,6 +187,26 @@ function taskNodeIndex(task){
   return Math.min(INSPECTION_NODES.length - 1, point - 1);
 }
 
+function robotMoving(task){
+  const pose = state.pose;
+  return !!(
+    task?.status === 'active'
+    && task?.phase === 'follow'
+    && pose?.valid
+    && (Math.abs(Number(pose.v) || 0) > 0.03 || Math.abs(Number(pose.w) || 0) > 0.05)
+  );
+}
+
+function displayedTaskNodeIndex(task){
+  if (!task || task.type === 'idle') return -1;
+  if (task.back) return INSPECTION_NODES.length - 1;
+  const target = taskNodeIndex(task);
+  if (task.status === 'active' && target > 0 && !robotMoving(task)){
+    return target - 1;
+  }
+  return target;
+}
+
 function incidentNodeIndex(item){
   const point = Number(item.task?.point);
   return Number.isInteger(point) && point >= 1 && point <= INSPECTION_NODES.length
@@ -227,20 +241,13 @@ function scheduleMovementCot(index){
 }
 
 function syncMovementCot(task, related, currentIndex){
-  const pose = state.pose;
-  const moving = !!(
-    related
-    && task.status === 'active'
-    && task.phase === 'follow'
-    && pose?.valid
-    && (Math.abs(Number(pose.v) || 0) > 0.03 || Math.abs(Number(pose.w) || 0) > 0.05)
-  );
+  const moving = related && robotMoving(task);
   state.cotMoving = moving;
   if (!moving){
     stopCotReveal();
     return;
   }
-  const cotIndex = task.back
+  const cotIndex = (task.back || currentIndex >= INSPECTION_NODES.length - 1)
     ? INSPECTION_NODES.length - 1
     : Math.max(0, Math.min(INSPECTION_NODES.length - 2, currentIndex - 1));
   const segment = [
@@ -345,7 +352,7 @@ function taskStateLabel(){
   if (!taskForSelectedRoute()) return taskActive() ? '其他任务执行中' : '等待下发任务';
   if (task.status === 'active') {
     if (task.phase === 'checking') return '出发准备中';
-    const index = task.back ? INSPECTION_NODES.length - 1 : taskNodeIndex(task);
+    const index = displayedTaskNodeIndex(task);
     const node = INSPECTION_NODES[index];
     return node ? `${node.code} · ${node.name}` : `第 ${task.point || 1} 站`;
   }
@@ -374,9 +381,7 @@ function renderTask(){
   els.taskStateText.textContent = taskStateLabel();
   els.taskPercent.textContent = `${Math.round(progress * 100)}%`;
   els.taskProgress.style.width = `${progress * 100}%`;
-  const currentIndex = related
-    ? (task.back ? INSPECTION_NODES.length - 1 : taskNodeIndex(task))
-    : -1;
+  const currentIndex = related ? displayedTaskNodeIndex(task) : -1;
   const currentNode = INSPECTION_NODES[currentIndex];
   els.currentPoint.textContent = currentNode
     ? `${currentIndex + 1}/${INSPECTION_NODES.length} · ${currentNode.name}`
