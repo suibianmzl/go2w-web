@@ -7,6 +7,7 @@ Wants=network-online.target go2w-cloud-rtc-http.service
 Type=simple
 WorkingDirectory=/opt/go2w-cloud-rtc-publisher
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/go2w-web/etc/rtc.env
 ExecStart=/opt/go2w-cloud-rtc-publisher/run-cloud-rtc-publisher.sh
 Restart=always
 RestartSec=5
