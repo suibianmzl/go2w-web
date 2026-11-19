@@ -267,6 +267,14 @@ async def test_cloud_gateway():
                 robot = await session.ws_connect(base + '/quadruped/robot/ws')
                 robot_reader = Reader(robot)
                 await robot.send_str('{"type":"hello","robot_id":"go2w-01","protocol":1}')
+                video = await session.ws_connect(base + '/quadruped/robot/video/ws')
+                video_reader = Reader(video)
+                await video.send_str('{"type":"hello","robot_id":"go2w-01","protocol":1}')
+                for _ in range(50):
+                    if 'go2w-01' in gateway.robot_video_sessions:
+                        break
+                    await asyncio.sleep(0.01)
+                assert 'go2w-01' in gateway.robot_video_sessions
 
                 browser = await session.ws_connect(base + '/quadruped/ws')
                 browser_reader = Reader(browser)
@@ -275,6 +283,7 @@ async def test_cloud_gateway():
                     't': 'robot_status',
                     'online': True,
                     'robot_id': 'go2w-01',
+                    'video_link': True,
                     'video_upload_enabled': True,
                 }
 
@@ -350,12 +359,12 @@ async def test_cloud_gateway():
 
                 camera = await session.ws_connect(base + '/quadruped/camera/ws')
                 camera_reader = Reader(camera)
-                await robot_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is True)
+                await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is True)
                 disabled_response = await session.post(
                     base + '/quadruped/api/robots/go2w-01/camera', json={'enabled': False})
                 assert disabled_response.status == 200
                 assert (await disabled_response.json())['video_upload_enabled'] is False
-                await robot_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
+                await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
                 notification = await browser_reader.text(lambda m: m.get('t') == 'camera_upload')
                 assert notification['enabled'] is False
                 await robot.send_bytes(bytes([T_CAM, 8, 9]))
@@ -364,11 +373,11 @@ async def test_cloud_gateway():
                 enabled_response = await session.post(
                     base + '/quadruped/api/robots/go2w-01/camera', json={'enabled': True})
                 assert (await enabled_response.json())['video_upload_enabled'] is True
-                await robot_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is True)
-                await robot.send_bytes(bytes([T_CAM, 5, 6]))
+                await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is True)
+                await video.send_bytes(bytes([T_CAM, 5, 6]))
                 assert await camera_reader.binary(T_CAM) == bytes([T_CAM, 5, 6])
                 await camera.close()
-                await robot_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
+                await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
                 await camera_reader.close()
 
                 await browser.send_str('{"t":"sub","layers":["cloud","particles"]}')
@@ -438,6 +447,8 @@ async def test_cloud_gateway():
                 status = await browser2_reader.text(lambda m: m.get('t') == 'robot_status')
                 assert status['online'] is False
                 assert not gateway.robots
+                await video.close()
+                await video_reader.close()
                 await browser2.close()
                 await browser2_reader.close()
                 await robot_reader.close()
@@ -560,6 +571,10 @@ async def test_browser_authentication():
                 robot_reader = Reader(robot)
                 await robot.send_str(
                     '{"type":"hello","robot_id":"go2w-01","protocol":1}')
+                robot_video = await session.ws_connect(
+                    base + '/quadruped/robot/video/ws')
+                await robot_video.send_str(
+                    '{"type":"hello","robot_id":"go2w-01","protocol":1}')
 
                 robot_rtc = await session.get(
                     base + '/quadruped/rtc/config?role=robot&robot_id=go2w-01')
@@ -606,6 +621,7 @@ async def test_browser_authentication():
                 assert denied_again.status == 401
 
                 await robot.close()
+                await robot_video.close()
                 await robot_reader.close()
         finally:
             await runner.cleanup()
@@ -889,8 +905,11 @@ async def test_robot_ssh_registration():
 
 
 async def test_edge_gateway(forward_camera=False):
-    local_messages, cloud_messages = asyncio.Queue(), asyncio.Queue()
-    connected = asyncio.Event()
+    local_messages = asyncio.Queue()
+    control_cloud_messages = asyncio.Queue()
+    video_cloud_messages = asyncio.Queue()
+    control_connected = asyncio.Event()
+    video_connected = asyncio.Event()
     camera_frame = pack_frame(T_CAM, {'key': True, 'dur': 0.07}, b'\x00\x00')
     map_frame = pack_frame(T_MAP, {'name': 'test-map'}, b'\x01\x02')
 
@@ -907,22 +926,34 @@ async def test_edge_gateway(forward_camera=False):
                 local_messages.put_nowait(('binary', bytes(message.data)))
         return ws
 
-    async def cloud_handler(request):
+    async def control_cloud_handler(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        connected.set()
-        await ws.send_str('{"t":"cam","on":true}')
+        control_connected.set()
         await ws.send_str('{"t":"cmd","id":1,"op":"cancel"}')
         async for message in ws:
             if message.type == WSMsgType.TEXT:
-                cloud_messages.put_nowait(('text', json.loads(message.data)))
+                control_cloud_messages.put_nowait(('text', json.loads(message.data)))
             elif message.type == WSMsgType.BINARY:
-                cloud_messages.put_nowait(('binary', bytes(message.data)))
+                control_cloud_messages.put_nowait(('binary', bytes(message.data)))
+        return ws
+
+    async def video_cloud_handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        video_connected.set()
+        await ws.send_str('{"t":"cam","on":true}')
+        async for message in ws:
+            if message.type == WSMsgType.TEXT:
+                video_cloud_messages.put_nowait(('text', json.loads(message.data)))
+            elif message.type == WSMsgType.BINARY:
+                video_cloud_messages.put_nowait(('binary', bytes(message.data)))
         return ws
 
     local_app, cloud_app = web.Application(), web.Application()
     local_app.router.add_get('/ws', local_handler)
-    cloud_app.router.add_get('/robot/ws', cloud_handler)
+    cloud_app.router.add_get('/robot/ws', control_cloud_handler)
+    cloud_app.router.add_get('/robot/video/ws', video_cloud_handler)
     local_runner, local_port = await start_app(local_app)
     cloud_runner, cloud_port = await start_app(cloud_app)
     stop = asyncio.Event()
@@ -930,33 +961,49 @@ async def test_edge_gateway(forward_camera=False):
         f'ws://127.0.0.1:{local_port}/ws',
         f'ws://127.0.0.1:{cloud_port}/robot/ws',
         'go2w-01', 0.1, stop, forward_camera,
+        f'ws://127.0.0.1:{cloud_port}/robot/video/ws',
     ))
     try:
-        await asyncio.wait_for(connected.wait(), 3)
-        hello = await asyncio.wait_for(cloud_messages.get(), 3)
-        assert hello == ('text', {'type': 'hello', 'robot_id': 'go2w-01', 'protocol': 1})
+        await asyncio.wait_for(control_connected.wait(), 3)
         if forward_camera:
-            relayed_camera = await asyncio.wait_for(cloud_messages.get(), 3)
-            kind, metadata, payload = unpack_frame(relayed_camera[1])
-            assert kind == T_CAM and metadata['robot_id'] == 'go2w-01' and payload == b'\x00\x00'
-        mapped = await asyncio.wait_for(cloud_messages.get(), 3)
+            await asyncio.wait_for(video_connected.wait(), 3)
+        await asyncio.sleep(0.4)
+
+        control_items = list(control_cloud_messages._queue)
+        video_items = list(video_cloud_messages._queue)
+        local_items = list(local_messages._queue)
+
+        assert ('text', {
+            'type': 'hello', 'robot_id': 'go2w-01', 'protocol': 1, 'channel': 'control',
+        }) in control_items
+        mapped = next(
+            item for item in control_items
+            if item[0] == 'binary' and item[1][0] == T_MAP
+        )
         kind, metadata, payload = unpack_frame(mapped[1])
         assert kind == T_MAP and metadata['robot_id'] == 'go2w-01'
         assert metadata['name'] == 'test-map' and payload == b'\x01\x02'
-        state = await asyncio.wait_for(cloud_messages.get(), 3)
-        assert state == ('text', {'t': 'state', 'armed': False, 'robot_id': 'go2w-01'})
+        assert ('text', {'t': 'state', 'armed': False, 'robot_id': 'go2w-01'}) in control_items
+        assert not any(item[0] == 'binary' and item[1][0] == T_CAM for item in control_items)
+        assert ('text', {
+            't': 'cmd', 'id': 1, 'op': 'cancel', 'robot_id': 'go2w-01',
+        }) in local_items
 
         if forward_camera:
-            camera_on = await asyncio.wait_for(local_messages.get(), 3)
-            assert camera_on == ('text', {'t': 'cam', 'on': True, 'robot_id': 'go2w-01'})
-        command = await asyncio.wait_for(local_messages.get(), 3)
-        assert command == ('text', {
-            't': 'cmd', 'id': 1, 'op': 'cancel', 'robot_id': 'go2w-01',
-        })
-        await asyncio.sleep(0.1)
-        if not forward_camera:
-            assert not any(item[0] == 'text' and item[1].get('t') == 'cam'
-                           for item in list(local_messages._queue))
+            assert ('text', {
+                'type': 'hello', 'robot_id': 'go2w-01', 'protocol': 1, 'channel': 'video',
+            }) in video_items
+            relayed_camera = next(
+                item for item in video_items
+                if item[0] == 'binary' and item[1][0] == T_CAM
+            )
+            kind, metadata, payload = unpack_frame(relayed_camera[1])
+            assert kind == T_CAM and metadata['robot_id'] == 'go2w-01' and payload == b'\x00\x00'
+            assert not any(item[0] == 'binary' and item[1][0] == T_MAP for item in video_items)
+            assert ('text', {'t': 'cam', 'on': True, 'robot_id': 'go2w-01'}) in local_items
+        else:
+            assert not video_items
+            assert not any(item[0] == 'text' and item[1].get('t') == 'cam' for item in local_items)
     finally:
         stop.set()
         await asyncio.gather(task, return_exceptions=True)

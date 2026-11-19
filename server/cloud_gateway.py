@@ -66,6 +66,7 @@ class Browser:
 class RobotSession:
     ws: web.WebSocketResponse
     robot_id: str | None = None
+    channel: str = 'control'
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(ROBOT_QUEUE_MAX))
     tx: asyncio.Task | None = None
@@ -143,6 +144,7 @@ class CloudGateway:
         self.client_seq = 0
         self.robots = {}
         self.robot_sessions = {}
+        self.robot_video_sessions = {}
         self.robot_records = {}
         self.rtc_publisher_states = {}
         self.command_seq = 0
@@ -218,6 +220,7 @@ class CloudGateway:
             '/quadruped/health',
             '/robot/ws',
             '/quadruped/robot/ws',
+            '/quadruped/robot/video/ws',
             '/quadruped/camera/ws',
             '/quadruped/rtc/publisher-status',
             '/login',
@@ -540,6 +543,10 @@ class CloudGateway:
             't': 'robot_status',
             'online': session is not None and not session.ws.closed,
             'robot_id': robot_id,
+            'video_link': bool(
+                self.robot_video_sessions.get(robot_id)
+                and not self.robot_video_sessions[robot_id].ws.closed
+            ),
             'video_upload_enabled': self.video_upload_enabled(robot_id),
         }
 
@@ -550,6 +557,16 @@ class CloudGateway:
     # ---------- robot output ----------
     def send_robot(self, robot_id, data):
         session = self.robots.get(robot_id)
+        if session is None or session.ws.closed:
+            return False
+        try:
+            session.queue.put_nowait(data)
+            return True
+        except asyncio.QueueFull:
+            return False
+
+    def send_robot_video(self, robot_id, data):
+        session = self.robot_video_sessions.get(robot_id)
         if session is None or session.ws.closed:
             return False
         try:
@@ -580,8 +597,11 @@ class CloudGateway:
         session.last_seen = now
         if session.robot_id:
             record = self.robot_records.setdefault(session.robot_id, {'robot_id': session.robot_id})
-            record['online'] = True
-            record['last_seen_at'] = time.time()
+            if session.channel == 'control':
+                record['online'] = True
+                record['last_seen_at'] = time.time()
+            else:
+                record['video_last_seen_at'] = time.time()
             record.setdefault('video_upload_enabled', True)
 
     async def register_robot(self, session, robot_id):
@@ -593,6 +613,16 @@ class CloudGateway:
             await old.ws.close(code=4000, message=b'replaced by a new robot connection')
         self.sync_layers(robot_id)
         self.sync_topics(robot_id)
+        self.sync_camera(robot_id)
+        self.broadcast_robot_status(robot_id)
+
+    async def register_robot_video(self, session, robot_id):
+        session.robot_id = robot_id
+        old = self.robot_video_sessions.get(robot_id)
+        self.robot_video_sessions[robot_id] = session
+        self.touch_robot(session)
+        if old is not None and old is not session and not old.ws.closed:
+            await old.ws.close(code=4000, message=b'replaced by a new video connection')
         self.sync_camera(robot_id)
         self.broadcast_robot_status(robot_id)
 
@@ -621,6 +651,20 @@ class CloudGateway:
             await self.archive_session_ended(session)
             self.broadcast_robot_status(robot_id)
 
+    async def clear_robot_video(self, session):
+        self.robot_sessions.pop(session.ws, None)
+        robot_id = session.robot_id
+        if robot_id and self.robot_video_sessions.get(robot_id) is session:
+            del self.robot_video_sessions[robot_id]
+            record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
+            record['video_last_seen_at'] = time.time()
+        if session.tx:
+            session.tx.cancel()
+            await asyncio.gather(session.tx, return_exceptions=True)
+            session.tx = None
+        if robot_id:
+            self.broadcast_robot_status(robot_id)
+
     # ---------- subscriptions ----------
     def sync_layers(self, robot_id):
         if robot_id not in self.robots:
@@ -642,10 +686,15 @@ class CloudGateway:
         session.active_topics = wanted
 
     def sync_camera(self, robot_id):
-        self.send_robot(robot_id, json.dumps({
+        message = json.dumps({
             't': 'cam',
             'on': self.video_upload_enabled(robot_id) and bool(self.camera_clients_for(robot_id)),
-        }, separators=(',', ':')))
+        }, separators=(',', ':'))
+        video_session = self.robot_video_sessions.get(robot_id)
+        if video_session is not None and not video_session.ws.closed:
+            self.send_robot_video(robot_id, message)
+        else:
+            self.send_robot(robot_id, message)
 
     # ---------- robot messages ----------
     async def on_robot_text(self, session, data):
@@ -664,6 +713,12 @@ class CloudGateway:
                 return
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['name'] = msg.get('name') or record.get('name') or robot_id
+            if session.channel == 'video':
+                await self.register_robot_video(session, robot_id)
+                session.edge_version = (
+                    msg.get('edge_version') or msg.get('version') or msg.get('protocol')
+                )
+                return
             await self.register_robot(session, robot_id)
             session.edge_version = (
                 msg.get('edge_version') or msg.get('version') or msg.get('protocol')
@@ -679,6 +734,8 @@ class CloudGateway:
             LOG.warning('dropped robot message for %s from %s', message_robot_id, robot_id)
             return
         if msg.get('t') == 'pong':
+            return
+        if session.channel == 'video':
             return
         msg_type = msg.get('t') or 'unknown'
         self.archive_up_text(session, data, msg, msg_type)
@@ -726,6 +783,12 @@ class CloudGateway:
         if not data:
             return
         kind = data[0]
+        if session.channel == 'video':
+            if kind != T_CAM or not self.video_upload_enabled(robot_id):
+                return
+            for client in self.camera_clients_for(robot_id):
+                self.send_browser(client, data)
+            return
         if kind == T_CAM:
             if not self.video_upload_enabled(robot_id):
                 return
@@ -739,9 +802,15 @@ class CloudGateway:
         self.broadcast_binary(robot_id, data, kind)
 
     async def handle_robot(self, req):
+        return await self.handle_robot_channel(req, 'control')
+
+    async def handle_robot_video(self, req):
+        return await self.handle_robot_channel(req, 'video')
+
+    async def handle_robot_channel(self, req, channel):
         ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
         await ws.prepare(req)
-        session = RobotSession(ws)
+        session = RobotSession(ws, channel=channel)
         session.remote_info = req.remote
         self.robot_sessions[ws] = session
         session.tx = asyncio.create_task(self.robot_tx_loop(session))
@@ -756,7 +825,10 @@ class CloudGateway:
         except Exception:
             LOG.exception('robot handler failed')
         finally:
-            await self.clear_robot(session)
+            if channel == 'video':
+                await self.clear_robot_video(session)
+            else:
+                await self.clear_robot(session)
         return ws
 
     # ---------- browser messages ----------
@@ -1263,8 +1335,10 @@ class CloudGateway:
 
     def robot_summary(self, robot_id):
         session = self.robots.get(robot_id)
+        video_session = self.robot_video_sessions.get(robot_id)
         record = self.robot_records.get(robot_id, {})
         online = session is not None and not session.ws.closed
+        video_link = video_session is not None and not video_session.ws.closed
         last_seen_at = record.get('last_seen_at')
         last_seen_seconds = (
             max(0.0, time.time() - last_seen_at)
@@ -1281,6 +1355,7 @@ class CloudGateway:
             'battery': record.get('battery'),
             'video_upload_enabled': self.video_upload_enabled(robot_id),
             'browsers': len(self.clients_for(robot_id)),
+            'video_link': video_link,
             'camera_source': bool(self.camera_clients_for(robot_id)),
             'rtc_publisher': self.rtc_publisher_states.get(robot_id, {'state': 'unknown'}),
         }
@@ -1550,6 +1625,7 @@ class CloudGateway:
         app.router.add_route('*', '/quadruped/rtc/publisher-status', self.rtc_publisher_status)
         app.router.add_get('/robot/ws', self.handle_robot)
         app.router.add_get('/quadruped/robot/ws', self.handle_robot)
+        app.router.add_get('/quadruped/robot/video/ws', self.handle_robot_video)
         app.router.add_get('/quadruped/ws', self.browser_ws)
         app.router.add_get('/quadruped/camera/ws', self.camera_source_ws)
         app.router.add_get('/ws', self.browser_ws)
