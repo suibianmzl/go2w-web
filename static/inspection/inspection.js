@@ -34,7 +34,18 @@ const INSPECTION_NODES = [
     cot:[
       '已到达巡逻点位【人行步道】',
       '定点巡逻中（30s）...',
-      '巡逻结束，返回待机位置',
+      '巡逻结束，准备返回起点',
+    ],
+  },
+  {
+    code:'04',
+    name:'返回起点',
+    cot:[
+      '已获取返回起点的导航路径',
+      '已识别门禁打开，正在通过',
+      '已识别大门打开，正在通过',
+      '识别到台阶，正在通过',
+      '已到达起点，返回待机位置',
     ],
   },
 ];
@@ -131,6 +142,8 @@ const state = {
   playbackId: null,
   lastFixedNodeIndex: null,
   openNodeIndex: 0,
+  cotVisible: new Map(),
+  cotTimer: null,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -187,6 +200,37 @@ function nodeIncidents(index){
   return state.incidents
     .filter(item => incidentNodeIndex(item) === index)
     .sort((left, right) => right.ts - left.ts);
+}
+
+function stopCotReveal(){
+  if (state.cotTimer){
+    clearTimeout(state.cotTimer);
+    state.cotTimer = null;
+  }
+}
+
+function startCotReveal(index, reset = false){
+  const node = INSPECTION_NODES[index];
+  if (!node) return;
+  stopCotReveal();
+  state.openNodeIndex = index;
+  const total = node.cot.length;
+  if (reset) state.cotVisible.set(index, 0);
+  const step = () => {
+    const shown = Math.min(total, (state.cotVisible.get(index) || 0) + 1);
+    state.cotVisible.set(index, shown);
+    renderTask();
+    if (shown < total && state.openNodeIndex === index){
+      state.cotTimer = setTimeout(step, 900);
+    } else {
+      state.cotTimer = null;
+    }
+  };
+  if ((state.cotVisible.get(index) || 0) < total){
+    state.cotTimer = setTimeout(step, reset ? 250 : 0);
+  } else {
+    renderTask();
+  }
 }
 
 function formatIncidentTime(value){
@@ -319,6 +363,14 @@ function renderTask(){
 function renderSteps(task, related, currentIndex){
   if (currentIndex >= 0 && currentIndex !== state.lastFixedNodeIndex){
     state.openNodeIndex = currentIndex;
+    state.cotVisible.set(currentIndex, 0);
+  }
+  if (related && task.status === 'succeeded'){
+    INSPECTION_NODES.forEach((node, index) => state.cotVisible.set(index, node.cot.length));
+  } else if (currentIndex > 0){
+    for (let index = 0; index < currentIndex; index += 1){
+      state.cotVisible.set(index, INSPECTION_NODES[index].cot.length);
+    }
   }
   els.steps.innerHTML = INSPECTION_NODES.map((node, index) => {
     let stepState = 'pending';
@@ -343,6 +395,7 @@ function renderSteps(task, related, currentIndex){
     }
     const incidents = nodeIncidents(index);
     const expanded = state.openNodeIndex === index;
+    const visibleCot = node.cot.slice(0, state.cotVisible.get(index) || 0);
     const incidentHtml = incidents.length ? `
       <div class="node-incidents">
         ${incidents.slice(0, 3).map(item => `
@@ -364,7 +417,7 @@ function renderSteps(task, related, currentIndex){
       </button>
       <div class="cot-content" ${expanded ? '' : 'hidden'}>
         <div class="cot-list">
-          ${node.cot.map(text => `<div class="cot-item"><i></i><span>${esc(text)}</span></div>`).join('')}
+          ${visibleCot.map(text => `<div class="cot-item"><i></i><span>${esc(text)}</span></div>`).join('')}
         </div>
         ${incidentHtml}
       </div>
@@ -376,6 +429,9 @@ function renderSteps(task, related, currentIndex){
       requestAnimationFrame(() => {
         els.steps.querySelector(`[data-open-node="${currentIndex}"]`)
           ?.scrollIntoView({ block:'center', behavior:'smooth' });
+        if (!(related && task.status === 'succeeded')){
+          startCotReveal(currentIndex, true);
+        }
       });
     }
   }
@@ -1176,8 +1232,13 @@ els.steps.addEventListener('click', event => {
   const toggle = event.target.closest('[data-open-node]');
   if (toggle){
     const index = Number(toggle.dataset.openNode);
-    state.openNodeIndex = state.openNodeIndex === index ? null : index;
-    renderTask();
+    if (state.openNodeIndex === index){
+      stopCotReveal();
+      state.openNodeIndex = null;
+      renderTask();
+    } else {
+      startCotReveal(index, (state.cotVisible.get(index) || 0) === 0);
+    }
     return;
   }
   const button = event.target.closest('[data-step-incident]');
@@ -1243,9 +1304,13 @@ window.addEventListener('keydown', event => {
   else if (!els.incidentHistory.hidden) closeHistory();
 });
 new ResizeObserver(resizeCanvas).observe(canvas);
-window.addEventListener('beforeunload', () => state.heartbeat?.terminate());
+window.addEventListener('beforeunload', () => {
+  stopCotReveal();
+  state.heartbeat?.terminate();
+});
 
 resizeCanvas();
 init().catch(error => {
   toast(`巡检页面初始化失败：${error?.message || error}`, 'err');
 });
+startCotReveal(0, true);
