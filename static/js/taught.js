@@ -6,6 +6,18 @@ import { captureIsOpen, storeTaughtDocument, taughtStartBlocker, taughtProcessin
 const CAPTURE_STATE = {recording:'正在采集',paused:'已暂停',interrupted:'采集中断',processing:'平滑与校验中',finished:'已保存',failed:'校验未通过',abandoned:'草稿已放弃'};
 const CHECK_STATE = {idle:'尚未自检',preparing:'准备中',standing:'正在自动站起',settling:'等待站稳',loading:'加载地图中',localizing:'定位中',ready:'自检通过，可开始采集',failed:'自检未通过'};
 const MODES = {replace:'整条替换',append:'末尾追加',replace_segment:'替换选中区间'};
+const CHECK_LABELS = {standing:'站立就绪',stack:'导航服务',map:'地图一致',measurement:'测量同步',localization_quality:'定位质量',localized:'定位确认',still:'静止状态',exclusive:'任务空闲'};
+const CHECK_ICONS = {
+  ok:'<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+  crit:'<path d="m12 3 10 17H2L12 3Z"/><path d="M12 9v4m0 3v.2"/>',
+  pending:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
+};
+function checkIcon(state){
+  const icon = document.createElement('span'); icon.className = 'taught-status-icon'; icon.setAttribute('aria-hidden','true');
+  // 图形固定，服务端说明始终用textContent写入；图标形状与可读状态共同表达结果。
+  icon.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${CHECK_ICONS[state] || CHECK_ICONS.pending}</svg>`;
+  return icon;
+}
 const editorUrl = (map, capture) => `/taught-editor${map ? `?map=${encodeURIComponent(map)}${capture ? `&capture=${encodeURIComponent(capture)}` : ''}` : ''}`;
 
 export function setupTaught(store, src, setTool){
@@ -25,7 +37,8 @@ export function setupTaught(store, src, setTool){
       if (map !== store.taughtMap) return r;
       accept(r?.data);
       if (r?.ok === false) message(r.msg || '操作失败，原参考轨迹与草稿均保留',true);
-      else if (r?.msg) message(r.msg);
+      // 准备/自检由结果面板持续展示；异步回执不能在完成后仍挂着“正在准备”。
+      else if (r?.msg && !['taughtPrepare','taughtCheck'].includes(name)) message(r.msg);
       return r;
     } catch (e){ const r = {ok:false,msg:e.message || '示教请求失败'}; message(r.msg,true); return r; }
     finally { busy = false; finishing = false; render(); }
@@ -137,7 +150,13 @@ export function setupTaught(store, src, setTool){
     const d = doc(), c = d?.capture, open = captureIsOpen(c), recording = c?.state === 'recording', processing = c?.state === 'processing';
     const reconnected = store.link.ok && !wasLinked; wasLinked = store.link.ok;
     if (store.uiTask === 'taught' && reconnected && store.taughtMap){ const map = store.taughtMap; queueMicrotask(()=>load(map)); }
-    const link = !!store.link.ok, ready = d?.check?.ok === true && d.check.state === 'ready';
+    const link = !!store.link.ok;
+    // 后端自检是通过的唯一来源；当前已知的趴姿/急停/换图只能使旧结果失效，不能反向补造通过。
+    const preparationIssue = store.estop ? '急停中，请先处理急停。'
+      : d?.map && d.map !== store.mapCurrent ? '所选地图尚未加载，请重新准备。'
+      : store.ctrl?.on && (store.ctrl.state !== 'Velocity' || store.ctrl.ready !== true || store.ctrl.op) ? '站立状态已变化，请重新准备。'
+      : '';
+    const wasReady = d?.check?.ok === true && d.check.state === 'ready', ready = wasReady && !preparationIssue;
     const checkBusy = ['preparing','standing','settling','loading','localizing'].includes(d?.check?.state);
     const stateText = !link && recording ? '连接中断，等待核对' : c && open ? CAPTURE_STATE[c.state] : d ? d.state === 'ready' ? '参考可用' : d.state === 'invalid' ? '参考无效' : '尚无轨迹' : '未读取';
     const pill = $('#taughtState'); pill.textContent = stateText; pill.dataset.s = !link || c?.state === 'failed' || d?.state === 'invalid' ? 'warn' : recording ? 'run' : ready ? 'ok' : '';
@@ -148,13 +167,49 @@ export function setupTaught(store, src, setTool){
     processingNote.hidden = !finishing && !processing && !summary;
     processingNote.textContent = finishing || processing ? '正在加密采样、平滑路线并检查完整机器人足迹，请等处理结果。' : summary ? `已保存参考的处理结果：${summary}` : '';
     processingNote.setAttribute('aria-busy',String(finishing || processing));
-    $('#taughtCheckNote').textContent = !link ? '连接断开。采样不会自动恢复；重连后读取状态并人工继续。' : d?.check?.message || CHECK_STATE[d?.check?.state || 'idle'];
-    $('#taughtCheckNote').classList.toggle('warn',!link || d?.check?.state === 'failed');
-    const checks = Array.isArray(d?.check?.checks) ? d.check.checks : [], ck = JSON.stringify(checks);
-    if (ck !== checksKey){ checksKey = ck; $('#taughtChecks').replaceChildren(...checks.map(item=>{
-      const li = document.createElement('li'), status = item.ok === true ? '通过' : item.ok === false ? '未通过' : '待确认';
-      li.dataset.s = item.ok === true ? 'ok' : 'warn'; li.textContent = `${status} · ${item.label || item.name || item.key || '检查项'}${item.message || item.msg ? `：${item.message || item.msg}` : ''}`; return li;
-    })); }
+    const checkState = !link ? 'pending' : ready ? 'ok' : d?.check?.state === 'failed' ? 'crit' : 'pending';
+    $('#taughtCheckResult').dataset.s = checkState;
+    $('#taughtCheckResult').setAttribute('aria-busy',String(checkBusy && link));
+    $('#taughtCheckIcon').replaceChildren(checkIcon(checkState));
+    $('#taughtCheckNote').textContent = !link ? '连接已断开' : ready ? '自检通过'
+      : wasReady && preparationIssue ? '需要重新准备'
+      : d?.check?.state === 'failed' ? '自检未通过' : CHECK_STATE[d?.check?.state || 'idle'];
+    $('#taughtCheckHint').textContent = !link ? '重连后核对状态，采集需手动继续。'
+      : ready ? store.source === 'mock' ? '模拟结果，可演练采集。' : '可以开始采集。'
+      : wasReady && preparationIssue ? preparationIssue
+      : checkState === 'crit' ? '请处理下方未通过项，再重新自检。'
+      : checkBusy ? '请保持静止，等待准备完成。' : '趴着或站着均可准备，站稳后自动定位。';
+    const checks = Array.isArray(d?.check?.checks) ? d.check.checks : [];
+    // 换图/停栈可整体作废一份旧快照，即使旧的八个子项仍保留ok，也只能显示待确认。
+    const checksCurrent = link && !checkBusy && !(wasReady && preparationIssue) && (d?.check?.state !== 'failed' || checks.some(item=>item.ok === false));
+    const ck = JSON.stringify([checks,checksCurrent,checkState,d?.check?.message]);
+    if (ck !== checksKey){
+      checksKey = ck;
+      const problems = [], messages = [];
+      // 默认只展示短标签；失败原因直接展开，完整条件和数值保留在可用键盘展开的详情里。
+      $('#taughtChecks').replaceChildren(...checks.map(item=>{
+        const ok = checksCurrent ? item.ok : null;
+        const state = ok === true ? 'ok' : ok === false ? 'crit' : 'pending';
+        const status = ok === true ? '通过' : ok === false ? '未通过' : '待确认';
+        const label = item.label || item.name || item.key || '检查项', detail = item.message || item.msg || '';
+        const li = document.createElement('li'), name = document.createElement('span');
+        li.dataset.s = state; li.setAttribute('aria-label',`${label}：${status}`); li.title = `${label}：${status}${detail ? `；${detail}` : ''}`;
+        name.textContent = CHECK_LABELS[item.key] || label; li.replaceChildren(checkIcon(state),name);
+        const message = document.createElement('li'); message.dataset.s = state;
+        message.textContent = `${label} · ${status}${detail ? `：${detail}` : ''}`; messages.push(message);
+        if (ok === false){ const problem = document.createElement('li'); problem.textContent = `${label}：${detail || '未通过，请重新检查'}`; problems.push(problem); }
+        return li;
+      }));
+      if (!problems.length && checkState === 'crit'){
+        const problem = document.createElement('li'); problem.textContent = d?.check?.message || '准备状态已失效，请重新准备。'; problems.push(problem);
+      }
+      $('#taughtChecks').hidden = !checks.length;
+      $('#taughtCheckMessages').replaceChildren(...messages);
+      $('#taughtCheckProblems').replaceChildren(...problems); $('#taughtCheckProblems').hidden = !problems.length;
+      $('#taughtCheckDetails').hidden = !checks.length;
+      const passed = checksCurrent ? checks.filter(item=>item.ok === true).length : 0;
+      $('#taughtCheckDetailsLabel').textContent = `检测详情 · ${passed}/${checks.length} 通过`;
+    }
     const rk = d ? `${d.map}:${d.revision}:${d.points?.length || 0}` : '';
     if (rk !== rangeKey){ rangeKey = rk; const n = d?.points?.length || 0;
       $('#taughtRangeStart').max = Math.max(1,n-1); $('#taughtRangeEnd').max = Math.max(2,n);
@@ -162,13 +217,16 @@ export function setupTaught(store, src, setTool){
     $('#taughtRangeRow').hidden = mode.value !== 'replace_segment';
     $('#taughtModeHint').textContent = mode.value === 'append' ? '从旧末端接入，原参考保留；新采样通过检查后追加。' : mode.value === 'replace_segment' ? '采集起止位置都需要靠近选定端点；后端保护区间外的参考。' : '旧参考一直保留，直到新轨迹校验保存通过。';
     const why = taughtStartBlocker(store,d,mode.value,range());
-    $('#taughtStart').disabled = busy || !!why; $('#taughtStartBlocker').textContent = busy ? '正在处理示教请求…' : why;
+    $('#taughtStart').disabled = busy || !!why || !!preparationIssue; $('#taughtStartBlocker').textContent = busy ? '正在处理示教请求…' : preparationIssue || why;
     const locked = busy || open;
     sel.disabled = locked || !names.length; mode.disabled = locked;
     $('#taughtRefresh').disabled = busy || !link || !store.taughtMap;
     // 中断后导航栈可能也已停止；同图草稿允许重新加载定位，仍保持 session/选图/模式锁，绝不新建或自动恢复采样。
     const recoverPrepare = ['paused','interrupted'].includes(c?.state) && c.map === store.taughtMap;
-    $('#taughtPrepare').disabled = busy || !link || !store.taughtMap || (open && !recoverPrepare) || checkBusy;
+    // 通过是已完成的准备结果；失效后才重新开放，不让用户重复启动站起和定位。
+    $('#taughtPrepare').disabled = busy || !link || !store.taughtMap || (open && !recoverPrepare) || checkBusy || ready;
+    $('#taughtPrepare').textContent = ready && link ? '已准备' : checkBusy ? '准备中…' : '准备示教';
+    $('#taughtPrepare').dataset.complete = String(ready && link);
     $('#taughtCheck').disabled = busy || !link || !d || recording || processing || checkBusy;
     for (const id of ['taughtRangeStart','taughtRangeEnd','taughtPickRange']) $('#'+id).disabled = locked || !d?.points?.length;
     $('#taughtCapture').hidden = !c;

@@ -56,3 +56,16 @@ sg docker -c './run.sh build-nav --packages-select go2w_taught_route --parallel-
 原始证据在主仓库已忽略目录`data/development/web-taught-refine-20261119/`：`core.md`、`frontend.md`、`protocol-{lying,standing}-final/result.json`、`final-browser/frontend-refine-browser.json`与截图。早期测试假设修正（协议命名、短状态广播）保留在`frontend.md`，不算产品失败。
 
 导航skill参考已同步仓库版与本机安装版，覆盖准备顺序、样条/预览/保存、控制点分存、断口和真实处理摘要，并通过结构、链接及独立检索验证。软件结果不替代真机定位质量、轮腿动力学、实际路径跟踪或Orin性能验收。
+
+## 同日补充：紧凑自检面板（v1.1.2）
+
+根据用户对结果层级、篇幅和按钮完成状态的反馈调整呈现。本次仅修改网页展示、按钮门槛与相关测试；导航算法、后端自检阈值和原始数据未修改。
+
+- 顶部独立结果框：通过为绿色勾，未通过为红色警示，准备/断线为待确认图标；不再把长条件当作结果正文。
+- 八个检测项用两列短标签和SVG状态图标展示。完整条件及原始数值保存在可键盘展开的“检测详情”，显示通过数；仅失败原因默认展开。所有状态均有可读名称，不依赖颜色辨识。
+- 自检通过后准备按钮显示灰色“已准备”。后端失效或当前已知趴姿、急停、换图时允许重新准备，开始按钮按现有门槛阻止旧结果继续使用；前端只作废已知失效结果，不自行推断通过。断线或整体作废后，旧绿灯改为待确认。
+- 准备与重新自检成功回执由结果面板统一显示，避免完成后仍残留“正在准备”的过期提示；错误提示保留。
+
+本轮实测：6个Node脚本全部通过；原有Chrome主流程8组通过；扩展Chrome检查14组通过（12组受控接口/模拟流程和2组实际假ROS后端）。覆盖准备完成置灰、暂停后重新自检与人工恢复、状态失效后重开、失败仅展开问题项、键盘展开详情、900/375px无横向溢出，以及原有样条保存/刷新/CAS冲突。实际假ROS从趴姿准备成功，八项绿灯、“已准备”置灰、未自动采集且未解锁。没有真机动作。
+
+本轮原始结果与截图位于主仓库已忽略目录`data/development/web-taught-checks-20261119/final/`：`frontend-browser-report.json`、`frontend-refine-browser.json`、`ui-checks-ready.png`、`ui-checks-failed.png`、`ui-checks-{900,375}.png`及`ui-live-prepare-ready.png`。本地预览`http://127.0.0.1:8838`已刷新为v1.1.2。

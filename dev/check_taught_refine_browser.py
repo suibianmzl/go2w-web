@@ -188,6 +188,58 @@ def main():
             box.locator('[data-a=o]').click()
             expect(main_page.locator('#taughtStart')).to_be_enabled()
             assert main_page.evaluate('go2w.store.taught.capture===null')
+            # 用接口返回形状的八项快照检查展示，不把纯前端fixture当作真实传感器自检。
+            main_page.evaluate('''() => {
+              window.__goodChecks=[
+                ['standing','站立就绪','需站起并由策略接管'],
+                ['stack','导航与定位服务','需运行定位、导航、速度桥和示教节点'],
+                ['map','底图一致','实际/map与所选文件一致'],
+                ['measurement','测量与坐标变换','测量与TF按同一时刻，均为新鲜数据'],
+                ['localization_quality','定位质量','位置σ 0.030m，测量时刻匹配率 100.0%；需要≤0.3m、≥60%'],
+                ['localized','定位来源已确认','换图或站起后需重新定位'],
+                ['still','机器人静止','开始和继续采集前保持静止'],
+                ['exclusive','任务状态','没有其他导航任务或地图切换']
+              ].map(([key,label,message])=>({key,label,message,ok:true}));
+              go2w.store.taught.check={state:'ready',ok:true,checks:window.__goodChecks};
+            }''')
+            expect(main_page.locator('#taughtPrepare')).to_be_disabled()
+            expect(main_page.locator('#taughtPrepare')).to_have_text('已准备')
+            expect(main_page.locator('#taughtCheckNote')).to_have_text('自检通过')
+            expect(main_page.locator('#taughtCheckResult')).to_have_attribute('data-s','ok')
+            expect(main_page.locator('#taughtChecks li[data-s=ok]')).to_have_count(8)
+            expect(main_page.locator('#taughtChecks svg')).to_have_count(8)
+            assert not main_page.locator('#taughtCheckDetails').evaluate('el=>el.open')
+            assert all(len(text)<=8 for text in main_page.locator('#taughtChecks li').all_inner_texts())
+            main_page.locator('#taughtCheckDetailsLabel').focus()
+            main_page.keyboard.press('Enter')
+            expect(main_page.locator('#taughtCheckMessages')).to_be_visible()
+            expect(main_page.locator('#taughtCheckMessages')).to_contain_text('0.030m')
+            main_page.keyboard.press('Enter')
+            assert not main_page.locator('#taughtCheckDetails').evaluate('el=>el.open')
+            main_page.screenshot(path=str(out/'ui-checks-ready.png'), full_page=True)
+            passed('自检结果高亮、八项图标短标签、完成后置灰与键盘展开详情')
+            main_page.evaluate('''() => {
+              const d=go2w.store.taught;
+              d.check={state:'failed',ok:false,checks:window.__goodChecks.map(item=>item.key==='localization_quality'
+                ? {...item,ok:false,message:'匹配率 45%，需要至少60%；请修正定位。'} : item)};
+            }''')
+            expect(main_page.locator('#taughtCheckResult')).to_have_attribute('data-s','crit')
+            expect(main_page.locator('#taughtCheckProblems')).to_contain_text('匹配率 45%')
+            expect(main_page.locator('#taughtCheckProblems li')).to_have_count(1)
+            expect(main_page.locator('#taughtPrepare')).to_be_enabled()
+            expect(main_page.locator('#taughtStart')).to_be_disabled()
+            main_page.screenshot(path=str(out/'ui-checks-failed.png'), full_page=True)
+            passed('失败只展开问题项、红色状态和具体原因，允许重新准备')
+            main_page.evaluate("go2w.store.taught.check={state:'ready',ok:true,checks:window.__goodChecks}")
+            expect(main_page.locator('#taughtPrepare')).to_be_disabled()
+            for width, height in [(900,780),(375,900)]:
+                main_page.set_viewport_size({'width':width,'height':height})
+                main_page.locator('#taughtCheckResult').scroll_into_view_if_needed()
+                assert main_page.evaluate('document.documentElement.scrollWidth<=innerWidth+1')
+                assert main_page.locator('#taughtChecks').evaluate('el=>el.scrollWidth<=el.clientWidth+1')
+                main_page.screenshot(path=str(out/f'ui-checks-{width}.png'), full_page=True)
+            main_page.set_viewport_size({'width':1440,'height':1000})
+            passed('自检面板900及375px无横向溢出，状态保持两列')
             main_page.locator('#taughtStart').click(); main_page.locator('.scrim [data-a=o]').click()
             # 模拟源边界只提供服务器结束结果，不把模拟当作真实平滑或足迹验证。
             main_page.evaluate('''() => {
@@ -272,6 +324,10 @@ def main():
                 live.screenshot(path=str(out/'ui-live-prepare-settling.png'), full_page=True)
                 live.wait_for_function('go2w.store.taught?.check?.state==="ready"', timeout=110000)
                 expect(live.locator('#taughtStart')).to_be_enabled()
+                expect(live.locator('#taughtPrepare')).to_be_disabled()
+                expect(live.locator('#taughtPrepare')).to_have_text('已准备')
+                expect(live.locator('#taughtCheckNote')).to_have_text('自检通过')
+                expect(live.locator('#taughtChecks li[data-s=ok]')).to_have_count(8)
                 report['live_prepare'] = {'initial_ctrl': 'Passive', 'final_ctrl': live.evaluate('go2w.store.ctrl.state'),
                                           'states': states, 'commands': commands,
                                           'capture_started': live.evaluate('!!go2w.store.taught.capture'),

@@ -110,17 +110,18 @@ def main():
             mock.locator('#taughtPause').click();await_capture(mock,'paused')
             count=mock_capture(mock)['sample_count'];mock.wait_for_timeout(700)
             assert mock_capture(mock)['sample_count'] == count
-            mock.locator('#taughtPrepare').click();modal(mock,check=True)
+            expect(mock.locator('#taughtPrepare')).to_be_disabled()
+            mock.locator('#taughtCheck').click()
             assert mock_capture(mock)['session_id'] == session and mock_capture(mock)['state'] == 'paused'
             mock.locator('#taughtResume').click();modal(mock);await_capture(mock,'recording')
             drive_mock(mock)
             assert len({point['continuous_id'] for point in mock_capture(mock)['points']}) >= 2
-            passed('模拟显式准备、遥控采样、暂停不采样、同图准备与人工恢复',samples=mock_capture(mock)['sample_count'])
+            passed('模拟显式准备、遥控采样、暂停不采样、准备完成置灰与人工恢复',samples=mock_capture(mock)['sample_count'])
             mock.evaluate('go2w.src.cmd.simulateDrop()');await_capture(mock,'interrupted')
             mock.wait_for_function('!go2w.store.link.ok')
             mock.wait_for_function('go2w.store.link.ok')
             assert mock_capture(mock)['state'] == 'interrupted'
-            mock.locator('#taughtPrepare').click();modal(mock,check=True)
+            mock.locator('#taughtCheck').click()
             mock.locator('#taughtResume').click();modal(mock);await_capture(mock,'recording')
             mock.locator('#taskTabs [data-t=nav]').click();modal(mock);await_capture(mock,'paused')
             expect(mock.locator('#flowNav')).to_be_visible()
