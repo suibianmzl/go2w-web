@@ -55,8 +55,13 @@ try {
   // 3. 定时覆盖同一份（假地图一直在长）
   const c1 = state.autosave.count;
   await until(() => state.autosave.count >= c1 + 2, 20000, '定时再存两次');
-  ok('定时保存：覆盖同一个名字', state.autosave.name === name && readdirSync(MAPS).filter(f => f.startsWith('autosave_') && f.endsWith('.yaml')).length === 3,
+  ok('定时保存：覆盖同一个名字', state.autosave.name === name && readdirSync(MAPS).filter(f => f.startsWith('autosave_') && f.endsWith('.yaml') && !f.includes('_prev')).length === 3,
      `第 ${state.autosave.count} 次`);
+  // 11-19：覆盖前把上一份挪成 <名字>_prev（yaml 的 image 跟着改），坏图写进来时还能退一步
+  const prevYaml = join(MAPS, `${name}_prev.yaml`);
+  ok('覆盖前留一份 _prev，四件套齐、yaml 指向自己的 pgm',
+     ['.yaml', '.pgm', '.posegraph', '.data'].every(x => existsSync(join(MAPS, `${name}_prev${x}`)))
+     && new RegExp(`^image: ${name}_prev\\.pgm$`, 'm').test(readFileSync(prevYaml, 'utf8')));
   ok('定时保存不刷日志', logs.filter(t => /建图自动保存：/.test(t)).length === 1);
 
   // 4. 里程计出问题（slam 还活着）：马上存一次，日志写明原因

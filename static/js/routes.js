@@ -130,23 +130,28 @@ export function setupRouteEditor(store, actions, setTool){
         label.textContent = `${i + 1} 号点${end ? (round.checked ? ' · 之后回到 1 号点' : ' · 终点') : ''} · ${heading}`;
         label.title = `坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
         label.classList.toggle('route-end', end);
-        const pointName = document.createElement('input');
-        pointName.type = 'text';
-        pointName.className = 'route-point-name';
-        pointName.maxLength = 40;
-        pointName.placeholder = `第 ${i + 1} 站名称（可选）`;
-        pointName.setAttribute('aria-label', pointName.placeholder);
-        pointName.value = p.name || '';
-        pointName.oninput = () => {
-          const current = store.routeDraft;
-          const points = current.points.map((point, j) => j === i ? { ...point, name:pointName.value } : point);
-          const renamed = { ...current, points };
-          store.routeDraft = renamed;
-          // 名称不影响路径。保留规划结果和输入框焦点。
-          if (store.routeCheck?.draft === current) store.routeCheck.draft = renamed;
-          if (lastDraft === current) lastDraft = renamed;
-          render();
+        // 站名、备注：只改文字，不影响路径。保留规划结果和输入框焦点
+        const textField = (el, key, cls, max, placeholder) => {
+          el.className = cls;
+          el.maxLength = max;
+          el.placeholder = placeholder;
+          el.setAttribute('aria-label', placeholder);
+          el.value = p[key] || '';
+          el.oninput = () => {
+            const current = store.routeDraft;
+            const points = current.points.map((point, j) => j === i ? { ...point, [key]:el.value } : point);
+            const edited = { ...current, points };
+            store.routeDraft = edited;
+            if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+            if (lastDraft === current) lastDraft = edited;
+            render();
+          };
+          return el;
         };
+        const pointName = textField(Object.assign(document.createElement('input'), { type:'text' }),
+          'name', 'route-point-name', 40, `第 ${i + 1} 站名称（可选）`);
+        const pointNote = textField(Object.assign(document.createElement('textarea'), { rows:2 }),
+          'note', 'route-point-note', 200, `第 ${i + 1} 站备注（可选）`);
         const button = (text, title, action, disabled = false) => {
           const b = document.createElement('button');
           b.className = 'btn sm'; b.textContent = text; b.title = title;
@@ -163,7 +168,7 @@ export function setupRouteEditor(store, actions, setTool){
         const move = target => points => { [points[i], points[target]] = [points[target], points[i]]; };
         li.append(label, button('↑', '上移第 ' + (i + 1) + ' 点', move(i - 1), i === 0),
           button('↓', '下移第 ' + (i + 1) + ' 点', move(i + 1), i === draft.points.length - 1),
-          button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName);
+          button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, pointNote);
         return li;
       }));
     }

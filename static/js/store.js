@@ -33,6 +33,8 @@ export function createStore(){
     mapBusy: false,
     // 续建（docs/地图续建.md）：{active, base, name, source, pose, note, warn, check:{ok,fit,...}, elapsed}
     cont: null,
+    contPaused: false,
+    contResult: null,
     // task.phase: plan | align | follow | final | dwell | arrived
     task: { type: 'idle' },
     armed: null, estop: false, odomOk: false,

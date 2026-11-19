@@ -218,19 +218,19 @@ export function createActions(store, src){
       if (!base) return toast('先选一张基准图', 'warn');
       if (!/^[A-Za-z0-9_-]{1,40}$/.test(name || '')) return toast('新图名限 1–40 个字母、数字、下划线或减号', 'err');
       if (name === base) return toast('续建必须另存新名字，不能覆盖基准图', 'err');
-      // 手动位姿是唯一没有自动校验的一级，所以要显式确认
       const manual = source === 'manual';
       return confirmBox({ title: `在 ${base} 上续建`,
-        body: `新图叫 ${name}。${manual ? '起点位姿用你手动给的那个（这一级没有自动校验，开后要看自检）。' : '起点位姿按「停车点 → 自动定位 → 手动」依次定。'}`
-          + '机器人的位置必须在基准图覆盖范围内。slam_toolbox 加载旧图时不校验位姿，给错了也不会报错，只会建出双线墙——所以开始后要点「自检」。',
+        body: `新图叫 ${name}。${manual ? '使用手动输入的位姿。' : source === 'parking' ? '请确认机器人正停在已记录的停车点。' : '在基准图上用当前激光自动定位。'}`
+          + '请保持机器人静止。旧墙贴合自检通过后开始采集。',
         ok: '开始续建', danger: manual,
         // 要等静止激光 + 自动定位 + 加载基准图，5–15 s：期间按钮显示进行中，失败原因留在状态栏
         // （提示框只停 2.6 s，长的原因一闪就没了，看起来像「点了没反应」）
         onOk: () => {
-          store.contStarting = true; store.contErr = null;
+          store.contStarting = true; store.contErr = null; store.contResult = null;
           return exec(src.cmd.contStart(base, name, pose, source), null).then(r => {
             store.contStarting = false;
             store.contErr = r && r.ok === false ? (r.msg || '没开始，原因未知') : null;
+            store.contResult = r && r.ok === false ? r.data : null;
             // 成功后到下一次状态推送（≤0.5 s）之间 store.cont 还是空的：这段时间继续显示进行中
             store.contStartOkAt = r && r.ok !== false ? Date.now() : 0;
             return r;
@@ -241,11 +241,15 @@ export function createActions(store, src){
       if (!ready('contCheck')) return;
       return exec(src.cmd.contCheck(), null);
     },
+    mapResume(){
+      if (!ready('mapResume')) return;
+      return exec(src.cmd.mapResume(), null);
+    },
     contFinish(reason){
       if (!ready('contFinish')) return;
       const c = store.cont;
       if (!c) return toast('没有正在进行的续建', 'warn');
-      if (!c.check?.ok) return toast('先跑自检并通过', 'err');
+      if (!c.ready || !c.check?.ok) return toast('先跑自检并通过', 'err');
       return exec(src.cmd.contFinish(reason), null).then(r => {
         if (r && r.ok !== false){ store.mapSavedAt = Date.now(); store.mapSavedName = c.name; }
         return r;
@@ -253,8 +257,11 @@ export function createActions(store, src){
     },
     contAbort(){
       if (!ready('contAbort')) return;
-      confirmBox({ title: '放弃这次续建', body: '已经建进档位里的节点不会消失——这是 slam_toolbox 的硬限制。想要干净的地图只能停掉建图再重开。',
-        danger: true, ok: '放弃', onOk: () => exec(src.cmd.contAbort(), null) });
+      confirmBox({ title: '放弃这次续建', body: '放弃会暂停扫描。可以重新选择基准图续建，或者重开建图档位。',
+        danger: true, ok: '放弃', onOk: () => {
+          store.contErr = null; store.contResult = null;
+          return exec(src.cmd.contAbort(), null);
+        } });
     },
     contParking(base, clear){
       if (!ready('contParking')) return;

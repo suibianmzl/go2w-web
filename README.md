@@ -80,7 +80,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 流程：选基准 → 检查基准（`cont_preflight`）→ 开始续建（`cont_start`）→ 自检（`cont_check`）→ 收工（`cont_finish`）。
 
 - 基准图必须有 `.posegraph` + `.data`。续建永远另存新名字，基准图不动；收工时写 `<name>.meta.json`，`routes.json` 里指向基准的任务改指新图（坐标系不变，站点不用重标）。
-- 开始续建：起点位姿按 停车点（`data/parkings.json`）→ 自动定位（在磁盘上的基准图上做）→ 手动 的顺序取，起点必须在基准图范围内；然后暂停收 scan、调 `/slam_toolbox/deserialize_map`（`START_AT_GIVEN_POSE`）、再恢复。
+- 开始续建：起点位姿按 停车点（`data/parkings.json`）→ 自动定位（在磁盘上的基准图上做）→ 手动 的顺序取，起点必须在基准图范围内；然后关扫描闸门、调 `/slam_toolbox/deserialize_map`（`START_AT_GIVEN_POSE`），只放一帧验证扫描，自检通过才恢复连续采集（v1.0.5 起，见下面「续建扫描闸门」）。
 - 这个服务读文件失败也返回成功，所以**自检是唯一判据**，没通过不许存图。自检（11-17 起不用回起点）用 slam 当前位姿（TF `map→base_footprint`，还没有 map 坐标系时退回起点位姿），角度修正绕该位姿转（`--pivot`），超出 0.40 m / 8° 报「起点位姿偏了」，并把修正量换算成起点位姿（`start_fix`）供重来；贴合率 < 85% 报「环境和图对不上」，提示站到能看到旧墙的地方。
 - 检查基准时核对运控策略（环境变量或 `runtime.env` 的 `GO2W_CONTROL_POLICY`）和切片高度（`pcl2scan_slam.yaml`，运行镜像里在 `/opt/go2w/base/go2w_bringup/share/go2w_bringup/config`），和基准 `meta.json` 不一致就拦下。
 
@@ -136,6 +136,38 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - `procs.list_maps` 多返回 `size`（`<名字>.*` 字节数之和）。
 
 同版本还修了导航页地图下拉框「选不上」：`store.maps` 每条 state（2 Hz）都是新数组，原来按引用比较，每 0.5 s 重建一次选项，展开的列表被关掉 / 选择被冲掉；现在按地图名比较。
+
+## 异常记录 + 站点备注（v1.0.4，11-18）
+
+后端 `server/incidents.py`（`IncidentLog`）把异常记进 `data/incidents.json`（最多 1000 条，新的挤掉旧的）：长时受阻、导航失败、安全停车、急停、电机过热、运控离线（v1.0.6 加了意外趴下、里程计异常）。每条带时间、狗编号、持续时长（持续类异常结束时补上）、位置、地图、当时的任务和站点。
+
+- 每条异常自动存回溯包（异常前 15 s + 后 15 s）；计划存包前又来的异常并进同一个包（`INC_MERGE`），同类异常 60 s 内只存一次（照样记，包标成「没存」并写原因）。包目录里附 `incidents.json` 说明为什么存。
+- 给云端监控页：ws 连上推最近 50 条 `{t:'incidents'}`，之后有变化推 `{t:'incident'}`；历史翻页 `GET /api/incidents?limit=50&before=<ts 毫秒>`。接口细节见主仓库 `docs/巡逻监控接口_v1.0.4新增.md`。
+- 导航任务每一站可以写备注（站名下面的输入框，最多 200 字，`ROUTE_NOTE_MAX`），跟任务一起保存；执行时任务卡片数据里带当前站备注。
+
+测试：`dev/test_incidents.py`、`dev/test_stuck.py`（要 aiohttp，用 `~/.cache/go2w_web_venv/bin/python`）、`dev/test_routes.mjs`。
+
+## 续建扫描闸门（v1.0.5，11-19）
+
+续建不再靠 slam_toolbox 的暂停开关（Humble 上加载后第一帧能绕过暂停，直接把错位的扫描写进基准图）。运行镜像里加了节点 `go2w_mapping_scan_gate`：`/scan` → `/go2w/mapping_scan`，slam_toolbox 只订后者；参数 `scan_budget` = -1 全部放行 / 0 全部挡住 / 1 只放一帧（后端 `set_scan_budget`）。
+
+流程：关闸门 → 定位出起点 → 加载基准 posegraph，确认 SLAM 地图和基准一致 → 狗静止时只放一帧 → 用这一帧对应的 SLAM 位姿做自检（`map_overlap_check`，`require_aligned`：按当前位姿量旧墙贴合率和覆盖率）→ 通过才放开闸门连续采集；没通过闸门保持关闭，基准图不会被污染，并给出起点该改多少。
+
+需要运行镜像带闸门（Tink-YG/go2w `mapping.launch.py` + `mapping_scan_gate.py`，v1.0.0.10 起）。旧镜像普通建图照常，续建会提示「建图扫描闸门不可用，请更新运行镜像并重开建图」。
+
+测试：`dev/test_continue.mjs`（准备见文件头，要 `lab_20261116` 带 `.posegraph/.data`）、`dev/test_mapcontinue.py`、`dev/test_map_overlap_check.py`。
+
+## 摔倒 / 里程计发散保护（v1.0.6，11-19）
+
+起因：11-19 .30 建图时摔倒，FAST-LIO 发散，自动保存把好图覆盖成了 467 × 551 m 的坏图。
+
+- safety 循环 5 Hz 检查：运控不是网页让的、从 FixStand / Velocity 掉到 Passive（摔倒或遥控器趴下；网页刚让趴下后 3 s 内不算）→ 异常「意外趴下」；`/odom` 速度 > 4 m/s、角速度 > 8 rad/s 或相邻两条位置跳 > 1 m → 异常「里程计异常」。两种都自动存回溯包。
+- 建图中出现任一种，立刻**冻结建图**：关扫描闸门（地图停在这一刻）、暂停自动保存（最近一份好的不会被覆盖）、暂停续建采集；停止建图时也不再「停止前保存」。
+- 自动保存每次覆盖前把上一份留成 `<名字>_prev`（四件套齐，可以拿来续建）。
+- 「保存地图」步骤显示冻结原因和保留的是哪一份。只是正常趴下、地图没乱：站起来后可以点「继续建图」；里程计飘过的不允许继续，只能停止后从保留的图续建。
+- 异常后马上停止档位时，先把回溯包存掉再停。
+
+测试：`dev/test_fall_guard.mjs`（准备见文件头：`GO2W_AUTOSAVE_SECONDS=4 GO2W_FAKE_MAP_GROW=1 dev/run.sh`）、`dev/test_autosave.mjs`。
 
 ## 地图显示方向
 

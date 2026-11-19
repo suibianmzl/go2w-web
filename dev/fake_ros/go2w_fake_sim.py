@@ -28,6 +28,11 @@ FAKE_MOVE = os.environ.get('GO2W_FAKE_MOVE', '/tmp/go2w_fake_move')
 FAKE_SCAN_OFF = os.environ.get('GO2W_FAKE_SCAN_OFF', '/tmp/go2w_fake_scan_off')
 # 测试建图自动保存：这个文件存在时假里程计报不健康（/odom_healthy 停发）
 FAKE_ODOM_OFF = os.environ.get('GO2W_FAKE_ODOM_OFF', '/tmp/go2w_fake_odom_off')
+FAKE_SLAM_POSE_OFF = os.environ.get('GO2W_FAKE_SLAM_POSE_OFF')
+# 测试摔倒保护（11-19）：这个文件出现时假运控不经请求直接掉到 Passive（摔倒），读完删掉
+FAKE_FALL = os.environ.get('GO2W_FAKE_FALL', '/tmp/go2w_fake_fall')
+# 这个文件存在期间假里程计发散：速度 -20 m/s、位置每帧跑 2 m（摔倒后 FAST-LIO 的样子）
+FAKE_ODOM_WILD = os.environ.get('GO2W_FAKE_ODOM_WILD', '/tmp/go2w_fake_odom_wild')
 # GO2W_FAKE_MAP_GROW=1：建图时 /map 每 2 s 发一次且内容在变（真机 slam 也是一直在发），测自动保存
 FAKE_MAP_GROW = os.environ.get('GO2W_FAKE_MAP_GROW') == '1'
 # GO2W_FAKE_SERIALIZE_FAIL=1：serialize_map 返回写文件失败
@@ -260,6 +265,7 @@ class Sim:
         self.procs[mode] = True
         if mode == 'mapping':
             self.slam_frame = None   # 新建图：map 坐标系和真实坐标重合
+            self.scan_budget = self.scan_remaining = -1
         self.ready_at[mode] = time.monotonic() + START_DELAY
         self.rosout(20, 'launch', f'[{mode}.launch.py] all processes started')
 
@@ -404,6 +410,8 @@ class Sim:
         # 续建：slam_toolbox 的三个服务只在建图档位里存在
         if name.startswith('/slam_toolbox/'):
             return self.ready('mapping')
+        if name.startswith('/go2w_mapping_scan_gate/'):
+            return self.ready('mapping')
         return False
 
     def call_service(self, name, req):
@@ -427,6 +435,12 @@ class Sim:
         if name == '/map_server/get_parameters':
             # 真机的 map_server：load_map 服务换图后，yaml_filename 参数仍是启动时的那张（11-06 实测）
             return GetParameters.Response([ParameterValue(4, string_value=f'/go2w/data/maps/{self.yaml_param}.yaml')])
+        if name == '/go2w_mapping_scan_gate/set_parameters':
+            self.scan_budget = self.scan_remaining = req.parameters[0].value.integer_value
+            return SetParameters.Response([SetParametersResult(successful=True)])
+        if name == '/go2w_mapping_scan_gate/get_parameters':
+            return GetParameters.Response([
+                ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=self.scan_budget)])
         # 续建用的 slam_toolbox 接口（真机上的字段照 Humble 上游 srv）
         if name == '/slam_toolbox/deserialize_map':
             from slam_toolbox.srv import DeserializePoseGraph
@@ -442,6 +456,7 @@ class Sim:
             a = g.theta - self.th
             ca, sa = math.cos(a), math.sin(a)
             self.slam_frame = (g.x - (ca*self.x - sa*self.y), g.y - (sa*self.x + ca*self.y), a)
+            self.deliver_map()
             self.plog(20, 'DeserializePoseGraph: 已加载 %s（match_type=%d）' % (base, req.match_type))
             return DeserializePoseGraph.Response()
         if name == '/slam_toolbox/serialize_map':
@@ -812,6 +827,7 @@ class Sim:
     def deliver_map(self):
         from nav_msgs.msg import OccupancyGrid
         g = OccupancyGrid()
+        g.header.frame_id = 'map'
         g.info.width, g.info.height, g.info.resolution = self.w, self.h, self.res
         g.info.origin.position.x, g.info.origin.position.y = self.ox, self.oy
         g.data = self.grid.ravel().tolist()
@@ -880,16 +896,36 @@ def run(node):
             cb()
         now = time.monotonic()
         sim.ctrl_step(now)
+        if os.path.exists(FAKE_FALL):
+            try:
+                os.unlink(FAKE_FALL)
+            except OSError:
+                pass
+            if sim.ctrl['state'] != 'Passive':
+                sim.ctrl.update(state='Passive', seq=sim.ctrl['seq'] + 1, t=now)
+                sim.v = sim.w_ = 0.0
+                sim.rosout(30, 'go2w_ctrl', 'FSM: Change state to Passive (fall)')
         if os.path.exists(FAKE_MOVE):
             try:
                 with open(FAKE_MOVE) as f:
-                    sim.teleport(*(float(v) for v in f.read().strip().split(',')))
+                    sim.glide = tuple(float(v) for v in f.read().strip().split(','))[:3]
             except (OSError, ValueError, TypeError) as e:
                 sim.plog(40, f'GO2W_FAKE_MOVE 读不了：{e}')
             try:
                 os.unlink(FAKE_MOVE)
             except OSError:
                 pass
+        # 「瞬移」改成快速滑过去：每步最多 0.25 m（/odom 10 Hz 时每条 ≤ 0.5 m），
+        # 不然会被网页的里程计跳变检查（11-19，> 1 m 判 FAST-LIO 发散）当成摔倒发散
+        g = getattr(sim, 'glide', None)
+        if g:
+            dx, dy = g[0] - sim.x, g[1] - sim.y
+            d = math.hypot(dx, dy)
+            if d <= 0.25:
+                sim.teleport(*g)
+                sim.glide = None
+            else:
+                sim.teleport(sim.x + dx / d * 0.25, sim.y + dy / d * 0.25, g[2])
         sim.step(dt, now)
         sim.patrol_step(now)
         k += 1
@@ -910,15 +946,32 @@ def run(node):
             o.pose.pose.orientation.z, o.pose.pose.orientation.w = math.sin(sim.th/2), math.cos(sim.th/2)
             o.twist.twist.linear.x = sim.v / sim.stamp_rate   # 和 planar_odom 一样按时间戳差分
             o.twist.twist.angular.z = sim.w_ / sim.stamp_rate
+            if os.path.exists(FAKE_ODOM_WILD):
+                sim.wild = getattr(sim, 'wild', 0.0) - 2.0
+                o.pose.pose.position.x = sim.x + sim.wild
+                o.twist.twist.linear.x = -20.0
             node.deliver('/odom', o)
             s = LaserScan()
             s.header.frame_id = 'base_footprint'
+            s.header.stamp = o.header.stamp
             s.angle_min, s.angle_increment = -math.pi, 2*math.pi/360
             s.range_min, s.range_max = 0.1, 15.0
             ranges = sim.scan()
             s.ranges = ranges.tolist()
             if not os.path.exists(FAKE_SCAN_OFF):
                 node.deliver('/scan', s)
+                if sim.ready('mapping') and sim.scan_remaining != 0:
+                    if sim.scan_remaining > 0:
+                        sim.scan_remaining -= 1
+                    from geometry_msgs.msg import PoseWithCovarianceStamped
+                    aligned = PoseWithCovarianceStamped()
+                    aligned.header.frame_id = 'map'
+                    aligned.header.stamp = s.header.stamp
+                    x, y, yaw = sim.map_pose()
+                    aligned.pose.pose.position.x, aligned.pose.pose.position.y = x, y
+                    aligned.pose.pose.orientation.z, aligned.pose.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+                    if not FAKE_SLAM_POSE_OFF or not os.path.exists(FAKE_SLAM_POSE_OFF):
+                        node.deliver('/pose', aligned)
             node.deliver('/cloud_registered_body', sim.cloud_msg(ranges))
             sim.feedback(now)
             g, t = sim.goal, sim.teleop
@@ -932,7 +985,7 @@ def run(node):
             b = Bool(); b.data = sim.armed; node.deliver('/go2w_cmd_bridge/armed', b)
         if alive and k % 10 == 0 and not os.path.exists(FAKE_ODOM_OFF):  # 里程计健康 2 Hz
             b = Bool(); b.data = True; node.deliver('/odom_healthy', b)
-        if FAKE_MAP_GROW and sim.ready('mapping') and k % 40 == 20:   # 假 slam：地图一直在长
+        if FAKE_MAP_GROW and sim.ready('mapping') and sim.scan_remaining < 0 and k % 40 == 20:
             sim.map_grow = getattr(sim, 'map_grow', 0) + 1
             free = np.flatnonzero(sim.grid.ravel() == -1)
             if len(free):
