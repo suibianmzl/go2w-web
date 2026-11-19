@@ -22,7 +22,7 @@ robots.sort(key=lambda robot: (
 if not robots:
     raise SystemExit("no online robot")
 print(robots[0]["robot_id"])
-' "${gateway_url%/}/quadruped/api/robots"
+' "${gateway_url%/}/quadruped/health"
 )
 if [[ ! "$robot_id" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
   echo "invalid online robot id: $robot_id" >&2
