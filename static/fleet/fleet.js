@@ -46,10 +46,10 @@ function render(robots){
     card.innerHTML = `
       <div class="device-head">
         <span class="badge ${online ? '' : 'offline'}">${online ? '● 在线' : '● 离线'}</span>
-        <span class="robot-id">${html(robot.robot_id)}</span>
+        <span class="robot-id" title="${html(robot.robot_id)}">${html(robot.robot_id)}</span>
       </div>
       <div class="visual"><div class="robot-icon"></div></div>
-      <h3>${html(robot.name, robot.robot_id)}</h3>
+      <h3 title="${html(robot.name, robot.robot_id)}">${html(robot.name, robot.robot_id)}</h3>
       <p>${html(task)}${online ? '' : html(lastSeen)}</p>
       <div class="metrics">
         <span>${battery}</span>
