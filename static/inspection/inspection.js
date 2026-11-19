@@ -147,6 +147,7 @@ const state = {
   cotTimer: null,
   cotSegment: null,
   cotMoving: false,
+  preparing: false,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -331,7 +332,8 @@ function renderSelectedRoute(){
   els.routeSelect.disabled = !state.routes.length || taskActive();
   els.routeMap.textContent = route?.map ? `地图 ${route.map}` : '地图 --';
   els.routeCount.textContent = `固定 ${INSPECTION_NODES.length} 个节点`;
-  els.startBtn.disabled = !route || !state.wsOpen || !state.online || taskActive();
+  els.startBtn.disabled = !route || !state.wsOpen || !state.online || taskActive() || state.preparing;
+  els.startBtn.textContent = state.preparing ? '正在准备…' : '开始巡检';
   els.stopBtn.disabled = !state.wsOpen || !taskActive();
   renderTask();
 }
@@ -453,19 +455,26 @@ function preflightReason(route){
   if (state.machine?.busy) return '机器狗正在切换运行模式';
   if (!route) return '请选择一个巡检任务';
   if (taskActive()) return '已有巡检任务正在执行';
-  const nav = state.machine?.profiles?.navigation;
-  if (nav !== 'run') return '请先在设备控制台启动导航';
-  if (!state.pose?.valid || state.pose?.frame !== 'map') return '等待地图定位和位姿就绪';
-  if (state.machine?.mapCurrent && state.machine.mapCurrent !== route.map){
-    return `请先在控制台切换到任务地图 ${route.map}`;
-  }
   return '';
 }
 
 function renderHint(route){
+  if (state.preparing){
+    els.startBtn.title = '正在准备导航和定位';
+    return;
+  }
   const reason = preflightReason(route);
-  els.actionHint.textContent = reason || '导航和定位已就绪，可以下发巡检任务';
-  els.actionHint.style.color = reason ? 'var(--warn)' : 'var(--green)';
+  const nav = state.machine?.profiles?.navigation;
+  const poseReady = !!state.pose?.valid && state.pose?.frame === 'map';
+  const mapReady = route && state.machine?.mapCurrent === route.map;
+  const ready = nav === 'run' && poseReady && mapReady;
+  const mapping = state.machine?.profiles?.mapping === 'run';
+  els.actionHint.textContent = reason || (ready
+    ? '导航和定位已就绪，可以下发巡检任务'
+    : mapping
+      ? '点击开始将停止建图并自动启动导航、定位'
+      : '点击开始将自动启动导航、定位并下发任务');
+  els.actionHint.style.color = reason ? 'var(--warn)' : ready ? 'var(--green)' : 'var(--fg-2)';
   if (reason) els.startBtn.title = reason;
   else els.startBtn.title = '下发巡检任务并自动解锁底盘';
 }
@@ -876,7 +885,7 @@ function samplePose(pose){
   }
 }
 
-function send(command){
+function send(command, timeout = 10000){
   return new Promise(resolve => {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN){
       resolve({ ok:false, msg:'巡检页面尚未连接云端' });
@@ -886,10 +895,112 @@ function send(command){
     const timer = setTimeout(() => {
       state.pending.delete(id);
       resolve({ ok:false, msg:'云端没有响应（超时）' });
-    }, 10000);
+    }, timeout);
     state.pending.set(id, { resolve, timer });
     state.ws.send(JSON.stringify({ t:'cmd', id, ...command }));
   });
+}
+
+function sleep(ms){
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForCondition(check, timeout, label){
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline){
+    if (!state.wsOpen) throw new Error('与云端的连接已断开');
+    if (check()) return;
+    await sleep(300);
+  }
+  throw new Error(`${label}超时`);
+}
+
+function showPrepare(message){
+  els.actionHint.textContent = message;
+  els.actionHint.style.color = 'var(--accent)';
+}
+
+async function prepareInspection(route){
+  const machine = state.machine || {};
+  const profiles = machine.profiles || {};
+  const ctrl = machine.ctrl || {};
+  let needsLocalization = (
+    profiles.navigation !== 'run'
+    || machine.mapCurrent !== route.map
+    || !state.pose?.valid
+    || state.pose?.frame !== 'map'
+  );
+
+  if (profiles.mapping === 'run'){
+    const ok = window.confirm(
+      `当前正在建图。开始巡检将停止建图，并切换到任务地图 ${route.map}。确认继续？`,
+    );
+    if (!ok) return false;
+  }
+
+  if (ctrl.on && ctrl.state !== 'Velocity'){
+    showPrepare('正在让机器狗站起并接管运控…');
+    const reply = await send({ op:'stand_up' }, 15000);
+    if (!reply.ok) throw new Error(reply.msg || '机器狗站起失败');
+    await waitForCondition(
+      () => state.machine?.ctrl?.state === 'Velocity',
+      20000,
+      '机器狗站起',
+    );
+  }
+
+  if (profiles.navigation !== 'run'){
+    showPrepare(`正在启动导航并使用地图 ${route.map}…`);
+    const reply = await send({ op:'set_mode', mode:'navigation', map:route.map }, 12000);
+    if (!reply.ok) throw new Error(reply.msg || '启动导航失败');
+  } else if (machine.mapCurrent !== route.map){
+    showPrepare(`正在切换任务地图 ${route.map}…`);
+    const reply = await send({ op:'load_map', name:route.map }, 12000);
+    if (!reply.ok) throw new Error(reply.msg || '切换任务地图失败');
+  }
+
+  showPrepare('正在等待导航和任务地图就绪…');
+  await waitForCondition(
+    () => state.machine?.profiles?.navigation === 'run'
+      && state.machine?.mapCurrent === route.map,
+    120000,
+    '启动导航',
+  );
+
+  if (needsLocalization){
+    showPrepare('正在等待导航自动定位…');
+    const waitLocalized = () => {
+      const auto = state.machine?.autoLoc;
+      return auto?.state === 'ok'
+        && auto?.map === route.map
+        && state.pose?.valid
+        && state.pose?.frame === 'map';
+    };
+    try {
+      await waitForCondition(waitLocalized, 12000, '自动定位');
+    } catch {
+      const auto = state.machine?.autoLoc;
+      if (auto?.state !== 'run'){
+        showPrepare('正在执行自动定位…');
+        const reply = await send({ op:'auto_localize' }, 100000);
+        if (!reply.ok && !/正在进行/.test(reply.msg || '')){
+          throw new Error(reply.msg || '自动定位失败');
+        }
+      }
+      try {
+        await waitForCondition(waitLocalized, 70000, '自动定位');
+      } catch {
+        const failed = state.machine?.autoLoc;
+        if (failed?.state === 'fail'){
+          throw new Error(failed.msg || '自动定位失败');
+        }
+        throw new Error('自动定位超时，请检查机器狗是否站稳且激光地图可匹配');
+      }
+    }
+  }
+
+  showPrepare('导航、地图和定位已就绪，正在下发巡检任务…');
+  return true;
 }
 
 async function startInspection(){
@@ -899,26 +1010,34 @@ async function startInspection(){
     toast(reason, 'warn');
     return;
   }
-  const opts = route.opts || {};
-  els.startBtn.disabled = true;
-  els.startBtn.textContent = '正在下发…';
-  const reply = await send({
-    op:'route_start',
-    route_id:route.id,
-    round_trip:!!opts.loop,
-    loops:Number.isInteger(opts.loops) ? opts.loops : 1,
-    arm:true,
-    ...(Number.isFinite(opts.vmax) ? { vmax:opts.vmax } : {}),
-    ...(Number.isFinite(opts.wmax) ? { wmax:opts.wmax } : {}),
-  });
-  els.startBtn.textContent = '开始巡检';
-  if (reply.ok){
-    toast(reply.msg || '巡检任务已下发');
-    state.selectedRouteId = route.id;
-  } else {
-    toast(reply.msg || '巡检任务下发失败', 'err');
-  }
+  state.preparing = true;
   renderSelectedRoute();
+  try {
+    const ready = await prepareInspection(route);
+    if (!ready) return;
+    const opts = route.opts || {};
+    const reply = await send({
+      op:'route_start',
+      route_id:route.id,
+      round_trip:!!opts.loop,
+      loops:Number.isInteger(opts.loops) ? opts.loops : 1,
+      arm:true,
+      ...(Number.isFinite(opts.vmax) ? { vmax:opts.vmax } : {}),
+      ...(Number.isFinite(opts.wmax) ? { wmax:opts.wmax } : {}),
+    });
+    if (reply.ok){
+      toast(reply.msg || '巡检任务已下发');
+      state.selectedRouteId = route.id;
+    } else {
+      toast(reply.msg || '巡检任务下发失败', 'err');
+    }
+  } catch (error){
+    toast(error?.message || String(error), 'err');
+  } finally {
+    state.preparing = false;
+    renderSelectedRoute();
+    renderHint(route);
+  }
 }
 
 async function stopInspection(){
