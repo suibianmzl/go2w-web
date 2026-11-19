@@ -141,9 +141,12 @@ const state = {
   history: { items: new Map(), before: null, loading: false, hasMore: true },
   playbackId: null,
   lastFixedNodeIndex: null,
-  openNodeIndex: 0,
+  openNodeIndex: null,
+  lastOpenedNodeIndex: null,
   cotVisible: new Map(),
   cotTimer: null,
+  cotSegment: null,
+  cotMoving: false,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
@@ -209,28 +212,48 @@ function stopCotReveal(){
   }
 }
 
-function startCotReveal(index, reset = false){
+function scheduleMovementCot(index){
   const node = INSPECTION_NODES[index];
-  if (!node) return;
-  stopCotReveal();
-  state.openNodeIndex = index;
-  const total = node.cot.length;
-  if (reset) state.cotVisible.set(index, 0);
-  const step = () => {
-    const shown = Math.min(total, (state.cotVisible.get(index) || 0) + 1);
-    state.cotVisible.set(index, shown);
+  if (!node || !state.cotMoving || state.cotTimer || state.openNodeIndex !== index) return;
+  const shown = state.cotVisible.get(index) || 0;
+  if (shown >= node.cot.length) return;
+  state.cotTimer = setTimeout(() => {
+    state.cotTimer = null;
+    if (!state.cotMoving) return;
+    state.cotVisible.set(index, Math.min(node.cot.length, shown + 1));
     renderTask();
-    if (shown < total && state.openNodeIndex === index){
-      state.cotTimer = setTimeout(step, 900);
-    } else {
-      state.cotTimer = null;
-    }
-  };
-  if ((state.cotVisible.get(index) || 0) < total){
-    state.cotTimer = setTimeout(step, reset ? 250 : 0);
-  } else {
-    renderTask();
+  }, shown === 0 ? 250 : 900);
+}
+
+function syncMovementCot(task, related, currentIndex){
+  const pose = state.pose;
+  const moving = !!(
+    related
+    && task.status === 'active'
+    && task.phase === 'follow'
+    && pose?.valid
+    && (Math.abs(Number(pose.v) || 0) > 0.03 || Math.abs(Number(pose.w) || 0) > 0.05)
+  );
+  state.cotMoving = moving;
+  if (!moving){
+    stopCotReveal();
+    return;
   }
+  const cotIndex = task.back
+    ? INSPECTION_NODES.length - 1
+    : Math.max(0, Math.min(INSPECTION_NODES.length - 2, currentIndex - 1));
+  const segment = [
+    task.routeId || '',
+    task.loop || 1,
+    task.back ? 'back' : 'forward',
+    cotIndex,
+  ].join(':');
+  if (segment !== state.cotSegment){
+    state.cotSegment = segment;
+    state.openNodeIndex = cotIndex;
+    state.cotVisible.set(cotIndex, 0);
+  }
+  scheduleMovementCot(cotIndex);
 }
 
 function formatIncidentTime(value){
@@ -356,22 +379,12 @@ function renderTask(){
   els.currentPoint.textContent = currentNode
     ? `${currentIndex + 1}/${INSPECTION_NODES.length} · ${currentNode.name}`
     : '--';
+  syncMovementCot(task, related, currentIndex);
   renderSteps(task, related, currentIndex);
   renderHint(selectedRoute());
 }
 
 function renderSteps(task, related, currentIndex){
-  if (currentIndex >= 0 && currentIndex !== state.lastFixedNodeIndex){
-    state.openNodeIndex = currentIndex;
-    state.cotVisible.set(currentIndex, 0);
-  }
-  if (related && task.status === 'succeeded'){
-    INSPECTION_NODES.forEach((node, index) => state.cotVisible.set(index, node.cot.length));
-  } else if (currentIndex > 0){
-    for (let index = 0; index < currentIndex; index += 1){
-      state.cotVisible.set(index, INSPECTION_NODES[index].cot.length);
-    }
-  }
   els.steps.innerHTML = INSPECTION_NODES.map((node, index) => {
     let stepState = 'pending';
     let label = '待执行';
@@ -423,17 +436,13 @@ function renderSteps(task, related, currentIndex){
       </div>
     </li>`;
   }).join('');
-  if (currentIndex !== state.lastFixedNodeIndex){
-    state.lastFixedNodeIndex = currentIndex;
-    if (currentIndex >= 0){
-      requestAnimationFrame(() => {
-        els.steps.querySelector(`[data-open-node="${currentIndex}"]`)
-          ?.scrollIntoView({ block:'center', behavior:'smooth' });
-        if (!(related && task.status === 'succeeded')){
-          startCotReveal(currentIndex, true);
-        }
-      });
-    }
+  state.lastFixedNodeIndex = currentIndex;
+  if (state.openNodeIndex !== null && state.openNodeIndex !== state.lastOpenedNodeIndex){
+    state.lastOpenedNodeIndex = state.openNodeIndex;
+    requestAnimationFrame(() => {
+      els.steps.querySelector(`[data-open-node="${state.openNodeIndex}"]`)
+        ?.scrollIntoView({ block:'center', behavior:'smooth' });
+    });
   }
 }
 
@@ -1237,7 +1246,9 @@ els.steps.addEventListener('click', event => {
       state.openNodeIndex = null;
       renderTask();
     } else {
-      startCotReveal(index, (state.cotVisible.get(index) || 0) === 0);
+      state.openNodeIndex = index;
+      renderTask();
+      if (state.cotMoving) scheduleMovementCot(index);
     }
     return;
   }
@@ -1313,4 +1324,3 @@ resizeCanvas();
 init().catch(error => {
   toast(`巡检页面初始化失败：${error?.message || error}`, 'err');
 });
-startCotReveal(0, true);
