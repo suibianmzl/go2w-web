@@ -87,6 +87,7 @@ import mapedit as ME
 import mapfile
 import procs as P
 import robot_ctrl as R
+import rtab as RT
 from teaching import TeachingError
 from teaching_bridge import TaughtMeasurements, TaughtWeb
 
@@ -1318,7 +1319,7 @@ class Bridge(TaughtMeasurements, Node):
         return profiles
 
 
-class Server(TaughtWeb):
+class Server(TaughtWeb, RT.RtabWeb):
     def __init__(self, node, static_dir, heartbeat):
         self.node, self.static_dir, self.heartbeat = node, static_dir, heartbeat
         # 版本号（11-18）：static/version.json，跟着 release 走；推给网页，和页面自己加载的版本比，不一样就提示刷新
@@ -1344,6 +1345,8 @@ class Server(TaughtWeb):
             self.procs = FakeProcs(node)
         else:
             self.procs = P.RuntimeProcs()
+        # RTAB-Map 影子库（rtab.py）：建图时顺带录，局部重扫用
+        self.init_rtab(DATA, self.procs.tools_dir if not self.simulated else DATA, self.simulated)
         self.procs_status = None      # 最近一次 supervisor 检查结果；None = 暂不可用
         self.transitions = {}         # 网页发起、还没完成的启停：档位 → 'starting' / 'stopping'
         self.starting = {}            # 档位 → 开始启动的时间（启动超时 / 失败检测）
@@ -1718,12 +1721,27 @@ class Server(TaughtWeb):
                     await self.send_all(self.routes_message(), key='routes')
                     await self.send_all(self.views_message(), key='views')
                 return result
+            if op == 'rtab_start':
+                return await self.rtab_start_map(self.remote(ws))
+            if op == 'rtab_continue':
+                res = await self.rtab_continue(d.get('map'), self.remote(ws), force=bool(d.get('force')))
+                if not res[0]:
+                    n.event('WARN', f'局部重扫没开始：{res[1]}（{self.remote(ws)}）')
+                return res
+            if op in ('rtab_pause', 'rtab_resume'):
+                return await self.rtab_call(op[5:], self.remote(ws))
+            if op == 'rtab_stop':
+                return await self.rtab_stop(f'网页停止（{self.remote(ws)}）')
+            if op == 'rtab_auto':
+                return self.rtab_set_auto(bool(d.get('on')), self.remote(ws))
             if op == 'cont_preflight':
                 return self.cont_preflight(d.get('base'))
             if op == 'cont_start':
                 # 成功时 cont_start 自己记日志；失败也要记——网页提示只停 2.6 s，事后只能靠日志查
                 res = await self.cont_start(d.get('base'), d.get('name'), d.get('pose'),
                                             d.get('source'), d.get('reason'))
+                if res[0]:
+                    self.background(self.rtab_on_cont_start())
                 if not res[0]:
                     n.event('WARN', f'续建没开始：{res[1]}（{self.remote(ws)}）')
                 return res
@@ -1919,6 +1937,7 @@ class Server(TaughtWeb):
         if self.cont:
             self.cont['ready'] = False
             self.cont['check'] = {'ok': False, 'code': 'frozen', 'reason': f'建图冻结：{reason}'}
+        self.background(self.rtab_on_freeze(reason))
         kept = (f"最近一份好的自动保存 data/maps/{f['kept']}（{time.strftime('%H:%M:%S', time.localtime(f['kept_wall']))}）"
                 f"不会再被覆盖" if f['kept'] else '还没有自动保存过')
         n.event('ERROR', f'建图已冻结：{reason}。' +
@@ -1946,6 +1965,7 @@ class Server(TaughtWeb):
             await self.gate_set(-1)
         self.map_frozen = None
         self.node.event('WARN', f"继续建图（{who}）：解除冻结（原因：{f['reason']}），自动保存恢复")
+        await self.rtab_on_resume(who)
         return True, '已继续建图，自动保存恢复'
 
     # ---------- 运控策略切换：只在趴着时，停掉 control 组换策略名重启 ----------
@@ -3005,6 +3025,10 @@ class Server(TaughtWeb):
                 # 「停止全部」不走下面的 if mode 分支，所以重置要放在停档位这一侧：
                 # 建图一停，续建的起点位姿和自检结果都不再成立
                 await self.incident_flush('停止' + '、'.join(self.MODE_NAME[m] for m in cur) if cur else '停止巡逻')
+                # RTAB 库靠这些档位的 /scan 和 TF：先停下存好库。它只是影子库，存不完也照常切档位（rtab_tick 会等它退出后收尾）
+                rtab_ok, rtab_msg = await self.rtab_before_mode_stop()
+                if not rtab_ok:
+                    n.event('ERROR', f'RTAB 库没有正常停下（{rtab_msg}），照常切换档位；这一轮 RTAB 库可能不完整')
                 if 'mapping' in cur:
                     # 停掉之前先存一份：地图只在 slam_toolbox 内存里，一停就没了（11-16 就这样丢过图）
                     t_wait = time.monotonic()
@@ -3048,6 +3072,7 @@ class Server(TaughtWeb):
                 if mode == 'mapping':
                     self.autosave_new_session()
                     self.cont_blocked = False
+                    self.rtab_on_mapping_start()
                 # 新版网页启动导航时始终启用示教代理：无参考时仍走原规划；有参考自动读取地图YAML。
                 await self.procs.start_mode(mode, map_name, taught_route=(mode == 'navigation' and self.taught_repo.available) or taught_route)
                 await asyncio.sleep(0.3)
@@ -3626,6 +3651,7 @@ class Server(TaughtWeb):
                             f"（{a['dur']:.1f} s；建图期间每 {self.autosave_period():.0f} s 覆盖这一份）")
         if first:
             self.autosave_prune()
+        self.rtab_link(name)
         self.maps = P.list_maps(maps_dir)
         return True, f'已自动保存 {name}'
 
@@ -3712,6 +3738,7 @@ class Server(TaughtWeb):
         if await self.procs.save_map(name):
             self.maps = P.list_maps(os.path.join(DATA, 'maps'))
             self.node.event('INFO', f'地图已保存：data/maps/{name}')
+            self.rtab_link(name)
             if MAPPING_VIEW in self.map_views:   # 建图时调好的显示方向带给新地图
                 await self.set_view(name, self.map_views[MAPPING_VIEW])
             return True, f'地图已保存：{name}'
@@ -4854,6 +4881,7 @@ class Server(TaughtWeb):
                     self.ctrl_watch()
                 if k % 10 == 0:
                     self.lidar_watch()
+                    self.rtab_tick()
                 # 急停期间底盘被其他客户端解锁 → 再次上锁。
                 # 只认急停 1 s 之后收到的「已解锁」，避免把上锁之前的旧状态当成又被解锁
                 if self.estop and n.is_armed() and n.armed_t > self.estop_t + 1.0 and k % 5 == 0:
@@ -4911,7 +4939,7 @@ class Server(TaughtWeb):
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
                               cont=self.cont_state(), contBusy=self.cont_busy,
                               contPaused=self.cont_blocked and self.prof('mapping') == 'run',
-                              autosave=self.autosave_view(), lidar=self.lidar_view(), webVersion=self.version)
+                              autosave=self.autosave_view(), lidar=self.lidar_view(), rtab=self.rtab_view(), webVersion=self.version)
                     st.update(taughtAvailable=self.taught_repo.available,
                               taughtNavigation='taught_route' in n.get_node_names())
                     await self.send_all(json.dumps(st), key='state')

@@ -9,6 +9,7 @@ const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, 
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
   'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
+  'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
   'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
@@ -148,6 +149,7 @@ export function createRosSource(store, bus){
         store.contBusy = !!m.contBusy;
         store.autosave = m.autosave || null;
         store.lidar = m.lidar || null;   // 后端判定的雷达无数据：{ since, msg（含网络诊断） }
+        store.rtab = m.rtab || null;     // RTAB 影子库：{ avail, auto, cur, last, pending, map, mapDb }
         store.webVersion = m.webVersion || null;
         store.taughtAvailable = typeof m.taughtAvailable === 'boolean' ? m.taughtAvailable : null;
         store.taughtNavigation = typeof m.taughtNavigation === 'boolean' ? m.taughtNavigation : null;
@@ -262,6 +264,13 @@ export function createRosSource(store, bus){
     contFinish: reason => send('cont_finish', { reason }, 45000),
     contAbort: () => send('cont_abort', {}),
     contParking: (base, clear) => send('cont_parking', clear ? { base, clear: true } : { base }),
+    // RTAB 影子库：建图同步录 / 局部重扫（停止要等 rtabmap 存完库，最多 120 s）
+    rtabStart: () => send('rtab_start', {}, 15000),
+    rtabContinue: (map, force) => send('rtab_continue', { map, ...(force ? { force: true } : {}) }, 30000),
+    rtabPause: () => send('rtab_pause', {}, 35000),
+    rtabResume: () => send('rtab_resume', {}, 35000),
+    rtabStop: () => send('rtab_stop', {}, 130000),
+    rtabAuto: on => send('rtab_auto', { on }),
     // 键盘遥控：按住时每 0.1 s 发一次（后端 0.3 s 收不到就发零速）；松手立即发零
     teleop: k => {
       teleCmd = k;

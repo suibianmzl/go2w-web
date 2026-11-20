@@ -705,3 +705,9 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 #taughtMessage{margin-top:10px;overflow-wrap:anywhere;color:var(--fg-2)}
 #taughtState{font-size:10px}
 @media(max-width:420px){#taskTabs{grid-template-columns:repeat(2,minmax(0,1fr))}#taskTabs button{min-height:44px}}
+
+/* RTAB 影子库卡片（rtab.js） */
+#rtabNote{white-space:pre-line}
+#rtabBtns{flex-wrap:wrap;margin-bottom:2px}
+#rtabBtns[hidden]{display:none}
+#rtabCard .map-chk{margin-top:6px}
