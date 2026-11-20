@@ -403,6 +403,7 @@ def roll_pitch(q):
 
 
 MATCH_TOL = 0.10  # m：scan 点离地图障碍物这么近就算「对上了」
+MATCH_HOLD_S = 0.6  # s：设完初始位姿后这么久内的 scan 不算匹配率（AMCL 处理 /initialpose、更新 map→odom 需要时间）
 
 
 class Rate:
@@ -547,6 +548,7 @@ class Bridge(TaughtMeasurements, Node):
         self.map_loaded = None   # 网页「切换地图」最近加载的地图名（map_server 重启后作废）
         self.amcl = None         # (位置 σ m, 航向 σ °, 收到时间)
         self.match = None        # scan / map 匹配率 %，平滑过
+        self.match_hold = 0.0    # monotonic：刚设完初始位姿，到这之前的 scan 不算匹配率（AMCL 还没用上新位姿）
         self.scan_blob, self.scan_ver = None, 0
         self.map_raw = None      # 自动定位用：(OccupancyGrid 原始 int8 栅格 h×w, res, ox, oy)
         self.map_crc = None      # 最新 /map 内容的 crc32（自动保存判断有没有变化）
@@ -698,7 +700,7 @@ class Bridge(TaughtMeasurements, Node):
         self.scan_blob = pack(T_SCAN, {'n': int(r.size), 'frame': self.fixed}, xy.tobytes())
         self.scan_ver += 1
         # 匹配率：只在 map 坐标系下有意义（退回 odom 时地图和 scan 本来就不对齐）
-        if self.fixed == 'map' and self.near_occ is not None and r.size >= 20:
+        if self.fixed == 'map' and self.near_occ is not None and r.size >= 20 and time.monotonic() >= self.match_hold:
             res, ox, oy, w, h = self.map_info
             gx = np.floor((xy[:, 0] - ox) / res).astype(int)
             gy = np.floor((xy[:, 1] - oy) / res).astype(int)
@@ -1102,6 +1104,10 @@ class Bridge(TaughtMeasurements, Node):
         m = PoseWithCovarianceStamped()
         m.header.frame_id = 'map'
         m.header.stamp = self.get_clock().now().to_msg()
+        # 匹配率从头算：旧值是按旧位姿平滑出来的（比如导航刚起来时 AMCL 默认位姿下的 7%），
+        # 留着会让「自动定位成功」后立刻出发时误报「匹配率低」。等 AMCL 用上新位姿再算。
+        self.match = None
+        self.match_hold = time.monotonic() + MATCH_HOLD_S
         # 后续示教仅接受本次修正之后的测量，延迟送达的旧scan/odom不能刷新定位自检。
         with self._taught_lock:
             self._taught_pose_stamp = secs(m.header.stamp)

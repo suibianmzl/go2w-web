@@ -38,6 +38,7 @@ FAKE_ODOM_WILD = os.environ.get('GO2W_FAKE_ODOM_WILD', '/tmp/go2w_fake_odom_wild
 FAKE_MAP_GROW = os.environ.get('GO2W_FAKE_MAP_GROW') == '1'
 # GO2W_FAKE_SERIALIZE_FAIL=1：serialize_map 返回写文件失败
 FAKE_SERIALIZE_FAIL = os.environ.get('GO2W_FAKE_SERIALIZE_FAIL') == '1'
+import threading
 import time
 import uuid
 from types import SimpleNamespace as N
@@ -543,7 +544,15 @@ class Sim:
     def on_publish(self, topic, msg):
         if topic == '/initialpose' and self.loc_ready():
             p = msg.pose.pose
-            self.later(lambda: self.teleport(p.position.x, p.position.y, 2*math.atan2(p.orientation.z, p.orientation.w)))
+            bx, by, bth = p.position.x, p.position.y, 2*math.atan2(p.orientation.z, p.orientation.w)
+            if os.environ.get('GO2W_FAKE_AMCL_ERR') == '1':
+                # 像真 AMCL：机器人不动，只把「以为的位置」改成给的位姿（map→odom 偏移），约 0.3 s 后生效
+                def set_belief():
+                    a = wrap(bth - self.th); ca, sa = math.cos(a), math.sin(a)
+                    self.loc_err = (bx - (ca*self.x - sa*self.y), by - (sa*self.x + ca*self.y), a)
+                threading.Timer(0.3, lambda: self.later(set_belief)).start()
+            else:
+                self.later(lambda: self.teleport(bx, by, bth))
         elif topic == '/patrol_pose' and self.pat and len(self.pat['points']) < 2:
             p = msg.pose
             yaw = 2 * math.atan2(p.orientation.z, p.orientation.w)
@@ -561,7 +570,11 @@ class Sim:
         """TF 里 map → base_footprint：续建时套上 slam 坐标系的偏移（起点给对时偏移为零）。"""
         f = getattr(self, 'slam_frame', None)
         if not f or not self.procs.get('mapping'):
-            return self.x, self.y, self.th
+            e = getattr(self, 'loc_err', None)   # GO2W_FAKE_AMCL_ERR：定位偏移（导航 / 定位档）
+            if e and not self.procs.get('mapping'):
+                f = e
+            else:
+                return self.x, self.y, self.th
         tx, ty, a = f
         ca, sa = math.cos(a), math.sin(a)
         return ca*self.x - sa*self.y + tx, sa*self.x + ca*self.y + ty, wrap(self.th + a)

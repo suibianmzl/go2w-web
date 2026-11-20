@@ -33,7 +33,7 @@ const taught = setupTaught(store, src, setTool);
 flow = setupFlow(store, src, actions, setTool, reloc, taught, mapView);
 const rtab = setupRtab(store, src);   // RTAB 影子库卡片
 const replay = early.splice(0); bus.h.log.shift(); replay.forEach(a => bus.emit('log', ...a));
-bus.on('map', () => mapView.fit());
+bus.on('map', () => mapView.onMap());
 setupCamera(src, bus);
 const alerts = setupAlerts(store, bus);                     // 服务异常：横幅 + 提示 + 日志
 const runState = setupRunState(store, actions, mapView);   // 地图右上角的运行状态牌

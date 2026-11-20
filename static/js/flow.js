@@ -148,6 +148,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   // prep.step：stand / nav / loc / go；store.prep 给地图右上角的状态牌看
   const prep = { on: false };
   const STEP_NAME = { stand: '站立', nav: '启动导航', loc: '定位', go: '下发任务' };
+  const MATCH_WAIT = 4000;   // ms：出发前等新匹配率的上限
   function resetPrep(){ for (const k of Object.keys(prep)) delete prep[k]; prep.on = false; }
   store.prep = () => prep.on ? { on: true, step: prep.step, name: STEP_NAME[prep.step] || '', fail: prep.fail, route: prep.routeName } : null;
   // 出发流程进行中每 2 s 告诉后端，别把这段时间当空闲自动趴下
@@ -166,7 +167,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     const begin = () => {
       resetPrep();
       Object.assign(prep, { on: true, fail: null, step: 'stand', route: route.id, routeName: route.name, map: route.map, t0: Date.now(),
-        seq0: store.autoLoc?.seq ?? -1, standT: 0, standOk: false, holdT: 0, navT: 0, runT: 0, loadT: 0, autoT: 0, goT: 0 });
+        seq0: store.autoLoc?.seq ?? -1, standT: 0, standOk: false, holdT: 0, navT: 0, runT: 0, loadT: 0, autoT: 0, matchT: 0, goT: 0 });
       render();
     };
     if (up('navigation')) return begin();
@@ -253,6 +254,11 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     prep.step = 'go';
     if (prep.goT) return;
     if (!store.odomOk || !store.robot.valid || store.fixed !== 'map') return;   // 等里程计和 map 坐标系
+    // 刚定好位时后端的匹配率要重新算（约 1 s 才有新值）：等到 ≥ 60% 再出发，最多等 MATCH_WAIT，
+    // 不然 startRoute 会拿定位前的旧值（比如 7%）误报「定位可能不准」。
+    const mNow = store.loc.match;
+    if (!prep.matchT) prep.matchT = now;
+    if (!(mNow != null && mNow >= 60) && now - prep.matchT < MATCH_WAIT) return;
     prep.goT = now;
     const t0 = prep.t0, o = route.opts || {};
     Promise.resolve(actions.startRoute(route, { roundTrip: !!o.loop, loops: o.loops ?? 1, vmax: o.vmax, wmax: o.wmax })).then(r => {
@@ -281,7 +287,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       loc: store.initPose && navHere ? `(${R.x.toFixed(2)}, ${R.y.toFixed(2)}) · ${Math.round(deg(R.th)) || 0}°${m != null ? ` · 匹配率 ${m.toFixed(0)}%` : ''}`
         : store.autoLoc?.state === 'move' ? store.autoLoc.msg || '移动后重试…'
         : store.autoLoc?.state === 'run' ? '定位中…（机器人保持静止）' : '等待自动定位…',
-      go: prep.goT ? '解锁底盘，下发任务…' : '定位好后自动出发',
+      go: prep.goT ? '解锁底盘，下发任务…' : prep.matchT ? '等定位匹配率更新…' : '定位好后自动出发',
     };
     for (const li of $$('#prepList li')){
       const k = li.dataset.k;

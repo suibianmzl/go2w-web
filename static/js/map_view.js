@@ -14,7 +14,7 @@ export function createMapView(store, actions){
   const alignment = () => store.alignment;
   // 地图显示方向：每张地图一个角度，存在后端（store.mapViews）。建图时还没有地图名，用 MAPPING_VIEW 暂存
   const MAPPING_VIEW = '_mapping', SNAP = 3 * Math.PI / 180, QUARTER = Math.PI / 2;
-  let viewKey = null, savedAngle = null;
+  let viewKey = null, savedAngle = null, fitKey = null;   // fitKey：上次按哪张图复位过视角（连接断开等短暂 null 不算换图）
   const currentKey = () => store.mapCurrent || (actions.curMode() === 'mapping' ? MAPPING_VIEW : null);
   const wrapPi = a => Math.atan2(Math.sin(a), Math.cos(a));
   const flash = () => { alignment().flashUntil = performance.now() + 2500; };
@@ -99,7 +99,8 @@ export function createMapView(store, actions){
       if (key === null) return;           // 暂时不知道是哪张图（连接断开、档位切换中）：保持当前方向
       clearWall();
       alignment().angle = saved; syncCompass();
-      fit();
+      // 真换了图才复位视角（之前的缩放 / 平移作废，新图来了照样自动适配）；断线重连回到同一张图保持用户的缩放
+      if (key !== fitKey || !touched){ fitKey = key; touched = false; fit(); }
     } else if (key !== null && saved !== savedAngle){
       savedAngle = saved;
       if (V.drag?.tool !== 'rot'){ alignment().angle = saved; flash(); syncCompass(); }
@@ -500,5 +501,8 @@ export function createMapView(store, actions){
     if (!editor.close(() => { setTool('pan'); next(); })) return false;
     setTool('pan'); return true;
   }
-  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
+  // 收到新的 /map：用户没动过视角才自动适配。建图时 slam_toolbox 每 ~2 s 发一次，
+  // 以前无条件 fit()，放大了几秒就被拉回全图
+  function onMap(){ if (!touched) fit(); }
+  return { draw, fit, onMap, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
 }
