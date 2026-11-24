@@ -209,7 +209,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 起因：1–2 m 一站、拐角 22–46° 的小圈，原来每站一个 NavigateToPose，几乎每站都减速 → 原地转 → 再起步（DDS 黑匣子实测每站约 2.5 s，一圈多 18 s）。
 
 - **连续通过**（任务运行参数 `opts.through`，默认开）：以设了停留的站为界把路线切成几段，每段一个 **NavigateThroughPoses**，Nav2 一次规划经过这段所有站的连续路径，中间站不减速不停车；停留站和终点照常停稳、对准站点朝向。离站 0.5 m 以内（`ROUTE_THROUGH_PASS`）或 Nav2 已经划掉就算经过，进度、日志「经过第 N 站」、断点照旧。一段最多 30 站（`ROUTE_SEG_MAX`）。日志记每段「多点规划用时」。
-- 行为树用本仓库的 `server/bt/navigate_through_go2w.xml`，下发时放进 `goal.behavior_tree`（网页包在容器里路径不变，bt_navigator 直接读，不用改导航镜像）：恢复动作同 `navigate_go2w.xml`（倒车 0.6 m / 0.15 m/s，默认树 0.05 m/s 的倒车 Go2W 不执行）；`RemovePassedGoals` 单独放在最前面每轮都跑（默认树里它跟着 0.333 Hz 的重新规划，可能刚好没判到经过的站，下一次规划就掉头回去找）。
+- 行为树用本仓库的 `server/bt/navigate_through_go2w.xml`，下发时放进 `goal.behavior_tree`（网页包在容器里路径不变，bt_navigator 直接读，不用改导航镜像）：恢复动作同 `navigate_go2w.xml`（倒车 0.6 m / 0.15 m/s，默认树 0.05 m/s 的倒车 Go2W 不执行）；`RemovePassedGoals` 单独放在最前面每轮都跑（默认树里它跟着 0.333 Hz 的重新规划，可能刚好没判到经过的站，下一次规划就掉头回去找）。v1.1.12 起途中 10 秒才重新规划一次（`RateController hz="0.1"`，原来 1 Hz）：一段是一次规划好的，每秒重算时人走过后全局代价地图里的拖尾会让路径来回摆、看着像追人；出发和每次恢复后都会先立刻规划，途中新障碍由 MPPI 局部绕。清全局代价地图节点 `server_timeout` 1000 ms（默认 20 ms 清不完，每次都判失败）。
 - 导航没有 `navigate_through_poses` 服务、行为树文件不在、或者多点目标一开始就失败（< 5 s 没有任何反馈，多半是行为树没加载上）→ 这次自动退回一站一站走，日志说明。运行参数里关掉「连续通过」也是一站一站走。
 - **站点停留**：每站可以填停留秒数（1–3600，`points[].dwell`，0 不存）。到站停稳、转到站点朝向后原地等够再走，任务卡片「停留中 · 还剩 N s」（`task.phase = dwell`、`dwellLeft`）。停留中取消，断点记在这一站，继续时回来重新停够。地图上停留站画成**橙色**并标「停 N s」，直接经过的站黄色，终点绿色。
 - 一站一站走时：拐角 ≤ 60°（`ROUTE_PASS_TURN`，原来 29°）的站不停车，提前切到下一站；配合导航参数 `angular_dist_threshold` 0.9（导航镜像 PR，没发版前狗上 `sudo bash ~/nav_tune/shim_turn.sh 0.9`），否则 RotationShim 还是会原地转。

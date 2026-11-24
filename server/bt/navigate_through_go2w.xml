@@ -7,7 +7,9 @@
     RemovePassedGoals 单独放在 PipelineSequence 第一个，每轮 BT 都跑（默认树里它在 0.333 Hz 的 RateController 里，
     狗 0.45 m/s 两次判断之间走 1.35 m，可能穿过途经点时恰好没判到，下一次重新规划就掉头回去找那个点）
     半径 0.5 m（网页按同样的半径判断经过了第几站）
-    重新规划 1 Hz（和 navigate_go2w.xml 一样；默认 0.333 Hz）
+    重新规划 0.1 Hz（11-24 由 1 Hz 改：连续通过是一次规划整段，不需要每秒重算；每秒重算时全局代价地图里人走过的拖尾
+    会让路径来回摆、看着像追人。开始和每次恢复后重试都会立刻先规划一次；途中新出现的障碍靠 MPPI 局部绕，最长 10 s 才改全局路线）
+    清全局代价地图节点 server_timeout 1000 ms（11-24：默认 20 ms，清整张全局代价地图远超 20 ms，BT 每次都判失败）
   注释里不能出现两个连续的减号
 -->
 <root main_tree_to_execute="MainTree">
@@ -15,10 +17,10 @@
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.5" global_frame="map" robot_base_frame="base_footprint"/>
-        <RateController hz="1.0">
+        <RateController hz="0.1">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
             <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
-            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0"/>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0" server_timeout="1000"/>
           </RecoveryNode>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
@@ -31,7 +33,7 @@
         <RoundRobin name="RecoveryActions">
           <Sequence name="ClearingActions">
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0"/>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0" server_timeout="1000"/>
           </Sequence>
           <BackUp backup_dist="0.6" backup_speed="0.15"/>
           <Spin spin_dist="1.57"/>
