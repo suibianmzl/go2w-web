@@ -55,14 +55,17 @@ class Ring:
         """缓存里实际覆盖了多少秒。"""
         return (self.items[-1][0] - self.items[0][0]) / 1e9 if len(self.items) > 1 else 0.0
 
-    def snapshot(self, seconds=None):
-        """按时间排序的 [(t, topic, data)]；缓存为空时返回空列表。seconds 给出时只取最近这么多秒。"""
+    def snapshot(self, seconds=None, end_ns=None):
+        """固定结束时刻的快照；省略 end_ns 时保持原来的最近窗口。"""
         if not self.items:
             return []
-        items = list(self.items)
+        end = self.items[-1][0] if end_ns is None else end_ns
+        items = [x for x in self.items if x[0] <= end]
         if seconds is not None:
-            cut = items[-1][0] - int(seconds * 1e9)
+            cut = end - int(seconds * 1e9)
             items = [x for x in items if x[0] >= cut]
+        if not items:
+            return []
         start = items[0][0]
         head = [(start, topic, data) for topic, kept in self.latched.items() for t, data in kept if t < start]
         return head + items
@@ -216,8 +219,10 @@ def main():
         name = parts[0] if parts else ''
         try:
             seconds = float(parts[1]) if len(parts) > 1 else None
+            end_ns = int(parts[2]) if len(parts) > 2 else None
         except ValueError:
             seconds = None
+            end_ns = None
         if not SAFE_NAME.fullmatch(name):
             node.get_logger().error(f'包名不对：{name!r}')
             return
@@ -226,7 +231,7 @@ def main():
         saving.set()
         # snapshot 在收消息的线程里做，不用加锁；写文件放到别的线程，缓存继续收
         saving_thread = threading.Thread(target=worker,
-            args=(name, ring.snapshot(seconds), dict(types)))
+            args=(name, ring.snapshot(seconds, end_ns), dict(types)))
         saving_thread.start()
 
     last_capped = [0]

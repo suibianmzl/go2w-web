@@ -2,11 +2,13 @@
 // 数据源的指令可以返回 { ok, msg }（或它的 Promise）：ROS 源以后端的回复为准，模拟源不返回就算成功
 import { toast, confirmBox, formBox } from './ui.js';
 import { deg, isAutosave, mapTitle } from './util.js';
+import { createRollbackCapture } from './recording-capture.js';
 
 export const MODES = { mapping: '建图', localization: '定位', navigation: '导航' };
 export const MODE_PKG = { mapping: 'slam_toolbox', localization: 'map_server · AMCL', navigation: 'AMCL · Nav2 · cmd_bridge' };
 
 export function createActions(store, src){
+  const rollbackCapture = createRollbackCapture(store, src, toast);
   const run = id => store.profiles[id] === 'run';
   const curMode = () => Object.keys(MODES).find(m => store.profiles[m] !== 'stop') || null;
   const canMove = () => store.armed && !store.estop && run('navigation') && store.odomOk && store.link.ok;
@@ -47,6 +49,7 @@ export function createActions(store, src){
   });
 
   const A = {
+    rollbackCapture,
     canMove, canTeleop, curMode, routeStartBlocker, routeGoBlocker, walking,
     // 站起：趴着 → 站稳 → 策略接管（后端一步步等运控的状态）
     standUp(){
@@ -451,7 +454,7 @@ export function createActions(store, src){
     },
     saveRollback(){
       if (!ready('saveRollback')) return;
-      exec(src.cmd.saveRollback(), null);
+      return rollbackCapture.save();
     },
     uploadBag(bag){
       if (!ready('uploadBag')) return;

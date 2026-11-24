@@ -1,0 +1,43 @@
+.voice-controls{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;margin-top:10px;color:var(--fg-2);font-size:13px}
+.voice-controls label{display:flex;align-items:center;gap:8px;color:var(--fg)}
+.voice-controls input{width:64px;min-height:44px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel-2);color:var(--fg);font:inherit;text-align:center}
+.voice-controls a,.voice-recovery a{color:var(--accent)}
+.voice-status{font-size:13px;line-height:1.5;color:var(--fg-2);margin:8px 0;overflow-wrap:anywhere}
+.voice-status:empty{display:none}
+.voice-status[data-kind=err],.voice-status[data-kind=warn]{color:var(--warn)}
+.voice-recovery{display:flex;justify-content:inherit;align-items:center;flex-wrap:wrap;gap:8px}
+.voice-recovery button,.voice-recovery a{min-height:44px;display:inline-flex;align-items:center;padding:8px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel-2);font:inherit}
+.record-page{height:auto;min-height:100dvh;overflow:auto;background:var(--bg);font-size:16px}
+.record-page a{color:var(--fg-2);text-decoration:none;min-height:44px;display:inline-flex;align-items:center}
+.record-page a:hover{color:var(--accent)}
+.record-page :focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+.recorder{max-width:680px;margin:0 auto;padding:calc(16px + env(safe-area-inset-top)) 20px calc(350px + env(safe-area-inset-bottom))}
+.recorder-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}
+.recorder-header>div{display:flex;align-items:center;gap:14px}
+.recorder-brand{font-family:var(--f-display);font-size:20px;font-weight:700;color:var(--accent)}
+.recorder-header h1{font-size:20px;font-weight:600;margin:0}
+.recorder-header a{font-size:14px}
+.recorder-context{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:12px 0 20px;border-bottom:1px solid var(--line-2);color:var(--fg-2);font-size:14px}
+#recordConnection[data-ready=true]{color:var(--ok)}
+.record-results-heading{display:flex;align-items:center;justify-content:space-between;margin-top:24px}
+.record-results-heading h2{font-size:15px;margin:0;font-weight:500}
+#recordCount{font:13px var(--f-mono);color:var(--fg-2)}
+.record-results{display:grid;gap:12px;margin-top:16px}
+.record-result{padding:16px;border:1px solid var(--line-2);border-radius:12px;background:var(--panel)}
+.record-result h3{font:500 14px/1.6 var(--f-mono);overflow-wrap:anywhere;margin:0 0 8px}
+.record-result p{font-size:13px;color:var(--fg-2);line-height:1.6;margin:4px 0}
+.record-result audio{display:block;width:100%;max-width:100%;height:44px;margin-top:12px}
+.record-empty{font-size:14px;line-height:1.8;color:var(--fg-2);padding:32px 0}
+.record-dock{position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;flex-direction:column;padding:12px 20px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line-2);background:var(--bg);z-index:10;text-align:center}
+.record-dock .voice-controls{margin:0;justify-content:center;font-size:14px}
+.record-dock .voice-status{max-width:600px;margin:8px 0;font-size:13px}
+.record-dock .voice-recovery{justify-content:center;font-size:13px}
+.record-shutter{width:88px;height:88px;flex:none;border:3px solid var(--fg);border-radius:50%;background:transparent;display:grid;place-items:center;margin:14px 0 8px;padding:5px;touch-action:manipulation;transition:opacity .15s,transform .15s}
+.record-shutter span{display:block;width:100%;height:100%;border-radius:50%;background:var(--crit);transition:border-radius .15s,transform .15s}
+.record-shutter:active:not(:disabled){transform:scale(.94)}
+.record-shutter:disabled{opacity:.4;cursor:default}
+.record-shutter[data-busy=true]{opacity:.75}
+.record-shutter[data-busy=true] span{border-radius:12px;transform:scale(.55)}
+.record-hint{font-size:13px;line-height:1.5;color:var(--fg-2);margin:0;max-width:540px}
+@media(max-height:500px) and (orientation:landscape){.record-shutter{width:64px;height:64px;margin:8px 0 4px}.record-dock{padding-top:8px}.recorder{padding-bottom:310px}.record-dock .voice-controls input{min-height:44px}.recorder-header{margin-bottom:8px}}
+@media(prefers-reduced-motion:reduce){.record-shutter,.record-shutter span{transition:none}}

@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import struct
 import sys
 import tempfile
@@ -67,6 +68,7 @@ from rosidl_runtime_py import message_to_yaml
 from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
+from recording import RecordingAPI
 
 # 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
 # 和续建无关，所以缺失时只把续建这条路标成不可用
@@ -119,7 +121,8 @@ UPLOAD_LABEL = os.environ.get('GO2W_UPLOAD_LABEL', '166:~/go2w_bags')
 # 没上传的不自动删，只报警并拒绝开始新的录包；正在录的包自己就超过上限（或磁盘快满）时自动停止录包
 BAG_LIMIT_GB = float(os.environ.get('GO2W_BAG_LIMIT_GB', '100'))
 BAG_MIN_FREE_GB = float(os.environ.get('GO2W_BAG_MIN_FREE_GB', '10'))
-ROLLBACK_SECONDS = 20         # 手动「保存刚才 N 秒」的长度
+ROLLBACK_SECONDS = 20         # 手动保存的点击前窗口
+ROLLBACK_AFTER = 10           # 手动保存还包含点击后10秒
 # 包名 = <狗编号>_<月日>_<时分秒>（11-12：原来是 go2w_，改成带狗编号，多狗时能区分）
 # 狗编号（11-18，用户：「robot id 写到机器狗自己的环境变量，不写到镜像里」）按这个顺序取：
 #   1. 狗硬盘上的 runtime.env（/opt/go2w/config/runtime.env，容器里是 /etc/go2w/runtime.env）的 GO2W_ROBOT_ID
@@ -143,7 +146,7 @@ def robot_id():
     if v and P.SAFE_PREFIX.fullmatch(v):
         return v, 'env'
     return ROBOT_ID_DEFAULT, 'default'
-ROLLBACK_BUFFER = 30          # 回溯进程缓存的长度，要装得下卡住自动保存的 前 + 后
+ROLLBACK_BUFFER = 35          # 前20+后10，并给请求轮询保留5秒余量；字节上限仍生效
 ROLLBACK_RETRY = 30.0         # 回溯进程退出后，隔多久再拉起来
 ROLLBACK_SAVE_TIMEOUT = 20.0  # 等存包完成的最长时间
 # 卡住自动保存：导航目标没结束、底盘已解锁、没急停，odom 位置在 STUCK_MOVE 内、朝向在 STUCK_TURN 内
@@ -1850,7 +1853,14 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'set_taught_nav':
                 return self.taught_nav_set(d.get('on') is True, self.remote(ws))
             if op == 'rollback_save':
-                return await self.rollback_save(self.remote(ws), trigger=True)
+                request_id = d.get('request_id')
+                if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request_id)):
+                    return False, '录制请求ID无效'
+                ok, msg = await self.rollback_save(self.remote(ws), trigger=True, after=ROLLBACK_AFTER, request_id=request_id)
+                if ok:
+                    bag = next((b for b in self.bags if b['name'] == self.rollback_last), {})
+                    return ok, msg, {'name': self.rollback_last, 'duration_s': bag.get('dur'), 'requested_s': ROLLBACK_SECONDS + ROLLBACK_AFTER}
+                return ok, msg, {'uncertain': '超时' in msg or '已提交' in msg}
             if op == 'bag_upload':
                 return await self.bag_upload(d.get('name'), self.remote(ws))
             if op == 'bag_stop':
@@ -4179,7 +4189,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             await asyncio.sleep(min(0.2, max(0.0, p['at'] - time.monotonic())))
         if self.inc_save is p:
             self.inc_save = None          # 从现在起的新异常另起一个包
-        for _ in range(10):               # 正好有人在手动保存时等它存完
+        for _ in range(int(ROLLBACK_AFTER + ROLLBACK_SAVE_TIMEOUT) + 1):  # 包含手动后10秒采集与写盘
             if not self.rollback_saving:
                 break
             await asyncio.sleep(1.0)
@@ -4223,27 +4233,46 @@ class Server(TaughtWeb, RT.RtabWeb):
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False),
                                  headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
-    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False):
+    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None):
         """trigger：人在网页上点「保存刚才 N 秒」→ 包名 狗编号_trigger_MMDD_HHMMSS；异常自动保存不带（11-24）。"""
         if not (self.procs_status or {}).get('rollback'):
             return False, '回溯录制没在运行：先打开回溯，并启动建图 / 定位 / 导航'
         if self.rollback_saving:
             return False, '正在保存上一段，请稍等'
         self.rollback_saving = True
+        clicked_ns = time.time_ns()
+        end_ns = clicked_ns + int(after * 1e9)
         bags_dir = os.path.join(DATA, 'bags')
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
         base = time.strftime(f"{robot_id()[0]}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
+        if after:
+            base += '_r'  # 独立后缀避免收集后10秒期间与普通分段同名。
         name, k = base, 1
         while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))):
             k += 1
             name = f'{base}_{k}'
         error, done = os.path.join(work, f'{name}.error'), os.path.join(bags_dir, name, 'metadata.yaml')
         try:
+            capture = {'name': name, 'request_id': request_id, 'clicked_ns': clicked_ns,
+                       'start_ns': clicked_ns - int(seconds*1e9), 'end_ns': end_ns,
+                       'before_s': seconds, 'after_s': after}
+            if request_id:
+                manifests = os.path.join(bags_dir, '.captures')
+                os.makedirs(manifests, exist_ok=True)
+                try:
+                    with open(os.path.join(manifests, request_id + '.json'), 'x') as f:
+                        json.dump(capture, f)
+                except FileExistsError:
+                    return False, '本次录制请求已提交，请按请求ID核对结果'
+            if after:
+                await asyncio.sleep(after)
+                if not (self.procs_status or {}).get('rollback'):
+                    return False, '收集后10秒时回溯录制已停止，本次未保存'
             os.makedirs(work, exist_ok=True)
             tmp = os.path.join(work, 'request.tmp')
             with open(tmp, 'w') as f:
-                f.write(f'{name} {float(seconds)}')
+                f.write(f'{name} {float(seconds + after)}' + (f' {end_ns}' if after else ''))
             os.replace(tmp, os.path.join(work, 'request'))
             t0 = time.monotonic()
             while time.monotonic() - t0 < ROLLBACK_SAVE_TIMEOUT:
@@ -4254,6 +4283,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                     self.node.event('ERROR', f'回溯保存失败：{why}')
                     return False, f'回溯保存失败：{why}'
                 if os.path.exists(done):
+                    if after:
+                        with open(os.path.join(bags_dir, name, 'capture.json'), 'w') as f:
+                            json.dump(capture, f)
                     self.bags = P.list_bags(bags_dir)
                     b = next((x for x in self.bags if x['name'] == name), {})
                     info = f"{b.get('dur') or 0:.0f} 秒，{b.get('size', 0):.0f} MB"
@@ -5810,7 +5842,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     # mapCurrent = 网页上显示的地图（导航没开时是文件地图）；mapLive = 它来自 map_server，可以定位 / 规划
                     st.update(mapCurrent=self.shown_map(), mapLive=n.map_file is None and n.map_current is not None)
                     st.update(estop=self.estop, busy=self.busy, mapBusy=self.map_busy, maps=self.maps, bags=self.bags, uploads=self.uploads, mapChoice=self.map_choice,
-                              rollback={'on': self.rollback_on, 'run': bool((self.procs_status or {}).get('rollback')), 'saving': self.rollback_saving, 'seconds': ROLLBACK_SECONDS},
+                              rollback={'on': self.rollback_on, 'run': bool((self.procs_status or {}).get('rollback')), 'saving': self.rollback_saving, 'seconds': ROLLBACK_SECONDS, 'after': ROLLBACK_AFTER},
                               procsKnown=self.procs_status is not None, teleop=self.teleop is not None,
                               autoLoc={**self.autoloc, 'movesLeft': max(0, AUTOLOC_MOVE_MAX - self.autoloc_moves)}, ctrl=self.ctrl_view(),
                               bagLive=sorted(n for n in self.recording_names() if n) if self.prof('bag') != 'stop' else [],
@@ -5846,6 +5878,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/', self.index)
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
+        RecordingAPI(os.path.join(DATA, 'bags'), self.static_dir).routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
@@ -5908,7 +5941,15 @@ def main():
     ap.add_argument('--port', type=int, default=8080)
     ap.add_argument('--static', default=os.path.join(here, '..', 'static'))
     ap.add_argument('--heartbeat', type=float, default=5.0, help='控制方网页心跳超时（秒）；1.0 在狗侧 Wi-Fi 上频繁误触发（11-20 一晚 4 次），改 5.0。网页断开仍立即上锁，网页遥控另有 0.3 s 超时')
+    ap.add_argument('--tls-cert', help='局域网HTTPS证书，须由手机信任且包含访问地址')
+    ap.add_argument('--tls-key', help='HTTPS证书私钥路径')
     args = ap.parse_args()
+    if bool(args.tls_cert) != bool(args.tls_key):
+        ap.error('--tls-cert 和 --tls-key 必须同时提供')
+    tls = None
+    if args.tls_cert:
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(args.tls_cert, args.tls_key)
 
     rclpy.init()
     node = Bridge()
@@ -5922,10 +5963,10 @@ def main():
             pass
     ros_thread = threading.Thread(target=spin, daemon=True)
     ros_thread.start()
-    node.get_logger().info(f'go2w_web on http://0.0.0.0:{args.port}，心跳超时 {args.heartbeat:.1f} s')
+    node.get_logger().info(f'go2w_web on {"https" if tls else "http"}://0.0.0.0:{args.port}，心跳超时 {args.heartbeat:.1f} s')
     try:
         web.run_app(Server(node, os.path.abspath(args.static), args.heartbeat).app(), host='0.0.0.0', port=args.port,
-                    print=None, handle_signals=True, shutdown_timeout=3.0)
+                    print=None, handle_signals=True, shutdown_timeout=3.0, ssl_context=tls)
     finally:
         executor.shutdown()
         ros_thread.join(timeout=3.0)

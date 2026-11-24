@@ -382,11 +382,15 @@ export function createMockSource(store, bus){
       store.rollback = { ...store.rollback, on, run:on };
       return { ok:true, msg:`回溯录制已${on ? '打开' : '关闭'}（模拟）` };
     },
-    saveRollback(){
+    async saveRollback(){
       if (!store.rollback.run) return { ok:false, msg:'回溯录制没在运行' };
+      if (store.rollback.saving) return { ok:false, msg:'正在保存上一段' };
+      store.rollback.saving = true;
+      await new Promise(resolve => setTimeout(resolve, 10000));
       const name = `go2w-01_${new Date().toTimeString().slice(0,8).replace(/:/g,'')}`;
-      store.bags = [{ name, dur:store.rollback.seconds, size:86 }, ...store.bags];
-      return { ok:true, msg:`已保存回溯 ${name}（模拟）` };
+      store.bags = [{ name, dur:store.rollback.seconds+10, size:86 }, ...store.bags];
+      store.rollback.saving = false;
+      return { ok:true, msg:`已保存回溯 ${name}（模拟）`, data:{name} };
     },
     uploadBag(name){
       if (Object.values(store.uploads).some(u => u.state === 'run')) return { ok:false, msg:'正在上传别的包，等它传完' };

@@ -15,6 +15,7 @@ import { setupReloc } from './reloc.js';
 import { setupTaught } from './taught.js';
 import { setupRtab } from './rtab.js';
 import { toast } from './ui.js';
+import { rollbackShortcut, setupRecordingControls } from './recording-capture.js';
 
 const store = createStore(), bus = new Bus();
 let flow = null;   // 右栏任务流程（setupFlow），setTool 里会用到
@@ -28,6 +29,9 @@ const src = mock ? createMockSource(store, bus) : createRosSource(store, bus);
 const actions = createActions(store, src);
 const mapView = createMapView(store, actions);
 const panels = createPanels(store, src, actions, mapView, bus, setTool);
+setupRecordingControls(actions.rollbackCapture);
+window.addEventListener('keydown', rollbackShortcut(() => actions.saveRollback()));
+document.getElementById('recordPageLink').href = mock ? '/record?mock' : '/record';
 const reloc = setupReloc(store, actions, mapView);
 const taught = setupTaught(store, src, setTool);
 flow = setupFlow(store, src, actions, setTool, reloc, taught, mapView);

@@ -58,7 +58,7 @@ export function createRosSource(store, bus){
       store.robot.valid = false; store.odomOk = false; store.armed = null;
       // 断线后清掉浏览器保存的遥控速度，重连必须重新操作；不能让旧的续发器在新连接上继续发速度。
       teleCmd = null; if (teleTimer){ clearInterval(teleTimer); teleTimer = null; }
-      for (const [, res] of pending) res({ ok: false, msg: '和后端的连接断开了' });
+      for (const [, res] of pending) res({ ok: false, uncertain: true, msg: '和后端的连接断开了' });
       pending.clear();
       if (camWanted) bus.emit('cam', { state: 'disconnected' });
       setTimeout(connect, 1000);
@@ -71,7 +71,7 @@ export function createRosSource(store, bus){
       const id = ++seq;
       pending.set(id, resolve);
       ws.send(JSON.stringify({ t: 'cmd', id, op, ...args }));
-      setTimeout(() => { if (pending.delete(id)) resolve({ ok: false, msg: '后端没有回复（超时）' }); }, timeout);
+      setTimeout(() => { if (pending.delete(id)) resolve({ ok: false, uncertain: true, msg: '后端没有回复（超时）' }); }, timeout);
     });
   }
 
@@ -92,7 +92,7 @@ export function createRosSource(store, bus){
     switch (m.t){
       case 'pong': store.link.ms = performance.now() - m.ts; break;
       case 'cam': bus.emit('cam', m); break;
-      case 'ack': { const res = pending.get(m.id); if (res){ pending.delete(m.id); res({ ok: m.ok, msg: m.msg, data: m.data }); } break; }
+      case 'ack': { const res = pending.get(m.id); if (res){ pending.delete(m.id); res({ ok: m.ok, msg: m.msg, data: m.data, ...(m.data?.uncertain ? { uncertain: true } : {}) }); } break; }
       case 'log': log(m.level, m.node, m.msg); break;
       case 'logs': for (const [lv, node, msg] of m.items) log(lv, node, msg); break;
       case 'plan': rawPlan = m.pts.length > 1 ? m.pts : null; break;
@@ -255,7 +255,7 @@ export function createRosSource(store, bus){
     uploadBag: name => send('bag_upload', { name }),
     setRollback: on => send('rollback_set', { on }),
     setTaughtNav: on => send('set_taught_nav', { on }),
-    saveRollback: () => send('rollback_save', {}, 25000),
+    saveRollback: request_id => send('rollback_save', { request_id }, 40000),
     // vmax / wmax：这次的速度上限（导航没开时在网页上选的），后端出发前设给 cmd_bridge
     // resume：'continue' 从断点那站接着跑 / 'skip' 跳过断点那站（11-24）；接续时后端用断点里的圈数，不看 round_trip / loops
     startRoute: (route_id, o = {}) => send('route_start', { route_id, round_trip: !!o.roundTrip, loops: o.loops ?? 1, arm: !!o.arm,

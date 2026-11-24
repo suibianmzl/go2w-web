@@ -408,8 +408,8 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const rb = store.rollback;
     $('#rbOn').checked = rb.on;
     $('#rbState').textContent = rb.saving ? '保存中…' : rb.run ? `缓存最近 ${rb.seconds} 秒` : rb.on ? '启动建图 / 定位 / 导航后开始' : '已关闭';
-    $('#rbSave').textContent = `保存刚才 ${rb.seconds} 秒`;
-    $('#rbSave').disabled = !rb.run || rb.saving;
+    $('#rbSave').textContent = `保存前 ${rb.seconds} 秒＋后 ${rb.after ?? 10} 秒`;
+    $('#rbSave').disabled = !store.link.ok || !rb.run || rb.saving || actions.rollbackCapture.state.busy || !!actions.rollbackCapture.state.pending;
     setHTML('#bagList', store.bags.length ? store.bags.map((b,i) => {
       const live = b.name === liveBag, u = store.uploads[b.name] || {}, upping = u.state === 'run';
       const anyUp = Object.values(store.uploads).some(x => x.state === 'run');
