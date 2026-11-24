@@ -28,6 +28,7 @@ WebSocket 协议
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import os
@@ -222,6 +223,10 @@ FALL_TILT_POST = 1.0          # s：真摔倒时姿态保护触发后还在倒�
 # 路线启动时离第 1 站不到这么远，就当已在第 1 站、直接去第 2 站：这么短的路径 RotationShim 不会先转正
 # （forward_sampling_distance 0.5），MPPI 只给出很小的速度，Go2W 不执行，会一直卡住
 ROUTE_NEAR_START = 0.5
+# 11-24 任务接续：任务没跑完（Nav2 失败、手动取消、急停、断线上锁、切档位、网页服务重启 / 断电）就在
+# data/route_resume.json 记断点（到了第几站、第几圈、已完成几站、停在哪里）。网页 / 云端可以从断点接着跑完剩下的站，
+# 圈数接着算。断点只在人点「继续」时用，不会自己出发；超过这么久、或者任务的站点改过就作废
+ROUTE_RESUME_MAX_AGE = 24 * 3600   # s
 # 多点任务：Nav2 报未到达（差几厘米到 goal checker 0.15 m 判不过、收尾蹭不进去）时，
 # 机器人离该站不超过这么远就当作到了，继续下一站；更远才终止任务
 ROUTE_ARRIVE_TOL = 0.4
@@ -1471,6 +1476,19 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.route = None
         self.route_job = None
         self.goal_pending = False
+        self.resume_file = os.path.join(DATA, 'route_resume.json')
+        self.resumes = {}
+        try:
+            with open(self.resume_file, encoding='utf-8') as f:
+                for rid, cp in json.load(f).items():
+                    if cp.get('status') == 'active':   # 上次跑着的时候网页服务停了（重启 / 断电）：没机会写结束原因
+                        cp.update(status='interrupted', reason='任务执行中网页服务停止（重启或断电）')
+                    self.resumes[rid] = cp
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            node.event('WARN', f'任务断点文件读不了，忽略：{e}')
+        self.prune_resumes(write=True)
         self.views_file = os.path.join(DATA, 'map_views.json')
         self.map_views = {}
         try:
@@ -2484,6 +2502,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
         self.routes = routes
+        self.prune_resumes(write=True)   # 任务删了、站点改了：断点作废
 
     @staticmethod
     def view_angle(v):
@@ -2677,7 +2696,91 @@ class Server(TaughtWeb, RT.RtabWeb):
         return True, f'已改名为「{label}」' if label else f'已恢复显示文件名 {name}'
 
     def routes_message(self):
-        return json.dumps({'t': 'routes', 'items': list(self.routes.values())})
+        # resume：这个任务的断点（没有就是 null），网页和云端据此显示「继续任务」
+        return json.dumps({'t': 'routes', 'items': [{**r, 'resume': self.resume_view(r)} for r in self.routes.values()]})
+
+    # ---------- 任务接续（11-24） ----------
+    @staticmethod
+    def route_fp(record):
+        """站点指纹：只看坐标和朝向（站名、备注、速度改了不影响接续）。"""
+        pts = [(round(p['x'], 3), round(p['y'], 3), round(p['th'], 3)) for p in record['points']]
+        return hashlib.sha1(json.dumps(pts).encode()).hexdigest()[:16]
+
+    def resume_valid(self, rid, cp, now=None):
+        r = self.routes.get(rid)
+        now = time.time() if now is None else now
+        return (r is not None and isinstance(cp, dict) and cp.get('fp') == self.route_fp(r)
+                and type(cp.get('index')) is int and 0 <= cp['index'] < len(r['points'])
+                and type(cp.get('loop')) is int and cp['loop'] >= 1 and type(cp.get('done')) is int
+                and isinstance(cp.get('time'), (int, float)) and now - cp['time'] <= ROUTE_RESUME_MAX_AGE)
+
+    def prune_resumes(self, write=False):
+        # 正在跑的任务的断点不删（它的 time 每站都刷新）
+        keep = {k: v for k, v in self.resumes.items() if self.resume_valid(k, v)}
+        changed = len(keep) != len(self.resumes)
+        self.resumes = keep
+        if changed and write:
+            self.write_resumes()
+        return changed
+
+    def write_resumes(self):
+        tmp = None
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=DATA, delete=False) as f:
+                tmp = f.name
+                json.dump(self.resumes, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.resume_file)
+        except OSError as e:
+            self.node.event('WARN', f'任务断点没能写盘：{e}')
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def push_routes(self):
+        msg = self.routes_message()
+        for ws in list(self.clients):
+            self.tx_put(ws, msg, 'routes')
+
+    def resume_view(self, record):
+        """推给网页 / 云端的断点。running 的任务（status = active）不给：只有停下来的才能接续。"""
+        cp = self.resumes.get(record['id'])
+        if not cp or cp.get('status') == 'active' or not self.resume_valid(record['id'], cp):
+            return None
+        n, i, back = len(record['points']), cp['index'], bool(cp.get('back'))
+        loops = cp.get('loops')
+        nxt = Server.route_next(n, loops, (i, cp['loop'], back))
+        return {'point': i + 1, 'count': n, 'back': back, 'loop': cp['loop'], 'loops': loops,
+                'roundTrip': loops is not None, 'done': cp['done'], 'total': cp.get('total'),
+                # 这一圈已经到过的站（1 起）：back = 正在回 1 号点，2..n 都到过了；第 2 圈起 1 号点是上一圈收尾时到的
+                'finished': list(range(2, n + 1)) if back else list(range(1, i + 1)),
+                'status': cp.get('status'), 'reason': cp.get('reason', ''), 'time': cp['time'],
+                'expires': cp['time'] + ROUTE_RESUME_MAX_AGE, 'pose': cp.get('pose'),
+                'pointName': record['points'][i].get('name', ''),
+                'canSkip': nxt is not None,
+                'skipPoint': None if nxt is None else nxt[0] + 1}
+
+    def resume_checkpoint(self, route, status='active', reason=''):
+        """记断点。还没到过任何一站（done = 0）就不记：那和从头出发一样。"""
+        rid = route['record']['id']
+        if status == 'succeeded' or route['done'] <= 0:
+            if self.resumes.pop(rid, None) is not None:
+                self.write_resumes()
+                self.push_routes()
+            return
+        pose = None
+        if status != 'active':
+            here = self.node.lookup(BASE_FRAME)
+            if here and self.node.fixed == 'map':
+                pose = [round(here[0], 3), round(here[1], 3), round(here[2], 3)]
+        prev = self.resumes.get(rid)
+        self.resumes[rid] = {'fp': self.route_fp(route['record']), 'name': route['record']['name'],
+                             'index': route['index'], 'loop': route['loop'], 'back': route['back'],
+                             'done': route['done'], 'total': route['total'], 'loops': route['loops'],
+                             'status': status, 'reason': reason, 'time': time.time(), 'pose': pose}
+        self.write_resumes()
+        if status != 'active' or (prev and prev.get('status') != 'active'):
+            self.push_routes()
 
     def route_running(self):
         return self.route_job is not None and not self.route_job.done()
@@ -2766,10 +2869,26 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.checking_route = False
 
-    def start_route(self, ws, route_id, round_trip=False, loops=1):
+    def start_route(self, ws, route_id, round_trip=False, loops=1, resume=None):
+        """resume：None = 从头出发；'continue' = 从断点那一站接着跑；'skip' = 跳过断点那一站，从下一站接着跑。
+        接续时圈数、已完成站数都用断点里的，round_trip / loops 参数不看。"""
         route = self.routes.get(route_id)
         if route is None:
             return False, '找不到这个导航任务'
+        if resume not in (None, 'continue', 'skip'):
+            return False, 'resume 只能是 continue 或 skip'
+        cp = None
+        if resume:
+            cp = self.resumes.get(route_id)
+            if not cp or cp.get('status') == 'active' or not self.resume_valid(route_id, cp):
+                return False, '这个任务没有可以接续的断点（任务跑完了、站点改过、或者断点超过 24 小时）'
+            round_trip, loops = cp.get('loops') is not None, cp.get('loops') if cp.get('loops') is not None else 1
+            state, done = (cp['index'], cp['loop'], bool(cp.get('back'))), cp['done']
+            if resume == 'skip':
+                state = self.route_next(len(route['points']), cp.get('loops'), state)
+                if state is None:
+                    return False, '断点是最后一站：跳过就没有剩下的站了'
+                done += 1
         if type(round_trip) is not bool or type(loops) is not int or not 0 <= loops <= 1000:
             return False, '循环圈数需要是 0–1000 的整数（0 = 一直循环）'
         if (self.route_running() or self.goal_pending or self.node.nav_active()
@@ -2786,9 +2905,23 @@ class Server(TaughtWeb, RT.RtabWeb):
                       # 循环：loops 为 None 表示单程；done = 已到达的站数，用来算进度。一圈到 n 站（含回到起点）
                       'loops': loops if round_trip else None, 'loop': 1, 'back': False, 'done': 0,
                       'total': n if not round_trip else None if loops == 0 else 1 + loops * n,
-                      'target': route['points'][0]}
-        self.route_job = asyncio.create_task(self.run_route(ws, self.route))
+                      'target': route['points'][0], 'resume': None}
         how = '' if not round_trip else '，一直循环' if loops == 0 else f'，循环 {loops} 圈'
+        if cp:
+            i, loop, back = state
+            self.route.update(index=i, loop=loop, back=back, done=done, total=cp.get('total'), resume=state,
+                              target=self.route_pose(route['points'], i, back))
+            lap = f"第 {loop} 圈" + ('' if not loops else f' / 共 {loops} 圈') + '，' if round_trip else ''
+            self.route_job = asyncio.create_task(self.run_route(ws, self.route))
+            where = '回 1 号点' if back else f'第 {i + 1} 站'
+            skipped = f"（跳过第 {cp['index'] + 1} 站）" if resume == 'skip' else ''
+            msg = f"接续任务：{route['name']}，{lap}从{where}继续{skipped}，之前已完成 {cp['done']} 站"
+            self.node.event('INFO', msg)
+            return True, msg
+        if self.resumes.pop(route_id, None) is not None:   # 从头出发：旧断点作废
+            self.write_resumes()
+            self.push_routes()
+        self.route_job = asyncio.create_task(self.run_route(ws, self.route))
         return True, f"开始任务：{route['name']}{how}"
 
     async def start_route_armed(self, ws, d):
@@ -2830,7 +2963,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not r.success:
                 return False, f'解锁失败：{r.message}'
             n.armed, n.armed_t, armed_here = True, time.monotonic(), True
-        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1))
+        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1), d.get('resume'))
         if armed_here and not result[0]:
             try:
                 r = await self.aw(n.call_arm(False), 2.0)
@@ -2845,6 +2978,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.incident('nav_fail', f"巡逻任务「{route['record']['name']}」{message}")   # 先记，任务信息还是执行中的
         route.update(status=status, message=message, ended=time.monotonic())
         route['stop'].set()
+        try:
+            self.resume_checkpoint(route, status, message)
+        except Exception as e:   # 记断点出错不能影响停车
+            self.node.event('WARN', f'任务断点没记上：{e!r}')
         self.node.event('ERROR' if status == 'aborted' else 'INFO', message)
 
     def stop_route(self, reason):
@@ -3208,9 +3345,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                 raise RuntimeError('无法读取当前位置')
             start = dict(zip(('x', 'y', 'th'), pos))
             points, loops = record['points'], route['loops']
-            first = (0, 1, False)
+            first = route['resume'] or (0, 1, False)
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
-            if near < ROUTE_NEAR_START:
+            if route['resume'] is None and near < ROUTE_NEAR_START:
                 first = self.route_next(len(points), loops, first)
                 route['done'] = 1
                 n.event('INFO', f'已在第 1 站附近（{near:.2f} m），直接前往第 2 站')
@@ -3224,6 +3361,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     return
                 point = self.route_pose(points, i, back)
                 route.update(index=i, loop=loop, back=back, target=point, goal=None)
+                self.resume_checkpoint(route)   # 每站出发前写盘：网页服务突然停了也知道跑到哪了
                 reason = self.route_blocker(ws, record)
                 if reason:
                     if prev is not None:
@@ -3343,7 +3481,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 'progress': progress,
                 'routeId': record['id'], 'pointName': record['points'][i]['name'],
                 'pointNote': record['points'][i].get('note', ''),
-                'message': route['message'], 'elapsed': route.get('ended', time.monotonic()) - route['started']}
+                'message': route['message'], 'elapsed': route.get('ended', time.monotonic()) - route['started'],
+                # resumed：这次是从断点接着跑的；resumable：停下了且记了断点，可以「继续任务」
+                'resumed': route['resume'] is not None,
+                'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------
     MODE_NAME = {'mapping': '建图', 'localization': '定位', 'navigation': '导航'}

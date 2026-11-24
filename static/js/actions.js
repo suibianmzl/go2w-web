@@ -173,7 +173,7 @@ export function createActions(store, src){
     startRoute(route, opts = {}){
       const reason = routeStartBlocker(route);
       if (reason) return toast(reason, 'err');
-      const go = () => exec(src.cmd.startRoute(route.id, { ...opts, arm: true }), '底盘已解锁，任务已出发');
+      const go = () => exec(src.cmd.startRoute(route.id, { ...opts, arm: true }), opts.resume ? '底盘已解锁，任务已接续' : '底盘已解锁，任务已出发');
       const R = store.robot, m = store.loc.match;
       if (m == null || m >= 60) return go();
       return new Promise(resolve => formBox({ title: '定位可能不准', ok: '仍然出发', danger: true,

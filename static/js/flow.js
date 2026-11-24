@@ -160,26 +160,28 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   }
   function prepFail(k, msg, soft = false){ prep.fail = { k, msg, soft }; }
 
-  // routes.js 的「出发」按钮调这个（参数没保存的已经先保存好了）
-  function startGo(route){
+  // routes.js 的「出发」按钮调这个（参数没保存的已经先保存好了）。
+  // resume（11-24 任务接续）：'continue' / 'skip'，流程一样（站立 → 导航 → 定位），最后下发时带上，后端从断点接着跑
+  function startGo(route, resume = null){
     if (!route) return toast('先选择（或保存）一个任务', 'warn');
     const b = actions.routeGoBlocker(route) || busyMsg(); if (b) return toast(b, 'warn');
+    if (resume && !route.resume) return toast('这个任务没有可以接续的断点', 'warn');
     if (prep.on && !prep.fail) return;
     const begin = () => {
       resetPrep();
-      Object.assign(prep, { on: true, fail: null, step: 'stand', route: route.id, routeName: route.name, map: route.map, t0: Date.now(),
+      Object.assign(prep, { on: true, fail: null, step: 'stand', route: route.id, routeName: route.name, map: route.map, t0: Date.now(), resume,
         seq0: store.autoLoc?.seq ?? -1, standT: 0, standOk: false, holdT: 0, navT: 0, runT: 0, loadT: 0, autoT: 0, matchT: 0, goT: 0 });
       render();
     };
     if (up('navigation')) return begin();
     // 要启动导航：FAST-LIO 初始化时机器人要站好不动
-    formBox({ title: '出发', ok: '出发',
-      body: `将${store.ctrl?.on && store.ctrl.state !== 'Velocity' ? '让机器狗站起来，' : ''}用地图 ${route.map} 启动导航（约 10–20 秒），自动定位后解锁底盘出发。${up('localization') ? '当前的「定位」档位会先停掉。' : ''}`,
+    formBox({ title: resume ? '继续任务' : '出发', ok: resume ? '继续' : '出发',
+      body: `${resume ? `从第 ${resume === 'skip' ? route.resume.skipPoint : route.resume.point} 站接着跑剩下的站。` : ''}将${store.ctrl?.on && store.ctrl.state !== 'Velocity' ? '让机器狗站起来，' : ''}用地图 ${route.map} 启动导航（约 10–20 秒），自动定位后解锁底盘出发。${up('localization') ? '当前的「定位」档位会先停掉。' : ''}`,
       build: f => stillCheck(f), valid: f => f.querySelector('[data-still]').checked, onOk: begin });
   }
   store.startGo = startGo;
   $('#prepStop').onclick = () => { resetPrep(); render(); toast('已取消出发', 'warn'); };
-  $('#prepRetry').onclick = () => { const r = store.routes.find(x => x.id === prep.route); resetPrep(); startGo(r); };
+  $('#prepRetry').onclick = () => { const r = store.routes.find(x => x.id === prep.route), how = prep.resume; resetPrep(); startGo(r, how); };
 
   function prepTick(){
     if (!prep.on) return;
@@ -189,6 +191,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     }
     const route = store.routes.find(r => r.id === prep.route);
     if (!route) return prepFail('go', '任务被删除了');
+    if (prep.resume && !route.resume && !prep.goT) return prepFail('go', '断点已经作废（任务站点改过或超过 24 小时）');
     if (store.estop) return prepFail(prep.step, '急停中');
     const now = Date.now();
     prepHold(now);
@@ -262,7 +265,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     if (!(mNow != null && mNow >= 60) && now - prep.matchT < MATCH_WAIT) return;
     prep.goT = now;
     const t0 = prep.t0, o = route.opts || {};
-    Promise.resolve(actions.startRoute(route, { roundTrip: !!o.loop, loops: o.loops ?? 1, vmax: o.vmax, wmax: o.wmax })).then(r => {
+    Promise.resolve(actions.startRoute(route, { roundTrip: !!o.loop, loops: o.loops ?? 1, vmax: o.vmax, wmax: o.wmax, resume: prep.resume })).then(r => {
       if (!prep.on || prep.t0 !== t0) return;
       if (r?.ok) resetPrep();                                   // 出发了：进度看「导航任务」卡片
       else prepFail('go', r == null ? '已取消出发' : r.msg || '任务没有下发成功', true);
@@ -388,7 +391,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       if (prep.on && sel && sel !== prep.route) resetPrep();
       const o = route?.opts;
       setStep('stRoute', mapOk ? 'cur' : 'todo',
-        prep.on ? (prep.fail ? `出发失败：${prep.fail.msg}` : `出发中 · ${STEP_NAME[prep.step]}…`)
+        prep.on ? (prep.fail ? `出发失败：${prep.fail.msg}` : `${prep.resume ? '接续' : '出发'}中 · ${STEP_NAME[prep.step]}…`)
         : route && !editing ? `${route.name} · ${route.points.length} 站${o ? ` · ${o.loop ? (o.loops ? `循环 ${o.loops} 圈` : '一直循环') : '单程'} · ${(+o.vmax).toFixed(2)} m/s` : ''}`
         : editing ? '正在编辑路线' : store.routes.some(r => r.map === store.mapCurrent) ? '选择一个任务' : '这张地图还没有任务，点「新建」');
       prepRender();

@@ -1,4 +1,5 @@
 import { $, deg } from './util.js';
+import { confirmBox } from './ui.js';
 // 右栏「导航任务」：选 / 新建 / 编辑路线，运行参数（跟任务一起保存），出发按钮（出发流程在 flow.js）
 
 export function setupRouteEditor(store, actions, setTool){
@@ -53,9 +54,42 @@ export function setupRouteEditor(store, actions, setTool){
       if (!saved) return;
       route = saved;
     }
+    // 有断点时「出发」= 从第 1 站重新开始：断点会作废，先问一句
+    if (route?.resume) return confirmBox({ title:'从头出发', body:`「${route.name}」上次停在第 ${route.resume.point} 站，已完成 ${route.resume.done} 站。从头出发会从第 1 站重新开始，这个断点作废。要接着跑请点「继续任务」。`,
+      ok:'从头出发', danger:true, onOk: () => { store.startGo?.(route); render(); } });
     store.startGo?.(route);
     render();
   };
+  // 任务接续（11-24）：后端在 routes 消息里给每个任务带 resume（断点，没有就是 null）
+  const resumeBox = $('#routeResume'), resumeGo = $('#routeResumeGo'), resumeSkip = $('#routeResumeSkip');
+  const resumeStart = how => { if (!resumeGo.disabled) { store.startGo?.(selected(), how); render(); } };
+  resumeGo.onclick = () => resumeStart('continue');
+  resumeSkip.onclick = () => resumeStart('skip');
+  const WHY = { aborted:'失败', canceled:'取消', interrupted:'中断' };
+  function renderResume(route, show, blocked){
+    const R = show ? route?.resume : null;
+    resumeBox.hidden = !R;
+    if (!R) return;
+    const when = new Date(R.time * 1000), pad = v => String(v).padStart(2, '0');
+    $('#routeResumeWhen').textContent = `${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}:${pad(when.getMinutes())} ${WHY[R.status] || ''}`;
+    const lap = R.roundTrip ? `第 ${R.loop} 圈${R.loops ? ` / 共 ${R.loops} 圈` : '（一直循环）'} · ` : '';
+    const target = R.back ? '回 1 号点' : `第 ${R.point} 站${R.pointName ? `「${R.pointName}」` : ''}`;
+    $('#routeResumeInfo').textContent = `${lap}停在去${target}的路上 · 已完成 ${R.done}${R.total ? ` / ${R.total}` : ''} 站`;
+    $('#routeResumeWhy').textContent = R.reason || '';
+    const fin = new Set(R.finished);
+    $('#routeResumeStops').replaceChildren(...Array.from({ length: R.count }, (_, i) => {
+      const li = document.createElement('li'), k = i + 1;
+      const next = R.back ? k === 1 : k === R.point;
+      li.dataset.s = next ? 'next' : fin.has(k) ? 'done' : 'todo';
+      li.textContent = next && R.back ? '↩1' : String(k);
+      li.title = next ? '从这站继续' : fin.has(k) ? '这一圈已到过' : '还没到';
+      return li;
+    }));
+    resumeGo.disabled = resumeSkip.disabled = !!blocked;
+    resumeGo.title = resumeSkip.title = blocked || '';
+    resumeSkip.hidden = !R.canSkip;
+    resumeSkip.textContent = R.canSkip ? `跳过，从第 ${R.skipPoint} 站继续` : '';
+  }
   remove.onclick = () => {
     const route = selected();
     if (!route) return;
@@ -306,8 +340,12 @@ export function setupRouteEditor(store, actions, setTool){
     else if (!runMessage && saveNeeded) runMessage = '参数改过还没保存：点「保存并出发」会先保存。';
     if (going && !going.fail) runMessage = '';
     run.disabled = runningSelected || saving || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
-    const runText = runningSelected ? '导航任务执行中' : going && !going.fail ? `出发中 · ${going.name}…` : going?.fail ? '出发失败' : saveNeeded ? '保存并出发' : '出发';
+    const resumable = !!route?.resume && !runningSelected && !pointsDirty && !saving && !(going && !going.fail);
+    renderResume(route, resumable, actions.routeGoBlocker(route) || (going && !going.fail ? '正在出发' : ''));
+    const runText = runningSelected ? '导航任务执行中' : going && !going.fail ? `出发中 · ${going.name}…` : going?.fail ? '出发失败'
+      : saveNeeded ? '保存并出发' : resumable ? '从头出发' : '出发';
     if (run.textContent !== runText) run.textContent = runText;
+    run.classList.toggle('pri', !resumable);   // 有断点时突出「继续任务」，「从头出发」降成普通按钮
     if (runHint.textContent !== runMessage) runHint.textContent = runMessage;
     let message = '用「导航点」单击加点，拖拽可指定朝向。至少选两站。';
     if (draft.map && !matching) message = `路线属于地图 ${draft.map}，请先切图。`;

@@ -305,6 +305,14 @@
                     <button class="btn pri big" id="routeRun" aria-describedby="routeRunHint" disabled>出发</button>
                     <div class="route-hint" id="routeRunHint" aria-live="polite"></div>
                   </div>
+                  <div class="route-resume" id="routeResume" hidden>
+                    <div class="route-resume-head"><b>上次没跑完</b><span id="routeResumeWhen"></span></div>
+                    <div class="route-resume-info" id="routeResumeInfo"></div>
+                    <ol class="route-resume-stops" id="routeResumeStops" aria-label="各站完成情况"></ol>
+                    <div class="route-resume-why" id="routeResumeWhy"></div>
+                    <div class="btn-row"><button class="btn pri" id="routeResumeGo">继续任务</button><button class="btn" id="routeResumeSkip">跳过这站继续</button></div>
+                    <div class="route-hint">继续：站起、启动导航、定位后，从没到的那一站接着跑完剩下的站，圈数接着算。点上面的「从头出发」是从第 1 站重新开始，断点作废。</div>
+                  </div>
                   <ul class="prep-list" id="prepList" hidden>
                     <li data-k="stand"><i></i><span>站立</span><small></small></li>
                     <li data-k="nav"><i></i><span>启动导航</span><small></small></li>
