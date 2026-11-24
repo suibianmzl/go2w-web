@@ -14,7 +14,7 @@ def main():
     errors=[]
     with sync_playwright() as p:
         browser=p.chromium.launch(executable_path='/opt/google/chrome/chrome',headless=True)
-        context=browser.new_context(viewport={'width':1050,'height':850},reduced_motion='reduce')
+        context=browser.new_context(viewport={'width':1440,'height':1000},reduced_motion='reduce')
         context.route('https://fonts.googleapis.com/**',lambda r:r.abort())
         context.route('https://fonts.gstatic.com/**',lambda r:r.abort())
         context.add_init_script('Object.defineProperty(window,"isSecureContext",{value:false});')
@@ -24,8 +24,6 @@ def main():
         card=page.locator('#recordingControls')
         expect(card).to_be_visible()
         page.screenshot(path=str(out/'console.png'),full_page=True)
-        # 将同一真实组件独立放大显示，主页面仍运行，所有交互仍走产品数据源。
-        page.add_style_tag(content='#recordingControls{position:fixed;inset:16px;z-index:1000;padding:20px;background:var(--panel);border:1px solid var(--line-2);border-radius:12px;overflow:auto}')
         expect(card).not_to_contain_text('data/bags')
         expect(card).not_to_contain_text('数据录包可用；语音需要受信任的 HTTPS 连接')
         expect(card.locator('#voiceStatus')).to_be_empty()
@@ -58,20 +56,35 @@ def main():
         expect(card.locator('#bagRecordingState')).to_be_visible()
         expect(card.locator('#bagSelBtn')).to_be_disabled()
         card.screenshot(path=str(out/'desktop-recording.png'))
+        page.set_viewport_size({'width':375,'height':812})
+        stop=card.get_by_role('button',name='停止录制',exact=True)
+        stop.scroll_into_view_if_needed()
+        expect(card.locator('#bagRecordingState')).to_be_visible()
+        assert card.evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+        header=card.locator('.bag-header').bounding_box();topic=card.locator('#bagSelBtn').bounding_box()
+        assert topic['x']+topic['width']<=header['x']+header['width']+1
+        assert 44<=stop.bounding_box()['height']<=60
+        card.screenshot(path=str(out/'mobile-recording.png'))
+        page.set_viewport_size({'width':1440,'height':1000})
         card.get_by_role('button',name='停止录制',exact=True).click()
         expect(start).to_be_visible(timeout=5000)
         expect(card.locator('#bagRecordingState')).not_to_be_visible()
-        for width,height in [(1050,850),(375,812),(812,375)]:
+        for width,height in [(1440,1000),(1050,850),(375,812),(812,375)]:
             page.set_viewport_size({'width':width,'height':height})
+            start.scroll_into_view_if_needed()
             a,b=start.bounding_box(),current.bounding_box()
             assert abs(a['y']-b['y'])<2,(width,a,b)
+            assert 44<=a['height']<=60 and 44<=b['height']<=60,(width,a,b)
             assert card.evaluate('(e)=>e.scrollWidth<=e.clientWidth'),width
+            header=card.locator('.bag-header').bounding_box()
+            topic=card.locator('#bagSelBtn').bounding_box()
+            assert topic['x']>=header['x'] and topic['x']+topic['width']<=header['x']+header['width']+1,(width,topic,header)
             card.screenshot(path=str(out/f'card-{width}-{height}.png'))
             card.locator('summary').click()
             assert card.evaluate('(e)=>e.scrollWidth<=e.clientWidth'),width
             card.screenshot(path=str(out/f'expanded-{width}-{height}.png'))
             card.locator('summary').click()
-        page.set_viewport_size({'width':1050,'height':850})
+        page.set_viewport_size({'width':1440,'height':1000})
         before=page.evaluate('go2w.store.bags.length')
         current.click();expect(current).to_be_disabled()
         page.wait_for_function('(before)=>go2w.store.bags.length===before+1',arg=before,timeout=15000)
