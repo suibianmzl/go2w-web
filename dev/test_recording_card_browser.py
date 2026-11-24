@@ -29,6 +29,15 @@ def main():
         expect(card.locator('#voiceStatus')).to_be_empty()
         expect(card.locator('#voiceSeconds')).not_to_be_visible()
         expect(card.locator('#rbOn')).not_to_be_visible()
+        history=card.locator('#bagHistory')
+        settings=card.locator('#bagSettings > summary')
+        expect(card.locator('#bagList')).not_to_be_visible()
+        expect(card.locator('#bagCount')).to_have_text(str(page.evaluate('go2w.store.bags.length')))
+        history.locator('summary').click()
+        expect(card.locator('#bagList')).to_be_visible()
+        expect(card.locator('#bagList .bag-up')).to_have_count(page.evaluate('go2w.store.bags.length'))
+        history.locator('summary').focus();history.locator('summary').press('Enter')
+        expect(card.locator('#bagList')).not_to_be_visible()
         topic=card.locator('#bagSelBtn').bounding_box();heading=card.locator('h4').bounding_box()
         assert topic['x']>heading['x']+heading['width'] and abs(topic['y']-heading['y'])<24
         start=card.get_by_role('button',name='开始持续录制',exact=True)
@@ -39,14 +48,14 @@ def main():
             rect=button.bounding_box();assert rect['height']>=44
             assert button.evaluate('(e)=>getComputedStyle(e).backgroundColor') not in ('rgba(0, 0, 0, 0)','transparent')
         a,b=start.bounding_box(),current.bounding_box();assert abs(a['y']-b['y'])<2
-        card.locator('summary').click()
+        settings.click()
         expect(card.locator('#rbOn')).to_be_checked()
         expect(card.locator('#voiceSeconds')).to_be_visible()
         card.locator('#voiceSeconds').fill('7');card.locator('#voiceSeconds').press('Tab')
         assert page.evaluate('go2w.actions.rollbackCapture.state.seconds')==7
-        assert card.locator('#bagSettings').evaluate('(e)=>e.previousElementSibling.id')=='bagList'
+        assert card.locator('#bagSettings').evaluate('(e)=>e.previousElementSibling.id')=='bagHistory'
         card.screenshot(path=str(out/'desktop-expanded.png'))
-        card.locator('summary').focus();card.locator('summary').press('Enter')
+        settings.focus();settings.press('Enter')
         expect(card.locator('#voiceSeconds')).not_to_be_visible()
         card.locator('#bagSelBtn').click();expect(card.locator('#bagSelList')).to_be_visible()
         card.locator('h4').click();expect(card.locator('#bagSelPop')).not_to_be_visible()
@@ -80,17 +89,26 @@ def main():
             topic=card.locator('#bagSelBtn').bounding_box()
             assert topic['x']>=header['x'] and topic['x']+topic['width']<=header['x']+header['width']+1,(width,topic,header)
             card.screenshot(path=str(out/f'card-{width}-{height}.png'))
-            card.locator('summary').click()
+            history.locator('summary').click()
+            expect(card.locator('#bagList')).to_be_visible()
+            assert card.evaluate('(e)=>e.scrollWidth<=e.clientWidth'),width
+            history.locator('summary').click()
+            settings.click()
             assert card.evaluate('(e)=>e.scrollWidth<=e.clientWidth'),width
             card.screenshot(path=str(out/f'expanded-{width}-{height}.png'))
-            card.locator('summary').click()
+            settings.click()
         page.set_viewport_size({'width':1440,'height':1000})
         before=page.evaluate('go2w.store.bags.length')
+        history.locator('summary').click()
         current.click();expect(current).to_be_disabled()
         page.wait_for_function('(before)=>go2w.store.bags.length===before+1',arg=before,timeout=15000)
         expect(current).to_be_enabled(timeout=3000)
+        expect(card.locator('#bagCount')).to_have_text(str(before+1))
+        expect(card.locator('#bagList')).to_be_visible()
+        page.reload(wait_until='networkidle')
+        expect(card.locator('#bagList')).not_to_be_visible()
         assert not errors,errors
-        print('PASS 录包卡片布局、更多设置、持续录制状态、当前数据录制及桌面/375px/横屏',flush=True)
+        print('PASS 录包列表默认折叠、点击/键盘展开收起、计数更新与录制卡片桌面/窄屏交互',flush=True)
         browser.close()
 
 

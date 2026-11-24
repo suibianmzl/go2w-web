@@ -411,6 +411,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#rbSave').textContent = rb.saving || actions.rollbackCapture.state.busy ? '录制中…' : '录制当前数据';
     $('#rbSave').title = `Shift+Enter：保存点击前 ${rb.seconds} 秒和后 ${rb.after ?? 10} 秒`;
     $('#rbSave').disabled = !store.link.ok || !rb.run || rb.saving || actions.rollbackCapture.state.busy || !!actions.rollbackCapture.state.pending;
+    $('#bagCount').textContent = store.bags.length;
     setHTML('#bagList', store.bags.length ? store.bags.map((b,i) => {
       const live = b.name === liveBag, u = store.uploads[b.name] || {}, upping = u.state === 'run', waiting = upping && u.phase === 'waiting';
       const anyUp = Object.values(store.uploads).some(x => x.state === 'run');
