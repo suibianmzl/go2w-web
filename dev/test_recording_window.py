@@ -66,6 +66,35 @@ int main() {
 
 
 class SaveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_robot_id_and_collisions_keep_manual_capture_name_valid(self):
+        import go2w_web as W
+        from datetime import datetime
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            server=W.Server.__new__(W.Server)
+            server.procs_status={'rollback':True};server.rollback_saving=False
+            server.node=NS(event=lambda *args:None)
+            rid='a'*30;names=[]
+            async def advance(delay):
+                if delay==10:
+                    registrations=list((Path(d)/'bags/.captures/by-name').glob('*.json'))
+                    self.assertTrue(all(W.P.SAFE_NAME.fullmatch(p.stem) for p in registrations),'长狗编号不能生成录包器拒绝的名字')
+                request=Path(d)/'bags/.rollback/request'
+                if delay!=10 and request.exists():
+                    name=request.read_text().split()[0];request.unlink();names.append(name)
+                    bag=Path(d)/'bags'/name;bag.mkdir()
+                    (bag/'metadata.yaml').write_text('duration:\n  nanoseconds: 30000000000\n')
+            stamp=datetime(2026,11,24,21,0,0)
+            strftime=W.time.strftime
+            with patch.object(W,'DATA',d),patch.object(W,'robot_id',return_value=(rid,'test')), \
+                    patch.object(W.time,'strftime',side_effect=lambda fmt,*_args:strftime(fmt,stamp.timetuple())),patch.object(W.asyncio,'sleep',side_effect=advance):
+                for _ in range(2):
+                    ok,msg=await server.rollback_save('test',trigger=True,after=10)
+                    self.assertTrue(ok,msg)
+                    self.assertEqual(json.loads((Path(d)/'bags'/server.rollback_last/'capture.json').read_text())['robot_id'],rid)
+            self.assertTrue(all(len(n)<=48 and '_trigger_' in n for n in names))
+            self.assertNotEqual(names[0],names[1]);self.assertTrue(names[1].endswith('_r_2'))
+
     async def test_backend_reserves_slot_before_wait_and_anchors_request(self):
         import go2w_web as W
         with tempfile.TemporaryDirectory() as d:

@@ -4247,17 +4247,25 @@ class Server(TaughtWeb, RT.RtabWeb):
         bags_dir = os.path.join(DATA, 'bags')
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
-        base = time.strftime(f"{robot_id()[0]}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
+        rid = robot_id()[0]
+        base = time.strftime(f"{rid}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
         if after:
             base += '_r'  # 独立后缀避免收集后10秒期间与普通分段同名。
-        name, k = base, 1
+        def capture_name(suffix=''):
+            if len(base + suffix) <= 48:
+                return base + suffix
+            tail = base[len(rid):]
+            room = 48 - len(tail) - len(suffix)
+            prefix = rid[:room - 9] + '-' + hashlib.sha256(rid.encode()).hexdigest()[:8]
+            return prefix + tail + suffix
+        name, k = capture_name(), 1
         by_name = os.path.join(bags_dir, '.captures', 'by-name')
         while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))) or (after and os.path.exists(os.path.join(by_name, name + '.json'))):
             k += 1
-            name = f'{base}_{k}'
+            name = capture_name(f'_{k}')
         error, done = os.path.join(work, f'{name}.error'), os.path.join(bags_dir, name, 'metadata.yaml')
         try:
-            capture = {'name': name, 'request_id': request_id, 'clicked_ns': clicked_ns,
+            capture = {'name': name, 'robot_id': rid, 'request_id': request_id, 'clicked_ns': clicked_ns,
                        'start_ns': clicked_ns - int(seconds*1e9), 'end_ns': end_ns,
                        'before_s': seconds, 'after_s': after}
             if voice_seconds is not None:

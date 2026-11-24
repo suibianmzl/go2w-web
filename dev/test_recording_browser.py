@@ -29,7 +29,7 @@ def main():
         page.wait_for_function('window.go2w?.store.link.ok')
         result = page.evaluate("go2w.src.cmd.setMode('localization','test')")
         assert result['ok'], result
-        page.wait_for_function('go2w.store.rollback.run', timeout=15000)
+        page.wait_for_function('go2w.store.profiles.localization === "run" && !go2w.store.busy && go2w.store.rollback.run', timeout=45000)
         assert page.locator('#voiceSeconds').input_value() == '5'
         page.locator('#srcBadge').click()
         page.keyboard.press('Shift+Enter');page.keyboard.press('Shift+Enter')
