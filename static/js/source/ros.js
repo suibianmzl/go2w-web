@@ -255,7 +255,7 @@ export function createRosSource(store, bus){
     uploadBag: name => send('bag_upload', { name }),
     setRollback: on => send('rollback_set', { on }),
     setTaughtNav: on => send('set_taught_nav', { on }),
-    saveRollback: request_id => send('rollback_save', { request_id }, 40000),
+    saveRollback: (request_id, voice_seconds) => send('rollback_save', { request_id, voice_seconds }, 40000),
     // vmax / wmax：这次的速度上限（导航没开时在网页上选的），后端出发前设给 cmd_bridge
     // resume：'continue' 从断点那站接着跑 / 'skip' 跳过断点那站（11-24）；接续时后端用断点里的圈数，不看 round_trip / loops
     startRoute: (route_id, o = {}) => send('route_start', { route_id, round_trip: !!o.roundTrip, loops: o.loops ?? 1, arm: !!o.arm,

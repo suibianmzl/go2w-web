@@ -27,6 +27,7 @@
 .record-result h3{font:500 14px/1.6 var(--f-mono);overflow-wrap:anywhere;margin:0 0 8px}
 .record-result p{font-size:13px;color:var(--fg-2);line-height:1.6;margin:4px 0}
 .record-result audio{display:block;width:100%;max-width:100%;height:44px;margin-top:12px}
+.record-voice-recover{min-height:44px;margin-top:8px;padding:8px 12px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel-2);color:var(--warn)}
 .record-empty{font-size:14px;line-height:1.8;color:var(--fg-2);padding:32px 0}
 .record-dock{position:fixed;bottom:0;left:0;right:0;display:flex;align-items:center;flex-direction:column;padding:12px 20px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line-2);background:var(--bg);z-index:10;text-align:center}
 .record-dock .voice-controls{margin:0;justify-content:center;font-size:14px}

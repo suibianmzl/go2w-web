@@ -3,6 +3,7 @@ import { Bus } from './util.js';
 import { createRosSource } from './source/ros.js';
 import { createMockSource } from './source/mock.js';
 import { createRollbackCapture, rollbackShortcut, setupRecordingControls } from './recording-capture.js';
+import { confirmBox } from './ui.js';
 
 const get=id=>document.getElementById(id), store=createStore(), bus=new Bus();
 const mock=new URLSearchParams(location.search).has('mock');
@@ -44,7 +45,7 @@ function showResults(items){
       const card=document.createElement('article');card.className='record-result';
       const name=document.createElement('h3');name.textContent=item.name;
       const detail=document.createElement('p'),voice=document.createElement('p');card.append(name,detail,voice);
-      row={card,detail,voice,player:null};cards.set(item.name,row);
+      row={card,detail,voice,player:null,recover:null};cards.set(item.name,row);
     }
     const when=item.mtime?new Date(item.mtime*1000).toLocaleString():'';
     row.detail.textContent=`${Number.isFinite(item.dur)?`${item.dur.toFixed(1)} 秒`:'时长未记录'} · ${item.size ?? 0} MB${when?` · ${when}`:''}`;
@@ -53,6 +54,19 @@ function showResults(items){
       if(!row.player){const player=document.createElement('audio');player.controls=true;player.preload='none';player.setAttribute('aria-label',`${item.name} 的语音备注`);row.player=player;row.card.append(player);}
       if(row.player.getAttribute('src')!==item.audio.url)row.player.src=item.audio.url;
     }else if(row.player){row.player.pause();row.player.remove();row.player=null;}
+    if(!item.audio && item.voice_state==='pending'){
+      if(!row.recover){
+        const button=document.createElement('button');button.className='record-voice-recover';button.textContent='结束待处理语音';row.card.append(button);row.recover=button;
+      }
+      row.voice.textContent='语音尚未保存；若原录制页面已关闭，可确认本次无录音';
+      row.recover.onclick=()=>confirmBox({title:'结束待处理语音',body:'确认本包不再保存语音？后续上传会明确记录无录音的原因，数据包会保留。',ok:'确认无录音',onOk:async()=>{
+        try{
+          const response=await fetch(`/api/recordings/${encodeURIComponent(item.name)}/audio-status`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:'unavailable',reason:'用户在结果列表确认本次无录音',request_id:item.request_id}),signal:AbortSignal.timeout(15000)});
+          if(!response.ok)throw Error((await response.text()).slice(0,160));
+          refresh();
+        }catch(e){get('recordListStatus').textContent=`语音状态更新失败：${e.message}`;}
+      }});
+    }else if(row.recover){row.recover.remove();row.recover=null;}
     return row.card;
   });
   if(!nodes.length){const empty=document.createElement('p');empty.className='record-empty';empty.textContent='还没有录包。按下底部按钮，保存当前事件。';nodes.push(empty);}

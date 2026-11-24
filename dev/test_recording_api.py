@@ -60,10 +60,14 @@ class RecordingAPITests(unittest.IsolatedAsyncioTestCase):
         manifests = self.root/'bags/.captures'
         manifests.mkdir()
         (manifests/'request-one.json').write_text(json.dumps({'name':'go2w-test','request_id':'request-one'}))
+        (self.bag/'capture.json').write_text(json.dumps({'name':'go2w-test','request_id':'request-one'}))
         response = await self.client.get('/api/recordings?request_id=request-one')
         self.assertEqual([x['name'] for x in (await response.json())['items']], ['go2w-test'])
         response = await self.client.get('/api/recordings?request_id=request-two')
         self.assertEqual((await response.json())['items'], [])
+        (self.bag/'capture.json').write_text(json.dumps({'name':'go2w-test','request_id':'new-request'}))
+        response = await self.client.get('/api/recordings?request_id=request-one')
+        self.assertEqual((await response.json())['items'], [], '旧索引不能把同名新包当成原包')
 
     async def test_invalid_uploads_do_not_leave_partial_voice_files(self):
         for data, mime, duration, status in [
@@ -92,6 +96,14 @@ class RecordingAPITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cross_origin_write_is_rejected(self):
         self.assertEqual((await self.upload(Origin='http://foreign.test')).status, 403)
+        response=await self.client.post('/api/recordings/go2w-test/audio-status',
+            json={'state':'unavailable','reason':'HTTP'},headers={'Origin':'http://foreign.test'})
+        self.assertEqual(response.status,403)
+
+    async def test_no_voice_status_requires_an_explicit_valid_reason(self):
+        for body in [[],{'state':'ready','reason':'not an audio file'},{'state':'unavailable','reason':42}]:
+            response=await self.client.post('/api/recordings/go2w-test/audio-status',json=body)
+            self.assertEqual(response.status,400)
 
 
 if __name__ == '__main__':

@@ -115,7 +115,7 @@ CONFIG_DIRS = [os.environ.get('GO2W_CONFIG_DIR') or '',
                '/opt/go2w/base/go2w_bringup/share/go2w_bringup/config',
                '/go2w/ws/src/go2w_bringup/config']
 # 录包上传到常驻服务器 166:~/go2w_bags。密钥在 data/ssh（不随 sync.sh 同步）；166 上这把钥匙被 rrsync 限制成只能往 go2w_bags 写
-UPLOAD_DEST = os.environ.get('GO2W_UPLOAD_DEST', 'evoengine@192.168.1.22:')
+UPLOAD_DEST = os.environ.get('GO2W_UPLOAD_DEST', 'evoengine@192.168.1.166:')
 UPLOAD_LABEL = os.environ.get('GO2W_UPLOAD_LABEL', '166:~/go2w_bags')
 # 录包容量上限：data/bags 总量超过 BAG_LIMIT_GB，或磁盘剩余不到 BAG_MIN_FREE_GB，就从最旧的开始删「已上传到 166」的包；
 # 没上传的不自动删，只报警并拒绝开始新的录包；正在录的包自己就超过上限（或磁盘快满）时自动停止录包
@@ -149,6 +149,7 @@ def robot_id():
 ROLLBACK_BUFFER = 35          # 前20+后10，并给请求轮询保留5秒余量；字节上限仍生效
 ROLLBACK_RETRY = 30.0         # 回溯进程退出后，隔多久再拉起来
 ROLLBACK_SAVE_TIMEOUT = 20.0  # 等存包完成的最长时间
+BAG_VOICE_WAIT = 45.0        # 一键上传先等本次语音落盘，超时不能只传数据却标为整包成功
 # 卡住自动保存：导航目标没结束、底盘已解锁、没急停，odom 位置在 STUCK_MOVE 内、朝向在 STUCK_TURN 内
 # 持续 STUCK_SECONDS 就算卡住；以判定卡住的那一刻为中心，存前 STUCK_BEFORE 秒 + 后 STUCK_AFTER 秒（go2w_ 开头，
 # 11-12 起 15 + 15 = 30 秒；原来是 2 秒后存最近 20 秒），两次自动保存至少隔 STUCK_COOLDOWN
@@ -1500,11 +1501,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             pass
         self.uploads_file = os.path.join(DATA, 'bag_uploads.json')
         self.uploads = {}             # 包名 → {state: run/done/fail, pct, msg}；done 的存进 bag_uploads.json
-        try:
-            with open(self.uploads_file) as f:
-                self.uploads = {k: {'state': 'done', 'pct': 100, 'msg': v} for k, v in json.load(f).items()}
-        except (OSError, ValueError, AttributeError):
-            pass
+        self.restore_upload_receipts()
+        self.recording_api = RecordingAPI(os.path.join(DATA, 'bags'), self.static_dir,
+                                          uploads=self.uploads, on_change=self.bag_content_changed)
         self.routes_file = os.path.join(DATA, 'routes.json')
         self.routes = {}
         self.routes_error = False
@@ -1856,7 +1855,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 request_id = d.get('request_id')
                 if request_id is not None and (not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request_id)):
                     return False, '录制请求ID无效'
-                ok, msg = await self.rollback_save(self.remote(ws), trigger=True, after=ROLLBACK_AFTER, request_id=request_id)
+                voice_seconds = d.get('voice_seconds')
+                if voice_seconds is not None and (type(voice_seconds) is not int or not 1 <= voice_seconds <= 20):
+                    return False, '语音时长必须是1–20秒整数'
+                ok, msg = await self.rollback_save(self.remote(ws), trigger=True, after=ROLLBACK_AFTER, request_id=request_id, voice_seconds=voice_seconds)
                 if ok:
                     bag = next((b for b in self.bags if b['name'] == self.rollback_last), {})
                     return ok, msg, {'name': self.rollback_last, 'duration_s': bag.get('dur'), 'requested_s': ROLLBACK_SECONDS + ROLLBACK_AFTER}
@@ -4233,7 +4235,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False),
                                  headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
-    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None):
+    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None, voice_seconds=None):
         """trigger：人在网页上点「保存刚才 N 秒」→ 包名 狗编号_trigger_MMDD_HHMMSS；异常自动保存不带（11-24）。"""
         if not (self.procs_status or {}).get('rollback'):
             return False, '回溯录制没在运行：先打开回溯，并启动建图 / 定位 / 导航'
@@ -4249,7 +4251,8 @@ class Server(TaughtWeb, RT.RtabWeb):
         if after:
             base += '_r'  # 独立后缀避免收集后10秒期间与普通分段同名。
         name, k = base, 1
-        while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))):
+        by_name = os.path.join(bags_dir, '.captures', 'by-name')
+        while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))) or (after and os.path.exists(os.path.join(by_name, name + '.json'))):
             k += 1
             name = f'{base}_{k}'
         error, done = os.path.join(work, f'{name}.error'), os.path.join(bags_dir, name, 'metadata.yaml')
@@ -4257,6 +4260,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             capture = {'name': name, 'request_id': request_id, 'clicked_ns': clicked_ns,
                        'start_ns': clicked_ns - int(seconds*1e9), 'end_ns': end_ns,
                        'before_s': seconds, 'after_s': after}
+            if voice_seconds is not None:
+                capture['voice'] = {'state': 'pending', 'requested_s': voice_seconds}
             if request_id:
                 manifests = os.path.join(bags_dir, '.captures')
                 os.makedirs(manifests, exist_ok=True)
@@ -4265,6 +4270,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                         json.dump(capture, f)
                 except FileExistsError:
                     return False, '本次录制请求已提交，请按请求ID核对结果'
+            if after:
+                os.makedirs(by_name, exist_ok=True)
+                capture_registration = os.path.join(by_name, name + '.json')
+                with open(capture_registration, 'x') as f:
+                    json.dump(capture, f)
             if after:
                 await asyncio.sleep(after)
                 if not (self.procs_status or {}).get('rollback'):
@@ -4284,8 +4294,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                     return False, f'回溯保存失败：{why}'
                 if os.path.exists(done):
                     if after:
-                        with open(os.path.join(bags_dir, name, 'capture.json'), 'w') as f:
-                            json.dump(capture, f)
+                        try:
+                            os.link(capture_registration, os.path.join(bags_dir, name, 'capture.json'))
+                        except FileExistsError:
+                            pass  # API可能已依据预登记同步语音状态，不覆盖后到的更新。
                     self.bags = P.list_bags(bags_dir)
                     b = next((x for x in self.bags if x['name'] == name), {})
                     info = f"{b.get('dur') or 0:.0f} 秒，{b.get('size', 0):.0f} MB"
@@ -4297,6 +4309,49 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '回溯保存超时，看 data/logs/rollback.log'
         finally:
             self.rollback_saving = False
+
+    def restore_upload_receipts(self):
+        try:
+            with open(self.uploads_file) as f:
+                receipts = json.load(f)
+            for name, value in receipts.items():
+                if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
+                    continue
+                bag = os.path.join(DATA, 'bags', name)
+                if isinstance(value, dict):
+                    fingerprint = value.get('bundle_fingerprint')
+                    try:
+                        with open(os.path.join(bag, 'recording-link.json'), 'rb') as f:
+                            current = hashlib.sha256(f.read()).hexdigest()
+                    except OSError:
+                        current = None
+                    done = bool(fingerprint and fingerprint == current)
+                    msg = value.get('msg', '')
+                elif isinstance(value, str):
+                    fingerprint, msg = None, value
+                    done = not any(os.path.exists(os.path.join(bag, fn)) for fn in ('voice-note.audio', 'voice-note.json', 'capture.json'))
+                    done = done and not os.path.exists(os.path.join(DATA, 'bags', '.captures', 'by-name', name + '.json'))
+                else:
+                    continue
+                self.uploads[name] = {'state': 'done' if done else 'stale', 'pct': 100 if done else 0,
+                                      'msg': msg if done else '旧上传回执未核对数据与录音，请重新上传整包',
+                                      **({'bundle_fingerprint': fingerprint} if fingerprint else {})}
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def save_upload_receipts(self):
+        done = {k: {'msg': u['msg'], 'bundle_fingerprint': u['bundle_fingerprint']} if u.get('bundle_fingerprint') else u['msg']
+                for k, u in self.uploads.items() if u['state'] == 'done'}
+        try:
+            with open(self.uploads_file, 'w') as f:
+                json.dump(done, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    def bag_content_changed(self, name):
+        if self.uploads.get(name, {}).get('state') == 'done':
+            self.uploads[name] = {'state': 'stale', 'pct': 0, 'msg': '语音备注已更新，请重新上传整包'}
+            self.save_upload_receipts()
 
     async def bag_upload(self, name, who):
         """rsync 把 data/bags/<name> 传到 166:~/go2w_bags/<name>。同一时间只传一个；进度和结果进网页日志。"""
@@ -4316,7 +4371,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         key = os.path.join(DATA, 'ssh', 'id_ed25519')
         if not os.path.exists(key) or not shutil.which('rsync') or not shutil.which('ssh'):
             return False, '扩展坞上缺上传工具：需要 data/ssh 密钥，以及镜像里的 rsync / ssh（重建 go2w-humble 镜像）'
-        self.uploads[name] = {'state': 'run', 'pct': 0, 'msg': '连接中'}
+        self.uploads[name] = {'state': 'run', 'phase': 'waiting', 'pct': 0, 'msg': '等待语音备注后一起上传'}
         asyncio.create_task(self.bag_upload_run(name, bag['size'], key, who))
         return True, f'开始上传 {name} → {UPLOAD_LABEL}'
 
@@ -4324,9 +4379,14 @@ class Server(TaughtWeb, RT.RtabWeb):
         n, t0 = self.node, time.monotonic()
         ssh = (f'ssh -i {key} -o UserKnownHostsFile={os.path.join(DATA, "ssh", "known_hosts")} '
                '-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10')
-        n.event('INFO', f'开始上传录包 {name}（{size:.0f} MB）→ {UPLOAD_LABEL}（{who}）')
+        n.event('INFO', f'准备整包上传 {name} → {UPLOAD_LABEL}（{who}，先核对语音备注）')
         tail, last_pct = deque(maxlen=6), 0
         try:
+            await self.recording_api.wait_bundle(name, BAG_VOICE_WAIT)
+            with open(os.path.join(DATA, 'bags', name, 'recording-link.json'), 'rb') as f:
+                bundle_fingerprint = hashlib.sha256(f.read()).hexdigest()
+            # 从此处到启动rsync之间不让语音文件再变动，避免目录扫描时漏掉后到的录音。
+            self.uploads[name] = {'state': 'run', 'phase': 'sending', 'pct': 0, 'msg': '数据、录音与匹配信息一起上传'}
             p = await asyncio.create_subprocess_exec(
                 'rsync', '-rt', '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
                 os.path.join(DATA, 'bags', name), UPLOAD_DEST,
@@ -4346,7 +4406,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     parts = line.split()
                     if len(parts) >= 3 and parts[1].endswith('%') and parts[1][:-1].isdigit():
                         pct = int(parts[1][:-1])
-                        self.uploads[name] = {'state': 'run', 'pct': pct, 'msg': parts[2]}
+                        self.uploads[name] = {'state': 'run', 'phase': 'sending', 'pct': pct, 'msg': parts[2]}
                         if pct // 25 > last_pct // 25 and pct < 100:
                             n.event('INFO', f'上传 {name}：{pct}%（{parts[2]}）')
                         last_pct = max(last_pct, pct)
@@ -4354,17 +4414,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                         tail.append(line)
             code = await p.wait()
         except Exception as e:
-            code, tail = -1, deque([repr(e)])
+            code, tail = -1, deque([getattr(e, 'text', None) or str(e) or repr(e)])
         dt = time.monotonic() - t0
         if code == 0:
             msg = time.strftime('%m-%d %H:%M')
-            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg}
-            done = {k: u['msg'] for k, u in self.uploads.items() if u['state'] == 'done'}
-            try:
-                with open(self.uploads_file, 'w') as f:
-                    json.dump(done, f, ensure_ascii=False, indent=1)
-            except OSError:
-                pass
+            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg, 'bundle_fingerprint': bundle_fingerprint}
+            self.save_upload_receipts()
             n.event('INFO', f'已上传录包 {name} → {UPLOAD_LABEL}/{name}（{size:.0f} MB，用时 {dt:.0f} s）')
         else:
             why = ' | '.join(tail) or f'rsync 退出码 {code}'
@@ -5878,7 +5933,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/', self.index)
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
-        RecordingAPI(os.path.join(DATA, 'bags'), self.static_dir).routes(app)
+        self.recording_api.routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）

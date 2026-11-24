@@ -83,12 +83,21 @@ export function createRollbackCapture(store, src, notify = () => {}){
 
   async function upload(){
     const pending=state.pending;
-    const response=await fetch(`/api/recordings/${encodeURIComponent(pending.name)}/audio?duration=${pending.duration}`,{
+    const response=await fetch(`/api/recordings/${encodeURIComponent(pending.name)}/audio?duration=${pending.duration}&request_id=${encodeURIComponent(pending.requestId)}`,{
       method:'POST',headers:{'Content-Type':pending.blob.type},body:pending.blob,
       signal:AbortSignal.timeout(15000),
     });
     if(!response.ok) throw Error((await response.text()).slice(0,160) || `HTTP ${response.status}`);
     state.pending=null;
+  }
+
+  async function markUnavailable(name, reason, requestId){
+    if(src.name==='mock')return;
+    const response=await fetch(`/api/recordings/${encodeURIComponent(name)}/audio-status`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:'unavailable',reason,request_id:requestId}),
+      signal:AbortSignal.timeout(15000),
+    });
+    if(!response.ok)throw Error((await response.text()).slice(0,160) || `HTTP ${response.status}`);
   }
 
   const api = {
@@ -103,18 +112,23 @@ export function createRollbackCapture(store, src, notify = () => {}){
       const requestId=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       try {
         // 先发送保存请求，首次麦克风授权的等待不改变录包窗口。
-        const bag=Promise.resolve(src.cmd.saveRollback(requestId)).catch(e=>({ok:false,uncertain:true,msg:e.message})).then(r=>{
+        const bag=Promise.resolve(src.cmd.saveRollback(requestId,state.seconds)).catch(e=>({ok:false,uncertain:true,msg:e.message})).then(r=>{
           if(!r?.ok && !r?.uncertain){cancelled=true;cancelVoice?.();}return r;
         });
         const audio=recordVoice().catch(e=>{voiceError=e.message;return null;});
         [result,voice]=await Promise.all([bag,audio]);
         if(voice)state.pending={...voice,name:result?.ok ? result.data?.name : null,requestId};
+        else if(result?.uncertain)state.pending={name:null,requestId,unavailableReason:voiceError || '语音未录制'};
         if(result?.uncertain){state.message='连接中断，正在按本次请求核对录包…';emit();result=await recover(requestId,15);if(result.ok && state.pending)state.pending.name=result.data.name;}
         if(!result?.ok){message(`${result?.msg || '录包未完成，请检查结果列表'}${voice?'；语音可先下载到本机':''}`,'err');return;}
         const actual=result.data?.duration_s, wanted=result.data?.requested_s ?? 30;
         const partial=Number.isFinite(actual) && actual<wanted-1;
         const saved=partial?`数据包仅覆盖 ${actual.toFixed(1)} 秒（目标 ${wanted} 秒，缓存可能不足）`:'数据包已保存';
-        if(!voice){message(`${saved}；${voiceError || '语音未录制'}`,'warn');return;}
+        if(!voice){
+          try{await markUnavailable(result.data.name,voiceError || '语音未录制',requestId);state.pending=null;message(`${saved}；${voiceError || '语音未录制'}`,'warn');}
+          catch(e){state.pending={name:result.data.name,requestId,unavailableReason:voiceError || '语音未录制'};message(`${saved}；${voiceError || '语音未录制'}；状态同步失败，可重试后上传整包`,'warn');}
+          return;
+        }
         if(!state.pending.name){message('数据包已保存，但后端未返回包名；语音可下载，请更新后端','warn');return;}
         if(src.name==='mock'){state.pending=null;message('已保存前20秒＋后10秒（模拟），语音不写入机器人');return;}
         state.message='数据包已保存，正在保存语音…';emit();
@@ -129,11 +143,20 @@ export function createRollbackCapture(store, src, notify = () => {}){
       state.busy=true;emit();
       try{
         if(!state.pending.name){const result=await recover(state.pending.requestId);if(!result.ok)throw Error(result.msg);state.pending.name=result.data.name;}
-        await upload();message('语音备注已保存');
+        if(state.pending.unavailableReason){await markUnavailable(state.pending.name,state.pending.unavailableReason,state.pending.requestId);state.pending=null;message('已同步本次没有录音的原因，可上传数据包','warn');}
+        else{await upload();message('语音备注已保存');}
       }catch(e){message(`语音上传失败：${e.message}`,'warn');}
       finally{state.busy=false;emit();}
     },
-    discard(){if(!state.busy){state.pending=null;emit();}},
+    async discard(){
+      if(state.busy || !state.pending)return;
+      state.busy=true;emit();
+      try{
+        if(!state.pending.name){const result=await recover(state.pending.requestId);if(!result.ok)throw Error(result.msg);state.pending.name=result.data.name;}
+        await markUnavailable(state.pending.name,'用户结束本次语音处理，未随包保存录音',state.pending.requestId);state.pending=null;message('已结束语音处理，匹配信息会注明本包无录音','warn');
+      }catch(e){state.pending=null;message('已结束本地语音处理；服务端状态未确认，请在结果列表核对，并按需结束待处理语音','warn');}
+      finally{state.busy=false;emit();}
+    },
   };
   return api;
 }
@@ -150,7 +173,7 @@ export function setupRecordingControls(capture, root=document){
     status.textContent=state.recording?`正在录语音 · 剩余 ${state.remaining} 秒` : state.message;
     status.dataset.kind=state.kind;
     retry.hidden=!state.pending?.requestId;retry.disabled=state.busy;
-    download.hidden=discard.hidden=!state.pending;discard.disabled=state.busy;
+    download.hidden=!state.pending?.blob;discard.hidden=!state.pending;discard.disabled=state.busy;
     if(blob!==state.pending?.blob){
       if(url)URL.revokeObjectURL(url);blob=state.pending?.blob;url=blob?URL.createObjectURL(blob):null;
       if(url){download.href=url;download.download=`${state.pending.name || 'voice-note'}.${blob.type.startsWith('audio/mp4')?'m4a':blob.type.startsWith('audio/ogg')?'ogg':'webm'}`;}

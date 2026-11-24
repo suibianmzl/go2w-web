@@ -25,9 +25,9 @@ globalThis.MediaRecorder = class {
   start(){this.state='recording';}
   stop(){this.state='inactive';this.ondataavailable({data:new Blob(['voice'],{type:this.mimeType})});this.onstop();}
 };
-let resolveBag;
+let resolveBag, requestedVoiceSeconds;
 const store = { link:{ok:true}, rollback:{run:true,saving:false} };
-const src = { name:'ros', cmd:{ saveRollback:() => { saves++; return new Promise(resolve=>resolveBag=resolve); } } };
+const src = { name:'ros', cmd:{ saveRollback:(_requestId,voiceSeconds) => { saves++;requestedVoiceSeconds=voiceSeconds;return new Promise(resolve=>resolveBag=resolve); } } };
 globalThis.fetch = async (url, options) => { uploads.push({url,options});return {ok:true,json:async()=>({})}; };
 const capture = M.createRollbackCapture(store,src);
 assert.equal(capture.state.seconds,5);
@@ -37,6 +37,7 @@ capture.setSeconds('bad'); assert.equal(capture.state.seconds,5);
 const run = capture.save();
 await flush();
 assert.equal(saves,1);
+assert.equal(requestedVoiceSeconds,5,'请求先声明本次语音，提前点击一键上传时后端才能等待');
 assert.equal(capture.state.recording,true);
 await capture.save(); assert.equal(saves,1,'忙碌时的第二次按下不生成第二个包');
 await advance(5000);
@@ -51,7 +52,9 @@ assert.equal(capture.state.busy,false);
 globalThis.isSecureContext=false;
 const unavailable = capture.save(); await flush(); resolveBag({ok:true,data:{name:'bag-two'}}); await unavailable;
 assert.match(capture.state.message,/HTTPS/);
-assert.equal(uploads.length,1,'普通HTTP不能伪报录音已保存');
+assert.equal(uploads.filter(u=>u.url.includes('/audio?')).length,1,'普通HTTP不能伪报录音已保存');
+const missing=uploads.find(u=>u.url.includes('/audio-status'));
+assert.equal(JSON.parse(missing.options.body).state,'unavailable','明确上报无录音，整包上传不会永久等待');
 
 globalThis.isSecureContext=true;
 globalThis.fetch=async()=>{throw Error('offline');};
@@ -82,6 +85,12 @@ navigator.mediaDevices.getUserMedia=async()=>{const e=Error('denied');e.name='No
 const denied=capture.save();await flush();resolveBag({ok:true,data:{name:'denied-mic'}});await denied;
 assert.match(capture.state.message,/允许麦克风权限/);
 assert.equal(capture.state.pending,null);
+
+navigator.mediaDevices.getUserMedia=async()=>stream;
+const unsaved=capture.save();await flush();await advance(1000);resolveBag({ok:false,msg:'保存失败'});await unsaved;
+assert.ok(capture.state.pending?.blob);
+globalThis.fetch=async()=>({ok:true,json:async()=>({items:[]})});
+await capture.discard();assert.equal(capture.state.pending,null,'找不到包时也能明确结束本地处理并继续录制');
 
 const event = (overrides={}) => ({key:'Enter',shiftKey:true,repeat:false,isComposing:false,ctrlKey:false,altKey:false,metaKey:false,
  target:{closest:()=>null},preventDefault(){this.prevented=true;},...overrides});

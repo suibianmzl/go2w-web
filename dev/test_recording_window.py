@@ -98,7 +98,7 @@ class SaveTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(W, 'DATA', d), patch.object(W.time, 'time_ns', return_value=40*S), \
                     patch.object(W.time, 'strftime', return_value='go2w-01_0101_000000'), \
                     patch.object(W.asyncio, 'sleep', side_effect=advance):
-                ok, _ = await server.rollback_save('test', after=10, request_id='request-one')
+                ok, _ = await server.rollback_save('test', after=10, request_id='request-one', voice_seconds=20)
             self.assertTrue(ok)
             self.assertEqual(seen[0], 10)
             self.assertFalse(server.rollback_saving)
@@ -107,6 +107,7 @@ class SaveTests(unittest.IsolatedAsyncioTestCase):
             manifest=json.loads((Path(d)/'bags/.captures/request-one.json').read_text())
             self.assertEqual(manifest['name'],server.rollback_last)
             self.assertEqual((manifest['start_ns'],manifest['end_ns']),(20*S,50*S))
+            self.assertEqual(manifest['voice'],{'state':'pending','requested_s':20})
 
     async def test_auto_incident_waits_for_manual_collection_and_write(self):
         import go2w_web as W
