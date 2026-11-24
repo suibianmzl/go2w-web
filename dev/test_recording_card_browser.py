@@ -42,6 +42,9 @@ def main():
         assert topic['x']>heading['x']+heading['width'] and abs(topic['y']-heading['y'])<24
         start=card.get_by_role('button',name='开始持续录制',exact=True)
         current=card.locator('#rbSave')
+        expect(start).to_have_attribute('aria-keyshortcuts','Shift+R')
+        assert 'Shift+R' in start.get_attribute('title')
+        assert 'Shift+Enter' in current.get_attribute('title')
         expect(current).to_have_text('录制当前数据')
         for button in (start,current):
             expect(button).to_be_enabled()
@@ -59,8 +62,10 @@ def main():
         expect(card.locator('#voiceSeconds')).not_to_be_visible()
         card.locator('#bagSelBtn').click();expect(card.locator('#bagSelList')).to_be_visible()
         card.locator('h4').click();expect(card.locator('#bagSelPop')).not_to_be_visible()
-        start.click()
+        card.locator('h4').click();page.keyboard.press('Shift+R')
         expect(card.get_by_role('button',name='停止录制',exact=True)).to_be_visible(timeout=5000)
+        assert 'Shift+R' in card.locator('#bagBtn').get_attribute('title')
+        assert '停止持续录制' in card.locator('#bagBtn').get_attribute('title')
         expect(card.locator('#bagRecordingState')).to_have_text('正在录制中')
         expect(card.locator('#bagRecordingState')).to_be_visible()
         expect(card.locator('#bagSelBtn')).to_be_disabled()
@@ -75,7 +80,7 @@ def main():
         assert 44<=stop.bounding_box()['height']<=60
         card.screenshot(path=str(out/'mobile-recording.png'))
         page.set_viewport_size({'width':1440,'height':1000})
-        card.get_by_role('button',name='停止录制',exact=True).click()
+        card.locator('h4').click();page.keyboard.press('Shift+R')
         expect(start).to_be_visible(timeout=5000)
         expect(card.locator('#bagRecordingState')).not_to_be_visible()
         for width,height in [(1440,1000),(1050,850),(375,812),(812,375)]:
@@ -100,15 +105,18 @@ def main():
         page.set_viewport_size({'width':1440,'height':1000})
         before=page.evaluate('go2w.store.bags.length')
         history.locator('summary').click()
-        current.click();expect(current).to_be_disabled()
+        card.locator('h4').click();page.keyboard.press('Shift+Enter');expect(current).to_be_disabled()
         page.wait_for_function('(before)=>go2w.store.bags.length===before+1',arg=before,timeout=15000)
         expect(current).to_be_enabled(timeout=3000)
         expect(card.locator('#bagCount')).to_have_text(str(before+1))
         expect(card.locator('#bagList')).to_be_visible()
         page.reload(wait_until='networkidle')
         expect(card.locator('#bagList')).not_to_be_visible()
+        phone=context.new_page();phone.on('pageerror',lambda e:errors.append(str(e)))
+        phone.goto(args.url+'/record.html?mock',wait_until='networkidle')
+        expect(phone.locator('#recordButton')).to_be_enabled(timeout=5000)
         assert not errors,errors
-        print('PASS 录包列表默认折叠、点击/键盘展开收起、计数更新与录制卡片桌面/窄屏交互',flush=True)
+        print('PASS 持续录制/当前数据快捷键与悬停提示、列表折叠、桌面/窄屏交互及手机录制页加载',flush=True)
         browser.close()
 
 

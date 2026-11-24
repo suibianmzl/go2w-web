@@ -95,7 +95,14 @@ await capture.discard();assert.equal(capture.state.pending,null,'找不到包时
 const event = (overrides={}) => ({key:'Enter',shiftKey:true,repeat:false,isComposing:false,ctrlKey:false,altKey:false,metaKey:false,
  target:{closest:()=>null},preventDefault(){this.prevented=true;},...overrides});
 let hotkeys=0;
-const handler=M.rollbackShortcut(()=>hotkeys++);
+const handler=M.recordingShortcut(()=>hotkeys++);
 handler(event());handler(event({repeat:true}));handler(event({isComposing:true}));handler(event({target:{closest:()=>({})}}));
 assert.equal(hotkeys,1,'输入框、编辑区域、对话框、长按不触发快捷键');
+let toggles=0;
+const continuous=M.recordingShortcut(()=>toggles++,'r');
+continuous(event({key:'r'}));continuous(event({key:'R'}));
+for(const overrides of [{key:'Enter'},{shiftKey:false},{ctrlKey:true},{altKey:true},{metaKey:true},{repeat:true},{isComposing:true},{target:{closest:()=>({})}}]){
+  continuous(event({key:'R',...overrides}));
+}
+assert.equal(toggles,2,'Shift+R 大小写均可，其他组合、输入/弹窗及长按不触发');
 console.log('录音默认/边界、重复按下、关联、HTTP降级、失败重试及快捷键通过');

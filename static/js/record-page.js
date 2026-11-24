@@ -2,7 +2,7 @@ import { createStore } from './store.js';
 import { Bus } from './util.js';
 import { createRosSource } from './source/ros.js';
 import { createMockSource } from './source/mock.js';
-import { createRollbackCapture, rollbackShortcut, setupRecordingControls } from './recording-capture.js';
+import { createRollbackCapture, recordingShortcut, setupRecordingControls } from './recording-capture.js';
 import { confirmBox } from './ui.js';
 
 const get=id=>document.getElementById(id), store=createStore(), bus=new Bus();
@@ -12,7 +12,7 @@ const capture=createRollbackCapture(store,src);
 setupRecordingControls(capture);
 get('consoleLink').href=mock?'/?mock':'/';
 get('recordButton').onclick=()=>capture.save();
-window.addEventListener('keydown',rollbackShortcut(()=>capture.save()));
+window.addEventListener('keydown',recordingShortcut(()=>capture.save()));
 let started=0, wasBusy=false, lastKey='', loading=false;
 const cards=new Map();
 

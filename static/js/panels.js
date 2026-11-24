@@ -424,14 +424,14 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#bagBtn').textContent = bs==='run' ? '停止录制' : bs==='stop' ? '开始持续录制' : bs==='starting' ? '启动中…' : '停止中…';
     $('#bagBtn').dataset.state = bs;
     $('#bagRecordingState').hidden = bs !== 'run';
-    $('#bagBtn').title = bs==='run' && store.bagSegment ? `正在录制中，每 ${store.bagSegment} 秒保存一个包` : '持续录制，每30秒保存一个包';
+    $('#bagBtn').title = bs==='run' ? `Shift+R：停止持续录制，每 ${store.bagSegment || 30} 秒保存一个包` : bs==='stop' ? 'Shift+R：开始持续录制，每30秒保存一个包' : `Shift+R：正在${bs==='starting' ? '启动' : '停止'}持续录制，请稍候`;
     bagSync(); bagListRender();
     const noneSel = store.bagTopics === '';
     $('#bagSelBtn').disabled = bs !== 'stop';
     if (bs !== 'stop' && !$('#bagSelPop').hidden) bagOpen(false);
     $('#bagSelBtn').title = bs !== 'stop' ? '录包中不能改，先停止录包' : '';
     $('#bagBtn').disabled = bs==='starting' || bs==='stopping' || (bs==='stop' && noneSel);
-    if (bs==='stop' && noneSel) $('#bagBtn').title = '先在左边至少勾选一个 topic';
+    if (bs==='stop' && noneSel) $('#bagBtn').title = 'Shift+R：开始持续录制；请先勾选至少一个 topic';
   }
   $('#saveMap').onclick = () => actions.saveMap($('#mapName').value.trim() || 'map');
   $('#alignSelect').onclick = () => setTool('align');

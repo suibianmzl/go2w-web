@@ -1,11 +1,11 @@
 // 控制台和手机录制页共用：一次操作、一条录包请求、一段语音。
 const duration = value => Number.isFinite(+value) ? Math.max(1, Math.min(20, Math.round(+value))) : 5;
 
-export function rollbackShortcut(save){
+export function recordingShortcut(action, key='Enter'){
   return e => {
-    if (e.key !== 'Enter' || !e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.repeat || e.isComposing) return;
+    if (e.key.toLowerCase() !== key.toLowerCase() || !e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.repeat || e.isComposing) return;
     if (e.target?.closest?.('input,select,textarea,[contenteditable]:not([contenteditable="false"]),[role="dialog"],.scrim')) return;
-    e.preventDefault(); save();
+    e.preventDefault(); action();
   };
 }
 
