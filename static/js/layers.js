@@ -4,6 +4,7 @@ import { ACC, TRAJ } from './util.js';
 // heavy：数据量大，只有打开时后端才计算和发送（见 go2w_web.py 的 HEAVY）
 export const LAYERS = [
   { id:'map', name:'栅格地图', topic:'/map', c:'#5acdd6', on:true, ros:'/map' },
+  { id:'keepout', name:'禁行区', topic:'<地图>.keepout.json', c:'#ff4b5c', on:true, ros:'KeepoutFilter · 地图编辑里画' },
   { id:'gcost', name:'全局代价地图', topic:'/global_costmap/costmap', c:'#ff4fa3', on:false, ros:'/global_costmap/costmap', heavy:true },
   { id:'lcost', name:'局部代价地图', topic:'/local_costmap · 6×6 m', c:'#c964d6', on:true, ros:'/local_costmap · 6×6 m', heavy:true },
   { id:'cloud', name:'点云（俯视投影）', topic:'/cloud_registered_body', c:'grad', on:true, ros:'/cloud_registered_body · 0.3–1.6 m', heavy:true },

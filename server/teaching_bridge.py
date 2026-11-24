@@ -638,6 +638,8 @@ class TaughtWeb:
             await self.taught_push()
             return True, '示教已校验并随地图保存', await self.taught_document(name)
         if op == 'taught_prepare':
+            if not self.taught_repo.available:
+                raise TeachingError('示教导航已关闭：先在「示教采集」卡片里打开「启用示教导航」')
             if self.taught_open() and self._taught_capture['map'] != name:
                 raise TeachingError('请先结束另一张地图的采集')
             if self.taught_recording():

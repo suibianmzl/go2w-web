@@ -4,6 +4,7 @@ import { on } from './layers.js';
 import { toast } from './ui.js';
 import { rotatePoint, wallAngle, screenToWorld } from './map_alignment.js';
 import { createMapEditor } from './map_edit.js';
+import * as KO from './keepout.js';
 import { continuousRuns } from './taught_geometry.js';
 
 export function createMapView(store, actions){
@@ -33,7 +34,7 @@ export function createMapView(store, actions){
   const POSE_TOOLS = { init: '初始位姿' };
   const hint = $('#aimHint');
   // 地图编辑（v1.0.2）：编辑模式下地图图层换成编辑中的那份，指针交给编辑器
-  const editor = createMapEditor(store, actions, { exit: () => setTool('pan') });
+  const editor = createMapEditor(store, actions, { exit: () => setTool('pan'), onHint: () => showHint() });
   function showHint(){
     if (V.tool === 'taught'){ hint.hidden = false; hint.textContent = '沿已保存的琥珀轨迹，点选区间起点和终点 · 序号也可在右栏填写'; return; }
     if (V.tool === 'edit'){ hint.hidden = !editor.hint; hint.textContent = editor.hint; return; }
@@ -44,7 +45,9 @@ export function createMapView(store, actions){
     }
     if (V.tool === 'route'){
       hint.hidden = false;
-      hint.textContent = '点击添加一站 · 按住拖拽指定到站朝向';
+      const k = store.routeReplace;
+      hint.textContent = Number.isInteger(k) ? `给第 ${k + 1} 点重新选位置：点击地图 · 按住拖拽指定朝向 · Esc 取消`
+        : '点击添加一站 · 按住拖拽指定到站朝向';
       return;
     }
     const name = POSE_TOOLS[V.tool];
@@ -285,6 +288,8 @@ export function createMapView(store, actions){
         for (let i=0, k=0; i<pts.length; i+=2, k++) if (ok[k] === want) ctx.fillRect(sx(pts[i])-1.6, sy(pts[i+1])-1.6, 3.2, 3.2); }
     } else if (on('scan')){ const sc = store.scan; ctx.fillStyle = '#fff'; for (let i=0;i<sc.length;i+=2) ctx.fillRect(sx(sc[i])-1.2, sy(sc[i+1])-1.2, 2.4, 2.4); }
     // 小车画在路线下面：路径、局部轨迹、站点、目标点都压在车上，导航时路线更显眼
+    // 禁行区（v1.1.8）：编辑中由编辑器画工作副本，平时画这张图已保存的
+    if (!editor.active && on('keepout')) KO.draw(ctx, sx, sy, (store.keepouts || {})[store.mapCurrent], view.s);
     if (R.valid) drawRobot();
     drawTaught();
     const P = store.plan;
@@ -314,7 +319,8 @@ export function createMapView(store, actions){
         ctx.restore();
       }
       draft.points.forEach((p, i) => drawPin(p, String(i + 1),
-        draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false));
+        store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
+          : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false));
     }
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();
@@ -367,6 +373,7 @@ export function createMapView(store, actions){
       Object.assign(alignment(), { points:[], target:null, source:null });
     }
     if (tool==='teleop' && V.tool!=='teleop' && onTeleop && !onTeleop()) return;
+    if (tool !== 'route') store.routeReplace = null;   // 离开「导航点」= 取消重选位置
     V.tool = tool; $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool===tool));
     $('#teleHint').hidden = tool!=='teleop'; if (tool!=='measure') V.measure = [];
     V.aim = null; showHint();
@@ -466,7 +473,9 @@ export function createMapView(store, actions){
     if (d.tool === 'route'){
       if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
       const th = d.moved ? Math.atan2(d.y1 - d.y0, d.x1 - d.x0) : 0;
-      return actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved });
+      const replaced = actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved }) === true;
+      if (replaced) setTool('pan');   // 改完一站就退出，免得下一下误加新站
+      return;
     }
     if (d.moved) return commit(d.tool, d.x0, d.y0, d.x1, d.y1);           // 按住拖动
     if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
@@ -504,5 +513,7 @@ export function createMapView(store, actions){
   // 收到新的 /map：用户没动过视角才自动适配。建图时 slam_toolbox 每 ~2 s 发一次，
   // 以前无条件 fit()，放大了几秒就被拉回全图
   function onMap(){ if (!touched) fit(); }
-  return { draw, fit, onMap, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
+  // 右栏「禁行区」按钮：打开地图编辑并直接进禁行区页
+  function openKeepout(){ if (V.tool !== 'edit') setTool('edit'); return editor.openKeep(); }
+  return { draw, fit, onMap, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, openKeepout, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
 }

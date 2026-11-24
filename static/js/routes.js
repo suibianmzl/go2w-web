@@ -8,7 +8,7 @@ export function setupRouteEditor(store, actions, setTool){
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
   const rtV = $('#rtV'), rtW = $('#rtW');
-  let lastRoutes, lastMap, lastDraft, savedDraft = store.routeDraft, saving = false;
+  let lastRoutes, lastMap, lastDraft, lastReplace = null, savedDraft = store.routeDraft, saving = false;
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
@@ -27,6 +27,7 @@ export function setupRouteEditor(store, actions, setTool){
   const optsDirty = () => { const r = selected(); return !!r && savedDraft.id === r.id && !sameOpts(readOpts(), optsOf(r)); };
 
   function edit(route = null){
+    store.routeReplace = null;
     store.routeDraft = route ? { ...route, confirmed: true } : { id:null, map:null, points:[], confirmed:false };
     store.routeCheck = null;
     savedDraft = store.routeDraft;
@@ -120,8 +121,9 @@ export function setupRouteEditor(store, actions, setTool){
       select.replaceChildren(new Option(mine.length ? '选择任务…' : '这张地图还没有任务', ''), ...options);
       select.value = draft.id || '';
     }
-    if (draft !== lastDraft){
-      lastDraft = draft;
+    if (store.routeReplace != null && !(store.routeReplace < draft.points.length)) store.routeReplace = null;
+    if (draft !== lastDraft || store.routeReplace !== lastReplace){
+      lastDraft = draft; lastReplace = store.routeReplace;
       list.replaceChildren(...draft.points.map((p, i) => {
         const li = document.createElement('li'), label = document.createElement('span');
         const end = draft.confirmed && i === draft.points.length - 1;
@@ -130,6 +132,7 @@ export function setupRouteEditor(store, actions, setTool){
         label.textContent = `${i + 1} 号点${end ? (round.checked ? ' · 之后回到 1 号点' : ' · 终点') : ''} · ${heading}`;
         label.title = `坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
         label.classList.toggle('route-end', end);
+        li.classList.toggle('route-replacing', store.routeReplace === i);
         // 站名、备注：只改文字，不影响路径。保留规划结果和输入框焦点
         const textField = (el, key, cls, max, placeholder) => {
           el.className = cls;
@@ -166,7 +169,19 @@ export function setupRouteEditor(store, actions, setTool){
           return b;
         };
         const move = target => points => { [points[i], points[target]] = [points[target], points[i]]; };
-        li.append(label, button('↑', '上移第 ' + (i + 1) + ' 点', move(i - 1), i === 0),
+        // 改位置：点了以后地图上点一下（或按住拖朝向）只替换这一站；再点一次取消
+        const place = document.createElement('button');
+        const placing = store.routeReplace === i;
+        place.className = 'btn sm' + (placing ? ' on' : '');
+        place.textContent = placing ? '取消' : '改位置';
+        place.title = placing ? '取消重选第 ' + (i + 1) + ' 点位置' : '在地图上重新选第 ' + (i + 1) + ' 点的位置';
+        place.setAttribute('aria-label', place.title);
+        place.onclick = () => {
+          if (store.routeReplace === i){ store.routeReplace = null; setTool('pan'); }
+          else { store.routeReplace = i; setTool('route'); }
+          render();
+        };
+        li.append(label, place, button('↑', '上移第 ' + (i + 1) + ' 点', move(i - 1), i === 0),
           button('↓', '下移第 ' + (i + 1) + ' 点', move(i + 1), i === draft.points.length - 1),
           button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, pointNote);
         return li;

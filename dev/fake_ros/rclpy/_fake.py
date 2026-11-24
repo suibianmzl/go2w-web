@@ -55,6 +55,10 @@ class Client:
     def call_async(self, req):
         fut = Future()
         sim = self.node.fake_sim
+        # 模拟真机负载高时闸门参数服务不回应（11-20）：有这个文件就永远不回
+        import os
+        if self.name == '/go2w_mapping_scan_gate/get_parameters' and os.path.exists('/tmp/go2w_fake_gate_hang'):
+            return fut
         # 真服务的回复是异步的：放到模拟器线程里处理，回调不在调用方线程触发
         sim.later(lambda: fut.set_result(sim.call_service(self.name, req)))
         return fut

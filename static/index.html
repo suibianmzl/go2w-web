@@ -77,6 +77,11 @@
           <button class="btn sm" id="poseUp">站起</button>
           <button class="btn sm danger" id="poseDown">趴下</button>
         </div>
+        <!-- 爬台模式：融合策略（rough + climb 同时加载）才显示；开着时后端 5 Hz 发 2101，关掉 / 网页断开 1 s 内回 rough -->
+        <div class="pose-row" id="climbRow" hidden>
+          <span class="pose-txt" id="climbTxt">--</span>
+          <button class="btn sm" id="climbBtn">开爬台模式</button>
+        </div>
         <!-- 运控策略：只能趴着时切换（后端停掉运控、换策略重启） -->
         <div class="pose-row" id="policyRow" hidden>
           <span class="pose-txt">策略</span>
@@ -126,6 +131,8 @@
         </div>
         <div class="hud medit" id="medit" hidden>
           <div class="medit-head"><b>地图编辑</b><span class="mono" id="meditName"></span><span class="sp"></span><button class="ib" id="meditClose" title="退出编辑" aria-label="退出地图编辑"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+          <div class="seg medit-tabs" id="meditTabs" role="tablist" aria-label="编辑内容"><button data-tab="map" title="去噪、擦除、画墙、裁剪：改地图本身，另存为新地图">修地图</button><button data-tab="keep" title="禁行线、禁行区域：不改地图，存在这张图上，导航中保存马上生效">禁行区</button></div>
+          <div class="medit-pane" id="meditMapPane">
           <div class="seg medit-tools" id="meditTools" role="group" aria-label="编辑工具">
             <button data-et="pan">平移</button><button data-et="free">擦成空地</button><button data-et="occ">画墙</button><button data-et="unknown">擦成未知</button><button data-et="crop">裁剪</button>
           </div>
@@ -137,6 +144,18 @@
           </div>
           <div class="medit-row"><button class="btn sm ghost" id="meditUndo" title="撤销（Ctrl/⌘+Z）">撤销</button><button class="btn sm ghost" id="meditRedo" title="重做（Ctrl/⌘+Shift+Z）">重做</button><button class="btn sm ghost" id="meditCompare" title="按住看原图">按住看原图</button><span class="sp"></span><span class="medit-dirty" id="meditDirty"></span></div>
           <button class="btn pri medit-save" id="meditSave">另存为新地图…</button>
+          </div>
+          <div class="medit-pane" id="meditKeepPane" hidden>
+            <div class="seg medit-tools" id="keepTools" role="group" aria-label="禁行区工具">
+              <button data-kt="pan">平移</button><button data-kt="line">禁行线</button><button data-kt="zone">禁行区域</button><button data-kt="del">删除</button>
+            </div>
+            <div class="medit-hint" id="keepHint"></div>
+            <button class="btn sm" id="keepFinish" hidden>完成这一条</button>
+            <div class="keep-list" id="keepList"></div>
+            <div class="medit-row"><button class="btn sm ghost" id="keepUndo" title="撤销（Ctrl/⌘+Z）">撤销</button><button class="btn sm ghost" id="keepRedo" title="重做（Ctrl/⌘+Shift+Z）">重做</button><span class="sp"></span><span class="medit-dirty" id="keepDirty"></span></div>
+            <div class="keep-live" id="keepLive"></div>
+            <button class="btn pri medit-save" id="keepSave">保存禁行区</button>
+          </div>
         </div>
         <div class="mode-tag" id="mapTag" hidden>建图中 · slam_toolbox</div>
         <div class="tele" id="teleHint" hidden>
@@ -252,7 +271,7 @@
             <div class="step-h"><div class="step-n"><span>1</span></div><div class="step-t">地图<span class="step-s" id="stMapSub"></span></div><button class="btn sm ghost step-more" data-open="stMap" hidden>更改</button></div>
             <div class="step-b">
               <p class="hint" id="navMapHint">导航不用先开：选好地图就能编辑任务，点「出发」时用这张图启动导航。</p>
-              <div class="inrow"><select id="navMapSel" aria-label="地图"></select><button class="btn sm" id="navMapLoad">切换</button><button class="btn sm ghost" id="navMapMgr" title="删除不用的地图">管理</button></div>
+              <div class="inrow"><select id="navMapSel" aria-label="地图"></select><button class="btn sm" id="navMapLoad">切换</button><button class="btn sm ghost" id="navMapRename" title="给下拉框里选中的地图起个显示名（可以中文）">改名</button><button class="btn sm ghost" id="navMapMgr" title="删除不用的地图">管理</button></div>
             </div>
           </div>
           <div class="step" id="stRoute" data-s="todo">
@@ -331,6 +350,7 @@
 
       <section class="panel card" id="flowTaught" hidden>
         <div class="card-h"><h3>示教采集</h3><span class="pill" id="taughtState">未读取</span></div>
+        <div class="inrow rb-row taught-nav-row"><label class="bag-livox"><input type="checkbox" id="taughtNavOn"> 启用示教导航</label><span class="meta rb-state" id="taughtNavState"></span></div>
         <p class="hint">每张地图保存一条参考轨迹。</p>
         <label class="taught-label" for="taughtMapSel">使用的地图</label>
         <div class="inrow"><select id="taughtMapSel" aria-label="示教地图"></select><button class="btn sm ghost" id="taughtRefresh">读取</button></div>

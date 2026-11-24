@@ -70,6 +70,10 @@ export function createMockSource(store, bus){
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';
   try { store.mapViews = JSON.parse(localStorage.getItem(viewsKey) || '{}') || {}; } catch { store.mapViews = {}; }
+  const labelsKey = 'go2w.mock.mapLabels';
+  try { store.mapLabels = JSON.parse(localStorage.getItem(labelsKey) || '{}') || {}; } catch { store.mapLabels = {}; }
+  const keepKey = 'go2w.mock.keepouts';
+  try { store.keepouts = JSON.parse(localStorage.getItem(keepKey) || '{}') || {}; } catch { store.keepouts = {}; }
   const routesKey = 'go2w.mock.routes';
   try {
     const saved = JSON.parse(localStorage.getItem(routesKey) || '[]');
@@ -370,6 +374,10 @@ export function createMockSource(store, bus){
       store.routes = routes;
       return { ok:true, data:record };
     },
+    setTaughtNav(on){
+      store.taughtNav = { on, forced: null, installed: true };
+      return { ok:true, msg:`示教导航已${on ? '打开' : '关闭'}（模拟）` };
+    },
     setRollback(on){
       store.rollback = { ...store.rollback, on, run:on };
       return { ok:true, msg:`回溯录制已${on ? '打开' : '关闭'}（模拟）` };
@@ -387,6 +395,25 @@ export function createMockSource(store, bus){
         const pct = Math.min(100, u.pct + 20);
         store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } }; }, 600);
       return { ok:true, msg:`开始上传 ${name} → 166:~/go2w_bags（模拟）` };
+    },
+    setMapLabel(name, label){
+      label = String(label || '').split(/\s+/).filter(Boolean).join(' ');
+      if (label === name) label = '';
+      if (label.length > 32) return { ok:false, msg:'显示名最多 32 个字' };
+      const dup = Object.keys(store.mapLabels).find(k => k !== name && store.mapLabels[k] === label);
+      if (label && dup) return { ok:false, msg:`「${label}」已经是 ${dup} 的显示名了，换一个` };
+      const labels = { ...store.mapLabels };
+      if (label) labels[name] = label; else delete labels[name];
+      store.mapLabels = labels;
+      try { localStorage.setItem(labelsKey, JSON.stringify(labels)); } catch {}
+      return { ok:true, msg: label ? `已改名为「${label}」（模拟）` : `已恢复显示文件名 ${name}（模拟）` };
+    },
+    saveKeepout(map, shapes){
+      const all = { ...store.keepouts };
+      if (shapes.length) all[map] = shapes; else delete all[map];
+      store.keepouts = all;
+      try { localStorage.setItem(keepKey, JSON.stringify(all)); } catch {}
+      return { ok:true, msg: shapes.length ? `禁行区已保存（${shapes.length} 个，模拟：只存在这个浏览器里）` : '禁行区已清空（模拟）' };
     },
     deleteMaps(names){
       const busy = names.filter(n => n === store.mapCurrent);
@@ -502,7 +529,7 @@ export function createMockSource(store, bus){
       return { ok: true, msg: `已保存 ${c.name}（模拟）` };
     },
     contAbort(){ store.cont = null; store.contPaused = true; return { ok: true, msg: '已放弃（模拟）' }; },
-    simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
+    simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 5.0 s)');
       setTimeout(() => {
         if (routeActive()) cancelTask('网页断开，已取消路线任务');
         lock('web heartbeat lost');

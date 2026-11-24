@@ -7,7 +7,7 @@ import { storeTaughtDocument } from '../taught_geometry.js';
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
   'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
   'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
@@ -101,6 +101,8 @@ export function createRosSource(store, bus){
       case 'routes': store.routes = m.items; break;
       case 'taught': storeTaughtDocument(store, m); break;
       case 'map_views': store.mapViews = m.items || {}; break;
+      case 'map_labels': store.mapLabels = m.items || {}; break;
+      case 'keepout': store.keepouts = m.items || {}; break;
       case 'task': onTask(m.task); break;
       case 'pose': {
         const R = store.robot;
@@ -151,8 +153,10 @@ export function createRosSource(store, bus){
         store.lidar = m.lidar || null;   // 后端判定的雷达无数据：{ since, msg（含网络诊断） }
         store.rtab = m.rtab || null;     // RTAB 影子库：{ avail, auto, cur, last, pending, map, mapDb }
         store.webVersion = m.webVersion || null;
+        store.keepoutState = m.keepout || null;
         store.taughtAvailable = typeof m.taughtAvailable === 'boolean' ? m.taughtAvailable : null;
         store.taughtNavigation = typeof m.taughtNavigation === 'boolean' ? m.taughtNavigation : null;
+        store.taughtNav = m.taughtNav || null;   // 「启用示教导航」开关：{ on, forced: '0'/'1'/null, installed }
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
@@ -241,12 +245,16 @@ export function createRosSource(store, bus){
     lieDown: () => send('lie_down', {}, 15000),
     standHold: on => send('stand_hold', { on }),
     setPolicy: name => send('set_policy', { name }, 60000),   // 停运控 + 重启 + 等状态，失败还要退回
+    climb: on => send('climb', { on }),
     prepHold: () => send('prep_hold'),
     deleteRoute: route_id => send('route_delete', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
     deleteMaps: names => send('map_delete', { names }, 60000),
+    setMapLabel: (name, label) => send('map_label', { name, label }),
+    saveKeepout: (map, shapes) => send('keepout_save', { map, shapes }, 20000),
     uploadBag: name => send('bag_upload', { name }),
     setRollback: on => send('rollback_set', { on }),
+    setTaughtNav: on => send('set_taught_nav', { on }),
     saveRollback: () => send('rollback_save', {}, 25000),
     // vmax / wmax：这次的速度上限（导航没开时在网页上选的），后端出发前设给 cmd_bridge
     startRoute: (route_id, o = {}) => send('route_start', { route_id, round_trip: !!o.roundTrip, loops: o.loops ?? 1, arm: !!o.arm,
@@ -279,11 +287,11 @@ export function createRosSource(store, bus){
       if (k && !teleTimer) teleTimer = setInterval(tx, 100);
       if (!k && teleTimer){ clearInterval(teleTimer); teleTimer = null; }
     },
-    // 真实测试：停发心跳 3 s，后端应在超时后取消导航并上锁
+    // 真实测试：停发心跳 7 s，后端应在超时（5 s）后取消导航并上锁
     simulateDrop: () => {
-      pingPausedUntil = performance.now() + 3000;
-      log('WARN', 'go2w_web', '安全测试：停止发送心跳 3 s');
-      return Promise.resolve({ ok: true, msg: '已停止发心跳 3 s：如果底盘解锁着，应在约 1 s 后自动上锁' });
+      pingPausedUntil = performance.now() + 7000;
+      log('WARN', 'go2w_web', '安全测试：停止发送心跳 7 s');
+      return Promise.resolve({ ok: true, msg: '已停止发心跳 7 s：如果底盘解锁着，应在约 5 s 后自动上锁' });
     },
     notice: op => bus.emit('toast', NOT_YET[op] || LATER, 'warn'),
   };

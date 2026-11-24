@@ -1,6 +1,6 @@
 import { setupRouteEditor } from './routes.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
-import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount } from './util.js';
+import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount, mapTitle, mapOptText } from './util.js';
 import { LAYERS, L } from './layers.js';
 import { MODES, MODE_PKG } from './actions.js';
 
@@ -211,19 +211,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   $('#poseUp').onclick = () => actions.standUp();
   $('#poseDown').onclick = () => actions.lieDown();
   $('#poseHold').onclick = () => actions.standHold(!store.ctrl?.hold);
+  $('#climbBtn').onclick = () => actions.climb(!store.ctrl?.climb);
   let policyPicking = false;   // 确认框开着时不让渲染把下拉框改回去
   $('#policySel').onchange = e => { policyPicking = true; actions.setPolicy(e.target.value, () => { policyPicking = false; renderPose(); }); };
   const escPol = s => String(s).replace(/[<>&"]/g, '');
   function renderPose(){
     const C = store.ctrl, on = !!C?.on && store.link.ok;
     $('#chPose').hidden = $('#poseRow').hidden = !on;
-    if (!on) $('#policyRow').hidden = true;
+    if (!on) $('#policyRow').hidden = $('#climbRow').hidden = true;
     if (!on) return;
     const name = C.state == null ? '运控离线' : POSE[C.state] || String(C.state).replace(/[<>&"]/g, '');
     const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…' : C.state === 'FixStand' && !C.ready ? '站起中…'
       : C.lieIn != null ? `${Math.ceil(C.lieIn)} s 后趴下` : name;
     chip('#chPose', C.state == null ? 'crit' : C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
     renderPolicy(C);
+    renderClimb(C);
     const pt = $('#poseTxt');
     pt.className = 'pose-txt' + (C.lieIn != null ? ' warn' : '');
     pt.innerHTML = C.op === 'policy' ? '姿态 <b>切换策略中…</b> · 运控重启'
@@ -237,6 +239,26 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#poseDown').disabled = busy && C.op !== 'up';   // 站起过程中可以打断
     $('#poseHold').hidden = !(C.lieIn != null || C.hold);
     $('#poseHold').textContent = C.hold ? '取消保持' : '保持站立';
+  }
+  // 爬台模式：后端 ctrl.dual = 运控回报的 {policy, switching, req}，ctrl.climb = 网页开着爬台模式 {since, max}
+  function renderClimb(C){
+    const D = C.dual, row = $('#climbRow');
+    row.hidden = !D;
+    if (!D) return;
+    const on = !!C.climb, climbing = D.policy === 'climb';
+    const st = D.switching ? (climbing ? '切到 climb 中…' : '切回 rough 中…')
+      : D.req && !climbing ? '等速度降下来再切（vx≤0.5 vy≤0.15 wz≤0.15）'
+      : climbing ? (on ? 'climb（爬台中）' : 'climb（遥控器 RB）')
+      : on ? '已请求，等运控切换…' : 'rough';
+    const left = on && C.climb.max ? ` · 剩 ${Math.max(0, Math.ceil((C.climb.max - C.climb.since) / 60))} 分钟` : '';
+    const t = $('#climbTxt');
+    t.className = 'pose-txt' + (climbing || on ? ' warn' : '');
+    t.innerHTML = `爬台 <b>${st}</b>${left}`;
+    const b = $('#climbBtn');
+    b.textContent = on ? '关爬台模式' : '开爬台模式';
+    b.classList.toggle('danger', on);
+    b.disabled = !on && (!(C.state === 'Velocity' && C.ready) || !!C.op || store.estop);
+    setAttr(b, 'title', on ? '切回 rough' : '切到 climb 策略（只能站着时开）');
   }
   function renderPolicy(C){
     const sel = $('#policySel'), list = C.policies || [];
@@ -352,12 +374,27 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   }
   function renderHud(){
     const R = store.robot, m = store.map;
-    $('#hMap').textContent = m ? `${m.name} · ${m.cells} · ${+m.res.toFixed(3)} m` : '--';
+    $('#hMap').textContent = m ? `${mapTitle(store.mapLabels, m.name)} · ${m.cells} · ${+m.res.toFixed(3)} m` : '--';
     $('#hPose').textContent = R.valid ? `x ${fmt(R.x)}  y ${fmt(R.y)}  θ ${fmt(deg(R.th),1)}°` : '--';
     $('#hVel').textContent = R.valid ? `vx ${fmt(R.v)}  vy ${fmt(R.vy)}  wz ${fmt(R.w)}` : '--';
     $('#hFrame').textContent = `${store.fixed} → base_footprint`;
     const m1 = [.5,1,2,5,10].find(c => c*mapView.view.s >= 60) || 10;
     $('#scaleBar').style.width = (m1*mapView.view.s).toFixed(0)+'px'; $('#scaleTxt').textContent = m1+' m';
+  }
+
+  /* ---------- 示教导航开关（示教采集卡片顶上） ---------- */
+  // 开：下次开导航时带示教节点（常驻约 0.6 个核）；关：不带。导航正在跑时改了要重开导航才生效。
+  function renderTaughtNav(){
+    const t = store.taughtNav, box = $('#taughtNavOn'), st = $('#taughtNavState');
+    if (!box) return;
+    if (!t){ box.disabled = true; st.textContent = '后端没有这个开关（旧版本）'; return; }
+    if (document.activeElement !== box) box.checked = !!t.on;
+    box.disabled = !!t.forced || (!t.installed && !t.on);
+    const nodeUp = store.taughtNavigation === true, nav = run('navigation');
+    st.textContent = t.forced ? `由环境变量 GO2W_TAUGHT=${t.forced} 固定`
+      : !t.installed && !t.on ? '后端没有示教算法包'
+      : t.on ? (nodeUp ? '示教节点运行中（约 0.6 核）' : nav ? '下次出发会先重开导航带上示教' : '下次开导航时启动')
+      : nodeUp ? '已关闭，重开导航后示教节点才会停' : '已关闭（开导航不启动示教节点）';
   }
 
   /* ---------- 录包 ---------- */
@@ -424,10 +461,11 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const c = store.cont, busy = store.mapSaving || store.mapBusy;
     // 基准图下拉：列出所有地图，标一下有没有 posegraph（后端 preflight 会把关，这里只做提示）
     const names = store.maps.map(m => m.name);
-    if (contBaseFilled !== names.join(',')){
-      contBaseFilled = names.join(',');
+    const contKey = names.map(n => mapOptText(store.mapLabels, n)).join('\n');
+    if (contBaseFilled !== contKey){
+      contBaseFilled = contKey;
       const sel = $('#contBase'), keep = sel.value;
-      sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
+      sel.replaceChildren(...names.map(n => new Option(mapOptText(store.mapLabels, n), n)));
       if (names.includes(keep)) sel.value = keep;
       else { const def = names.find(n => n === 'lab_20261116') || names[0]; if (def) sel.value = def; }
     }
@@ -604,6 +642,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   bagSync();
   $('#bagBtn').onclick = () => actions.toggle('bag');
   $('#rbOn').onchange = e => actions.setRollback(e.target.checked);
+  $('#taughtNavOn').onchange = e => { const on = e.target.checked; Promise.resolve(actions.setTaughtNav(on)).then(r => { if (r?.ok === false) e.target.checked = !on; renderTaughtNav(); }); };
   $('#rbSave').onclick = () => actions.saveRollback();
   $('#bagList').onclick = e => {
     const b = e.target.closest('[data-del],[data-up]'); if (!b || b.disabled) return;
@@ -795,7 +834,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   return {
     fast(){ renderTask(); renderRoutes(); renderHud(); renderArm(); syncSliders(); }, // 5 Hz
     medium(){ renderVersion(); renderChips(); renderCharts(); renderProfiles(); renderAlignment(); renderCont(); renderTaughtLayer(); },  // 4 Hz
-    slow(){ renderTopics(); renderMaps(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
+    slow(){ renderTopics(); renderMaps(); renderTaughtNav(); $('#clock').textContent = new Date().toTimeString().slice(0,8); }, // 1 Hz
     pushHist,                                                      // 10 Hz
     toggleLeft, toggleRight,
   };

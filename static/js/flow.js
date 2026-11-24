@@ -2,7 +2,7 @@
 // 导航（11-12 改）：1 地图 → 2 导航任务（路线 + 运行参数 + 出发按钮）。选图、编辑任务都不用开导航（后端直接读地图文件）；
 // 点「出发」后自动：站立 → 启动导航（或切图）→ 自动定位 → 解锁并下发任务。不再用 Nav2 预先检查站间路径。
 // 建图 / 重定位标签照旧：点标签就切换机器人档位，切换时先停车（取消任务、底盘上锁）。
-import { $, $$, deg } from './util.js';
+import { $, $$, deg, mapTitle, mapOptText } from './util.js';
 import { toast, formBox, stillCheck } from './ui.js';
 
 export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
@@ -105,6 +105,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   const pickMap = () => { const v = mapSel.value; if (v && v !== store.mapCurrent) actions.loadMap(v); };
   $('#navMapLoad').onclick = pickMap;
   $('#navMapMgr').onclick = () => actions.manageMaps();
+  $('#navMapRename').onclick = () => actions.renameMap(mapSel.value);
   mapSel.onchange = () => { if (!up('navigation') && !up('localization')) pickMap(); };
   // 定位（出发流程里定位失败时手动补救）
   $('#navInitBtn').onclick = () => setTool('init');
@@ -283,7 +284,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
         : C.op === 'up' ? '站起中…（站稳约 2 s，再启动策略）'
         : C.state === 'Velocity' && C.ready ? '已站起，策略运行中'
         : C.state === 'Passive' ? '趴着，站起来' : C.state === 'FixStand' ? '站着，启动策略' : C.state || '收不到运控状态',
-      nav: navHere ? `运行中 · ${store.mapCurrent}` : prep.loadT ? `切换到地图 ${prep.map}…` : run('navigation') && taughtMissing() ? '启用示教导航中…（机器人保持静止）' : run('navigation') ? '等待地图…' : '启动中…（机器人保持静止）',
+      nav: navHere ? `运行中 · ${mapTitle(store.mapLabels, store.mapCurrent)}` : prep.loadT ? `切换到地图 ${prep.map}…` : run('navigation') && taughtMissing() ? '启用示教导航中…（机器人保持静止）' : run('navigation') ? '等待地图…' : '启动中…（机器人保持静止）',
       loc: store.initPose && navHere ? `(${R.x.toFixed(2)}, ${R.y.toFixed(2)}) · ${Math.round(deg(R.th)) || 0}°${m != null ? ` · 匹配率 ${m.toFixed(0)}%` : ''}`
         : store.autoLoc?.state === 'move' ? store.autoLoc.msg || '移动后重试…'
         : store.autoLoc?.state === 'run' ? '定位中…（机器人保持静止）' : '等待自动定位…',
@@ -344,7 +345,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     const pill = $('#stackPill');
     const ps = store.estop ? ['crit', '急停'] : starting ? ['warn', '启动中…'] : stopping ? ['warn', '停止中…'] : routeActive() ? ['run', '执行任务'] : stack ? ['ok', stack + '运行中'] : ['', '未运行'];
     if (pill.textContent !== ps[1]){ pill.dataset.s = ps[0]; pill.textContent = ps[1]; }
-    $('#stackTxt').textContent = stack ? `${stack}${starting ? '（启动中）' : ''}${store.mapCurrent && stack !== '建图' ? ' · ' + store.mapCurrent : ''}` : '无';
+    $('#stackTxt').textContent = stack ? `${stack}${starting ? '（启动中）' : ''}${store.mapCurrent && stack !== '建图' ? ' · ' + mapTitle(store.mapLabels, store.mapCurrent) : ''}` : '无';
     $('#armTxt').textContent = store.estop ? '急停' : store.armed == null ? '--' : store.armed ? '已解锁' : '已上锁';
 
     $('#flowNone').hidden = !!t;
@@ -364,18 +365,18 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       // 现在只在当前地图变化时同步；列表刷新时保留用户的选择
       // 11-18 修：store.maps 每条 state（2 Hz）都是新数组，原来按引用比较 → 每 0.5 s 重建一次选项，
       // 下拉框刚展开就被关掉 / 选择被冲掉（「选不上地图」）。现在按地图名比较，名单真的变了才重建
-      const mapKey = mapNames().join('\n');
+      const mapKey = mapNames().map(n => mapOptText(store.mapLabels, n)).join('\n');   // 显示名变了也重建
       if (mapKey !== lastMaps){
         const keep = mapSel.value;
         lastMaps = mapKey;
-        mapSel.replaceChildren(...mapNames().map(n => new Option(n, n)));
+        mapSel.replaceChildren(...mapNames().map(n => new Option(mapOptText(store.mapLabels, n), n)));
         if (keep && mapNames().includes(keep)) mapSel.value = keep;
         else if (store.mapCurrent) mapSel.value = store.mapCurrent;
       }
       if (store.mapCurrent !== lastMapCur){ lastMapCur = store.mapCurrent; if (store.mapCurrent) mapSel.value = store.mapCurrent; }
       const mapOk = !!store.mapCurrent;
       const navLive = up('navigation') || up('localization');
-      setStep('stMap', mapOk ? 'done' : 'cur', mapOk ? `${store.mapCurrent}${navLive ? ' · 导航在用' : ''}` : '等待地图');
+      setStep('stMap', mapOk ? 'done' : 'cur', mapOk ? `${mapTitle(store.mapLabels, store.mapCurrent)}${navLive ? ' · 导航在用' : ''}` : '等待地图');
       $('#navMapHint').textContent = navLive
         ? '导航正在用这张图：换图后 map_server 立即加载新图，要重新定位。'
         : '导航不用先开：选好地图就能编辑任务，点「出发」时用这张图启动导航。';

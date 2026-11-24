@@ -36,6 +36,8 @@ try {
   let r = await c.cmd('cont_parking', { base: 'lab_20261021' });
   ok('导航档：不是当前地图的停车点拒绝', !r.ok, r.msg);
   await c.cmd('initial_pose', { x: TRUE[0], y: TRUE[1], th: TRUE[2] });
+  // 设完位姿后端会清空匹配率重算（11-20）：先等它清空，再等新值上来，别读到设位姿之前的旧值
+  await c.until(() => c.state.loc?.match == null, 3000, '匹配率清空重算').catch(() => {});
   await c.until(() => (c.state.loc?.match ?? 0) >= 70, 15000, '匹配率上来');
   r = await c.cmd('cont_parking', { base: BASE });
   ok('导航档：定好位后记停车点', r.ok, r.msg);

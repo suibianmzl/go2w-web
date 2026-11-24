@@ -34,6 +34,8 @@ FAKE_SLAM_POSE_OFF = os.environ.get('GO2W_FAKE_SLAM_POSE_OFF')
 FAKE_FALL = os.environ.get('GO2W_FAKE_FALL', '/tmp/go2w_fake_fall')
 # 这个文件存在期间假里程计发散：速度 -20 m/s、位置每帧跑 2 m（摔倒后 FAST-LIO 的样子）
 FAKE_ODOM_WILD = os.environ.get('GO2W_FAKE_ODOM_WILD', '/tmp/go2w_fake_odom_wild')
+# 禁行层（v1.1.8）：导航档位里有 /filter_mask_server/load_map；这个文件存在时没有，模拟还没更新的旧导航镜像
+FAKE_NO_KEEPOUT = os.environ.get('GO2W_FAKE_NO_KEEPOUT', '/tmp/go2w_fake_no_keepout')
 # GO2W_FAKE_MAP_GROW=1：建图时 /map 每 2 s 发一次且内容在变（真机 slam 也是一直在发），测自动保存
 FAKE_MAP_GROW = os.environ.get('GO2W_FAKE_MAP_GROW') == '1'
 # GO2W_FAKE_SERIALIZE_FAIL=1：serialize_map 返回写文件失败
@@ -160,6 +162,9 @@ class Sim:
         self.ctrl_sent = None  # 上次发出的 (state, ready, seq)
         self.policy = os.environ.get('GO2W_CONTROL_POLICY') or 'mjlab_go2w_dgv2_m22_scratch_w02_7999'
         self.ctrl_off_until = 0.0   # 假运控重启（切策略）期间不发状态
+        # 假融合策略（rough + climb）：GO2W_FAKE_DUAL=1 或策略名带 fused。2101 {"climb":true} 1 s 续约，和真的一样
+        self.dual = ({'policy': 'rough', 'sw_t': None, 'until': 0.0}
+                     if os.environ.get('GO2W_FAKE_DUAL') == '1' or 'fused' in self.policy else None)
         self.taught_route_enabled = os.environ.get('GO2W_TAUGHT_ROUTE', '').lower() in ('1', 'true', 'yes', 'on')
         self.taught_map_yaml = os.path.join(DATA, 'maps', self.map_name + '.yaml')
         self.mode_environment = {'GO2W_NAVIGATION_MODE': 'navigation', 'GO2W_MAP': self.map_name + '.yaml'}
@@ -176,7 +181,20 @@ class Sim:
         c = self.ctrl
         return c['state'] != 'FixStand' or now - c['t'] >= self.CTRL_INTERP
 
+    def dual_step(self, now):
+        d = self.dual
+        if d is None:
+            return
+        if d['sw_t'] is not None and now - d['sw_t'] >= 0.5:
+            d['sw_t'] = None
+            self.rosout(20, 'go2w_ctrl', f"切换完成: {d['policy']}")
+        target = 'climb' if now < d['until'] else 'rough'
+        if d['sw_t'] is None and target != d['policy'] and abs(self.v) <= 0.5 and abs(self.w_) <= 0.15:
+            d.update(policy=target, sw_t=now)
+            self.rosout(20, 'go2w_ctrl', f'切换策略 -> {target}（过渡 0.5s）')
+
     def ctrl_step(self, now):
+        self.dual_step(now)
         r, c = self.ctrl_req, self.ctrl
         if r and now - r[1] > 0.2:
             self.ctrl_req = r = None
@@ -191,11 +209,17 @@ class Sim:
     def ctrl_msg(self, now, force):
         from std_msgs.msg import String
         c = self.ctrl
-        cur = (c['state'], self.ctrl_ready(now), c['seq'])
+        d = self.dual
+        extra = None if d is None else (d['policy'], d['sw_t'] is not None, now < d['until'])
+        cur = (c['state'], self.ctrl_ready(now), c['seq'], extra)
         if not force and cur == self.ctrl_sent:
             return None
         self.ctrl_sent = cur
-        return String('{"state":"%s","ready":%s,"seq":%d}' % (cur[0], 'true' if cur[1] else 'false', cur[2]))
+        j = '{"state":"%s","ready":%s,"seq":%d' % (cur[0], 'true' if cur[1] else 'false', cur[2])
+        if extra:
+            b = lambda v: 'true' if v else 'false'
+            j += ',"policy":"%s","switching":%s,"climb_req":%s' % (extra[0], b(extra[1]), b(extra[2]))
+        return String(j + '}')
 
     def load(self, yaml_path):
         self.grid, self.res, self.ox, self.oy = load_map(yaml_path)
@@ -428,6 +452,8 @@ class Sim:
             return self.ready('navigation')
         if name.startswith('/map_server/'):
             return self.loc_ready()
+        if name == '/filter_mask_server/load_map':
+            return self.ready('navigation') and not os.path.exists(FAKE_NO_KEEPOUT)
         # 续建：slam_toolbox 的三个服务只在建图档位里存在
         if name.startswith('/slam_toolbox/'):
             return self.ready('mapping')
@@ -468,6 +494,22 @@ class Sim:
                 return LoadMap.Response(1)
             self.load(path)
             self.deliver_map()
+            return LoadMap.Response(0)
+        if name == '/filter_mask_server/load_map':
+            # 和真机一样：读不到 / 不是 raw 掩膜就失败。加载了哪个记在 mask_loaded，测试里看后端 state.keepout
+            path = req.map_url
+            if path == '/go2w/data' or path.startswith('/go2w/data/'):
+                path = DATA + path[len('/go2w/data'):]
+            try:
+                with open(path, encoding='utf-8') as f:
+                    ok = 'mode: raw' in f.read()
+            except OSError:
+                ok = False
+            if not ok:
+                self.plog(40, 'filter_mask_server: 掩膜加载失败 %s' % req.map_url)
+                return LoadMap.Response(1)
+            self.mask_loaded = path
+            self.plog(20, 'filter_mask_server: Loading yaml file: %s' % req.map_url)
             return LoadMap.Response(0)
         if name == '/map_server/get_parameters':
             # 真机的 map_server：load_map 服务换图后，yaml_filename 参数仍是启动时的那张（11-06 实测）
@@ -559,7 +601,12 @@ class Sim:
             self.pat['points'].append((p.position.x, p.position.y, yaw))
             self.plog(20, '%s 点：(%.2f, %.2f)，朝向 %.0f°' % ('AB'[len(self.pat['points']) - 1], p.position.x, p.position.y, math.degrees(yaw)))
         elif topic == '/api/sport/request':
-            self.ctrl_req = (msg.header.identity.api_id, time.monotonic())
+            if msg.header.identity.api_id == 2101:
+                if self.dual is not None:
+                    on = '"climb":true' in msg.parameter.replace(' ', '')
+                    self.dual['until'] = time.monotonic() + 1.0 if on else 0.0
+            else:
+                self.ctrl_req = (msg.header.identity.api_id, time.monotonic())
         elif topic == '/cmd_vel':
             self.teleop = (msg.linear.x, msg.linear.y, msg.angular.z, time.monotonic())
 
@@ -843,7 +890,9 @@ class Sim:
     def tilt(self):
         """机身 (roll, pitch)，弧度：静止约 -0.4° / 0.9°，加速抬头、转弯侧倾，外加一点抖动。"""
         t = time.monotonic()
-        return (math.radians(-0.4 + 0.6*self.w_ + 0.06*math.sin(t*5.3)),
+        if self.ctrl['state'] != 'Passive':
+            self.fall_roll = 0.0          # 站起来了：不再侧躺
+        return (math.radians(-0.4 + 0.6*self.w_ + 0.06*math.sin(t*5.3) + getattr(self, 'fall_roll', 0.0)),
                 math.radians(0.9 + 1.5*self.v + 0.08*math.sin(t*7)))
 
     def build_costmap(self):
@@ -959,14 +1008,18 @@ def run(node):
         now = time.monotonic()
         sim.ctrl_step(now)
         if os.path.exists(FAKE_FALL):
+            # 文件内容 remote = 遥控器 LT+B 趴下（机身水平）；其他 = 摔倒（侧躺 80°，和运控姿态保护 > 57° 一致）
             try:
+                with open(FAKE_FALL) as f:
+                    how = f.read().strip()
                 os.unlink(FAKE_FALL)
             except OSError:
-                pass
+                how = ''
             if sim.ctrl['state'] != 'Passive':
                 sim.ctrl.update(state='Passive', seq=sim.ctrl['seq'] + 1, t=now)
                 sim.v = sim.w_ = 0.0
-                sim.rosout(30, 'go2w_ctrl', 'FSM: Change state to Passive (fall)')
+                sim.fall_roll = 0.0 if how == 'remote' else 80.0
+                sim.rosout(30, 'go2w_ctrl', f"FSM: Change state to Passive ({'remote LT+B' if how == 'remote' else 'fall'})")
         if os.path.exists(FAKE_MOVE):
             try:
                 with open(FAKE_MOVE) as f:

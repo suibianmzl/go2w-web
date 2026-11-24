@@ -10,7 +10,7 @@
   - 急停：取消所有导航目标 + 调 /go2w_cmd_bridge/arm(false)（cmd_bridge 立即发 StopMove 并上锁）。
     急停是锁存的：解除之前拒绝解锁和发目标；急停期间如果发现底盘被别处解锁，会再次上锁。
   - 心跳：网页每 0.5 s 发一次 ping。最近一个发过运动相关指令的网页是「控制方」；
-    控制方心跳超过 --heartbeat 秒（默认 1.0）或连接断开，而底盘处于解锁或有导航目标时，
+    控制方心跳超过 --heartbeat 秒（默认 5.0）或连接断开，而底盘处于解锁或有导航目标时，
     取消导航并上锁。恢复后保持上锁，必须手动重新解锁。
 
 WebSocket 协议
@@ -81,6 +81,7 @@ from geometry_msgs.msg import Pose2D
 
 import camera as C
 import incidents as INC
+import keepout as KO
 import mapcontinue as MC
 import mapmeta as MM
 import mapedit as ME
@@ -210,12 +211,28 @@ ODOM_WILD_SPEED = 4.0         # m/s：Go2W 实际最快约 1.2 m/s；11-19 发�
 ODOM_WILD_TURN = 8.0          # rad/s
 ODOM_WILD_JUMP = 1.0          # m：相邻两条 /odom（10 Hz）位置跳变
 FALL_LIE_GRACE = 3.0          # s：网页刚让狗趴下后的这段时间里掉到 Passive 不算意外
+# 摔倒 vs 遥控器趴下（11-23：11-20 晚上 4 次「意外趴下」倾角都很小、也没有 API 请求，应该是遥控器 LT+B，却被记成摔倒）：
+# 运控两种情况都不留原因。运控的姿态保护是机身倾角 > 1.0 rad（57°）才进 Passive，真摔倒后狗也是侧躺 / 翻着的；
+# 遥控器趴下是正常软着陆，机身基本水平。所以看掉到 Passive 前 FALL_TILT_PRE 秒到后 FALL_TILT_POST 秒内的
+# 最大倾角：≥ FALL_TILT_DEG 记「摔倒」（存包）；更小 = 遥控器趴下，只写日志。楼梯上正常走俯仰也有 40°，所以门限取 50°。
+# 拿不到姿态（planar_odom 没在跑）时分不清，照旧按摔倒记。
+FALL_TILT_DEG = 50.0
+FALL_TILT_PRE = 2.0           # s
+FALL_TILT_POST = 1.0          # s：真摔倒时姿态保护触发后还在倒，等一下再判断
 # 路线启动时离第 1 站不到这么远，就当已在第 1 站、直接去第 2 站：这么短的路径 RotationShim 不会先转正
 # （forward_sampling_distance 0.5），MPPI 只给出很小的速度，Go2W 不执行，会一直卡住
 ROUTE_NEAR_START = 0.5
 # 多点任务：Nav2 报未到达（差几厘米到 goal checker 0.15 m 判不过、收尾蹭不进去）时，
 # 机器人离该站不超过这么远就当作到了，继续下一站；更远才终止任务
 ROUTE_ARRIVE_TOL = 0.4
+# 11-20 到点卡顿：每站单独一个 NavigateToPose、带固定朝向 → 原地转到朝向、完全停下 ~1 s、再慢慢起步，每站多花 4–6 s。
+# 现在中间站（后面还有下一站的）不停车：朝向改成面向下一站，离站不到这么远就直接发下一站（Nav2 新目标顶替旧目标，
+# 控制器不停）。只有整条任务的最后一站才按自己的朝向停稳
+ROUTE_PASS_DIST = 0.6   # 实际取 min(0.6, 这段路长度的一半)
+# 11-20 晚：拐角大的站提前换目标会「开过点」——狗还在 0.4 m/s 往前冲，Nav2 换目标要 ~1 s，冲过去后倒车 ~1.5 s、
+# 再慢慢原地转，比停下来转还慢。所以只有拐角不超过这个角度（= RotationShim angular_dist_threshold 0.5 rad）
+# 的站才不停车经过；拐角大的站照常到点停下，但朝向仍面向下一站（只转一次，不会先转到站点朝向再转回来）
+ROUTE_PASS_TURN = 0.5
 ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
 # 地图显示方向（只转网页画面，不改地图坐标）：按地图名存在 data/map_views.json，大家看到的方向一样。
 # 建图时还没有地图名，用 MAPPING_VIEW 暂存，存图时带给新地图
@@ -322,6 +339,9 @@ CTRL_WAIT = 3.0        # s：每一步切换（插值走完之后）最多等这
 CTRL_INTERP = 2.0      # s：FixStand 从趴姿插值到站姿的时间（config.yaml 的 ts 末项）
 POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到新进程的 Passive
 CTRL_RESEND = 0.5      # s：请求还没被接受就重发（运控 0.2 s 后作废没取走的请求，DDS 也可能丢）
+# 爬台模式（11-23）：融合策略（rough + climb）下网页开关，开着时 5 Hz 发 2101 续约（运控 1 s 没收到就回 rough）。
+# 开着最长这么久自动关，免得忘了关一直用 climb 策略走路
+CLIMB_MAX = float(os.environ.get('GO2W_CLIMB_MAX', '300'))
 # 网页站起来（或跑过任务）的机器狗，空闲这么久就原地趴下；0 = 不自动趴下
 IDLE_LIE = float(os.environ.get('GO2W_IDLE_LIE', '30'))
 # 电机过热自动趴下（11-18，用户：「有关节到 68 度就自动趴下」）：16 个电机（12 个腿关节 + 4 个轮子）任何一个
@@ -404,6 +424,7 @@ def roll_pitch(q):
 
 MATCH_TOL = 0.10  # m：scan 点离地图障碍物这么近就算「对上了」
 MATCH_HOLD_S = 0.6  # s：设完初始位姿后这么久内的 scan 不算匹配率（AMCL 处理 /initialpose、更新 map→odom 需要时间）
+GATE_QUERY_TIMEOUT = 8.0  # s：问建图扫描闸门 scan_budget 的超时（狗负载高时 3 s 不够）
 
 
 class Rate:
@@ -596,6 +617,9 @@ class Bridge(TaughtMeasurements, Node):
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.loadmap_cli = self.create_client(LoadMap, '/map_server/load_map')
+        # 禁行层（v1.1.8）：navigation.launch.py 里的第二个 map_server，专门发 KeepoutFilter 的掩膜。
+        # 旧导航镜像没有它，服务一直不可用 → 网页照样能画、能存，只是提示要更新导航
+        self.maskload_cli = self.create_client(LoadMap, '/filter_mask_server/load_map')
         self.mapparam_cli = self.create_client(GetParameters, '/map_server/get_parameters')
         self.taught_param_cli = self.create_client(SetParameters, '/taught_route/set_parameters')
         # 续建：从基准 posegraph 恢复。服务名照核实过的上游源码（slam_toolbox_common.cpp），
@@ -906,6 +930,11 @@ class Bridge(TaughtMeasurements, Node):
         req.map_url = os.path.join(DATA, 'maps', f'{name}.yaml')
         return self.loadmap_cli.call_async(req)
 
+    def load_mask(self, path):
+        req = LoadMap.Request()
+        req.map_url = path
+        return self.maskload_cli.call_async(req)
+
     # ---------- 续建：从基准 posegraph 恢复 ----------
     def serialize_posegraph(self, path):
         """slam_toolbox 把当前位姿图写成 <path>.posegraph / <path>.data（path 不带扩展名）。"""
@@ -1072,7 +1101,7 @@ class Bridge(TaughtMeasurements, Node):
         res = RESULT.get(status, 'aborted')
         with self.lock:
             g = self.goal
-            if g is None or g['id'] != gid:
+            if g is None or g['id'] != gid or g.get('passed'):   # passed：路线中间站已被下一站顶替，旧目标的 abort 不算失败
                 return
             g['status'], g['end'] = res, time.monotonic()
             if res == 'succeeded':
@@ -1180,6 +1209,19 @@ class Bridge(TaughtMeasurements, Node):
         return self.pset_cli.call_async(req)
 
     # ---------- 查询（asyncio 线程调用，只读） ----------
+    def body_tilt(self):
+        """机身总倾角（度，= 重力和机身 z 轴的夹角，和运控姿态保护同一个量）。planar_odom 把机器人 IMU 的
+        俯仰 / 横滚发成 base_footprint → base_link（10 Hz）。返回 (时间戳 ns, 倾角°)，没有返回 None。
+        新不新由调用方看时间戳变没变：这个时间戳和本机时钟不一定对得上（11-20 /odom 时间戳走速 0.2–5 倍）。"""
+        try:
+            t = self.tf.lookup_transform(BASE_FRAME, 'base_link', rclpy.time.Time())
+            r, p = roll_pitch(t.transform.rotation)
+            st = t.header.stamp
+            return (st.sec * 1_000_000_000 + st.nanosec,
+                    math.degrees(math.acos(max(-1.0, min(1.0, math.cos(r) * math.cos(p))))))
+        except Exception:
+            return None
+
     def lookup(self, frame):
         """frame 在 fixed 坐标系下的 (x, y, yaw)。没有 map 时退回 odom（例如只跑了里程计）。"""
         for fixed in ('map', 'odom'):
@@ -1372,6 +1414,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.map_busy = False         # 保存和导出地图期间保护源快照及目标文件
         # 续建（docs/地图续建.md）：一次会话 = 基准图 + 新图名字 + 起点位姿 + 自检结果
         self.cont = None              # {base, name, source, pose, warn, check, started, paused}
+        self.last_save_park = ''      # 最近一次存图时顺手记停车点的说明（续建收工的提示要带上）
         self.cont_hold = ()           # cont_start 进行中的 (基准, 新名)：自动保存清理不许碰
         self.cont_busy = False
         self.cont_blocked = False
@@ -1392,6 +1435,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.inc_bag_t = {}           # 类型 → 上次为它自动存包的时间
         self.map_frozen = None        # 建图冻结（摔倒 / 里程计异常）：{reason, wild, wall, kept, kept_wall, gate}
         self.fall_prev = None         # 上一轮看到的运控状态（检测意外掉到 Passive）
+        self.tilt_hist = deque()      # (monotonic, 机身倾角°)，最近 FALL_TILT_PRE 秒
+        self.tilt_stamp = None        # 上一次取到的姿态 TF 时间戳
+        self.fall_pending = None      # 掉到 Passive 后等 FALL_TILT_POST 秒再判断：{'t', 'prev'}
         self.lie_done_t = -1e9        # 网页最近一次让狗趴下结束的时间
         self.odom_wild_seen = None
         self.inc_open = {}            # 持续中的异常：'stuck' / 'estop' / 'motor_hot' / 'ctrl_offline' → id
@@ -1435,6 +1481,30 @@ class Server(TaughtWeb, RT.RtabWeb):
             pass
         except (OSError, ValueError, TypeError, AttributeError) as e:
             node.event('WARN', f'无法读取地图显示方向 {self.views_file}，全部按 0° 显示：{e}')
+        # 地图显示名（11-23）：文件名还是英文（ROS / 云端 / 任务都用它），网页上可以起个中文名
+        self.labels_file = os.path.join(DATA, 'map_labels.json')
+        self.map_labels = {}
+        try:
+            with open(self.labels_file, encoding='utf-8') as f:
+                raw = json.load(f)
+            self.map_labels = {k: v for k, v in raw.items() if isinstance(k, str) and P.SAFE_NAME.fullmatch(k)
+                               and isinstance(v, str) and self.label_error(v) is None}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            node.event('WARN', f'无法读取地图显示名 {self.labels_file}，全部显示文件名：{e}')
+        # 禁行区（v1.1.8）：每张图的形状（<名字>.keepout.json）推给网页；掩膜缺了 / 旧了先补上，
+        # 导航启动时 navigation.launch.py 直接按地图名读 keepout/<名字>.yaml
+        maps_dir = os.path.join(DATA, 'maps')
+        self.keepouts = KO.load_all(maps_dir, [m['name'] for m in self.maps])
+        for x in self.keepouts:
+            try:
+                KO.ensure_mask(maps_dir, x)
+            except (OSError, ValueError) as e:
+                node.event('WARN', f'禁行区掩膜 {x} 写不了：{e}')
+        self.keepout_live = None      # 导航里现在加载的是哪张图的禁行掩膜（网页确认过的）
+        self.keepout_ready = False    # 上一拍 /filter_mask_server/load_map 可用吗（变成可用时补加载一次）
+        self.keepout_loading = False
         self.map_loading = False
         self.checking_route = False
         # 自动定位：最近一次的结果推给网页（state.autoLoc）；seq 每次结束 +1，网页据此知道「刚定位成功」
@@ -1451,6 +1521,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             except Exception as e:
                 node.event('ERROR', f'无法连接运控状态（域 0）：{e!r}；站起 / 趴下不可用')
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
+        self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
         self.ctrl_abort = False    # 站起过程中被要求趴下
         self.ctrl_msg = ''         # 最近一次站起 / 趴下的结果
@@ -1465,6 +1536,12 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.t_start = time.monotonic()
         self.prep_hold_t = -1e9    # 网页自检最近一次说「我在自检」的时间
         self.init_taught(DATA)
+        self.taught_nav_file = os.path.join(DATA, 'taught_nav.json')
+        try:
+            with open(self.taught_nav_file) as f:
+                self.taught_repo.enabled = bool(json.load(f).get('on', False))
+        except (OSError, ValueError, AttributeError):
+            pass
 
     # ---------- 工具 ----------
     def aw(self, fut, timeout=3.0):
@@ -1553,6 +1630,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '另一个网页正在进行示教采集，请在原页面操作'
         if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize', 'autoloc_move'):
             return False, '正在检查路线，请稍等'
+        if self.climb is not None and op in ('goal', 'route_start', 'auto_localize', 'autoloc_move', 'taught_start'):
+            return False, '爬台模式开着：先关掉爬台模式（切回 rough）再导航'
         if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
@@ -1567,6 +1646,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'estop':
                 # 先停车，再记日志
                 self.estop, self.estop_t = True, time.monotonic()
+                self.climb_off(f'网页急停（{self.remote(ws)}）')
                 errors = await self.disarm_and_cancel(f'网页急停（{self.remote(ws)}）')
                 if 'estop' not in self.inc_open:
                     self.inc_open['estop'] = self.incident('estop', f'网页急停（{self.remote(ws)}）', ongoing=True)
@@ -1599,6 +1679,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return await self.lie_down(self.remote(ws))
             if op == 'set_policy':
                 return await self.switch_policy(d.get('name'), self.remote(ws))
+            if op == 'climb':
+                return self.set_climb(ws, bool(d.get('on')))
             if op == 'stand_hold':
                 on = bool(d.get('on'))
                 self.stand_hold, self.idle_since = on, None
@@ -1623,6 +1705,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                 ok, message = await self.check_ordinary_taught_binding(n.map_current)
                 if not ok:
                     return False, message
+                why = self.keepout_blocker(n.map_current, [d])
+                if why:
+                    return False, why
                 self.route = None
                 # 结束的旧目标（卡片会保留 5 s）先清掉：等 Nav2 接受新目标时，卡片不能显示旧目标的「已取消 / 失败」
                 with n.lock:
@@ -1703,6 +1788,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return await self.bag_delete(d.get('name'), self.remote(ws))
             if op == 'rollback_set':
                 return self.rollback_set(bool(d.get('on')), self.remote(ws))
+            if op == 'set_taught_nav':
+                return self.taught_nav_set(d.get('on') is True, self.remote(ws))
             if op == 'rollback_save':
                 return await self.rollback_save(self.remote(ws))
             if op == 'bag_upload':
@@ -1713,6 +1800,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return True, '录包已停止'
             if op == 'map_view':
                 return await self.set_view(d.get('map'), d.get('angle'))
+            if op == 'map_label':
+                return await self.set_label(d.get('name'), d.get('label'), self.remote(ws))
+            if op == 'keepout_save':
+                return await self.keepout_save(d.get('map'), d.get('shapes'), self.remote(ws))
             if op == 'save_map':
                 return await self.save_map(d.get('name', ''))
             if op == 'align_map':
@@ -1726,6 +1817,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if result[0]:
                     await self.send_all(self.routes_message(), key='routes')
                     await self.send_all(self.views_message(), key='views')
+                    await self.send_all(self.labels_message(), key='labels')
+                    await self.send_all(self.keepout_message(), key='keepout')
                 return result
             if op == 'rtab_start':
                 return await self.rtab_start_map(self.remote(ws))
@@ -1877,6 +1970,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             return True, '已经趴着'
         if self.ctrl_op == 'down':
             return False, '正在趴下'
+        self.climb_off(f'趴下（{who}）')
         self.ctrl_abort = True                 # 正在站起就打断
         while self.ctrl_op == 'up':
             await asyncio.sleep(0.05)
@@ -1907,14 +2001,34 @@ class Server(TaughtWeb, RT.RtabWeb):
     def fall_tick(self):
         """safety 循环 5 Hz：运控意外掉到 Passive、或里程计数值离谱 → 记异常（自动存回溯包），建图中就冻结。"""
         n = self.node
+        now = time.monotonic()
+        bt = n.body_tilt()
+        if bt is not None and bt[0] != self.tilt_stamp:   # 时间戳没变 = planar_odom 没在发了，旧值不算
+            self.tilt_stamp = bt[0]
+            self.tilt_hist.append((now, bt[1]))
+        while self.tilt_hist and now - self.tilt_hist[0][0] > FALL_TILT_PRE + FALL_TILT_POST + 0.5:
+            self.tilt_hist.popleft()
         s, _, _ = self.ctrl_get()
         prev, self.fall_prev = self.fall_prev, (s or self.fall_prev)
         if (prev in ('FixStand', 'Velocity') and s == 'Passive' and self.ctrl_op != 'down'
-                and time.monotonic() - self.lie_done_t > FALL_LIE_GRACE):
-            msg = f'运控从 {prev} 意外掉到 Passive（摔倒，或遥控器让它趴下）'
-            self.incident('fall', msg)
-            if self.prof('mapping') == 'run':
-                self.background(self.freeze_mapping(msg))
+                and now - self.lie_done_t > FALL_LIE_GRACE and self.fall_pending is None):
+            self.fall_pending = {'t': now, 'prev': prev}
+            if self.prof('mapping') == 'run':   # 建图先冻结（摔倒和趴下都不该再往图里加东西），判断稍后
+                self.background(self.freeze_mapping(f'运控从 {prev} 掉到 Passive（不是网页让的）'))
+        f = self.fall_pending
+        if f and now - f['t'] >= FALL_TILT_POST:
+            self.fall_pending = None
+            seen = [a for t, a in self.tilt_hist if f['t'] - FALL_TILT_PRE <= t <= now]
+            top = max(seen) if seen else None
+            if top is None:
+                self.incident('fall', f"运控从 {f['prev']} 意外掉到 Passive：没有机身姿态数据，分不清是摔倒还是遥控器让它趴下",
+                              ago=now - f['t'])
+            elif top >= FALL_TILT_DEG:
+                self.incident('fall', f"摔倒：机身倾角最大 {top:.0f}°，运控姿态保护从 {f['prev']} 切到 Passive",
+                              ago=now - f['t'])
+            else:
+                n.event('WARN', f"遥控器让狗趴下了：运控从 {f['prev']} 切到 Passive，不是网页发起的"
+                                f"（机身倾角最大 {top:.0f}°，不是摔倒，不记异常）")
         w = n.odom_wild
         if w and w is not self.odom_wild_seen:
             self.odom_wild_seen = w
@@ -2050,13 +2164,75 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.ctrl_op = None
             await self.refresh_procs()
 
+    # ---------- 爬台模式（融合策略 2101） ----------
+    def set_climb(self, ws, on):
+        who = self.remote(ws)
+        if not on:
+            if self.climb is None:
+                return True, '爬台模式已经是关的'
+            self.climb_off(f'关闭爬台模式（{who}）')
+            return True, '已关闭爬台模式，运控切回 rough'
+        if self.ctrl is None:
+            return False, self.ctrl_blocker() or '运控接入已关闭（GO2W_CTRL=0）'
+        if self.estop:
+            return False, '急停中：先解除急停'
+        if self.ctrl_op:
+            return False, '运控正在操作（站起 / 趴下 / 切策略），请稍等'
+        s, ready, _ = self.ctrl_get()
+        if s is None:
+            return False, '收不到运控状态（/go2w_ctrl/state）'
+        if s != 'Velocity' or not ready:
+            return False, f'只能站着（策略运行中）开爬台模式（现在：{s}）'
+        if self.ctrl.get_dual(CTRL_STALE) is None:
+            return False, '当前运控策略不是融合策略（rough + climb），没有爬台模式'
+        n = self.node
+        if (self.route_running() or self.goal_pending or n.nav_active() or self.taught_recording()
+                or self._taught_job is not None or self.prof('patrol') != 'stop'):
+            return False, '有导航任务在跑：先取消任务再开爬台模式（爬台用遥控或网页摇杆）'
+        if self.climb is not None:
+            self.climb['ws'] = ws
+            return True, '爬台模式已经开着'
+        self.climb = {'ws': ws, 'who': who, 't': time.monotonic()}
+        self.ctrl.climb(True)
+        n.event('WARN', f'开启爬台模式（{who}）：切到 climb 策略，最长 {CLIMB_MAX:.0f} s 自动关')
+        return True, '爬台模式已开：速度 |vx|≤0.5、|vy|≤0.15、|wz|≤0.15 时切到 climb'
+
+    def climb_off(self, reason):
+        if self.climb is None:
+            return
+        self.climb = None
+        if self.ctrl is not None:
+            self.ctrl.climb(False)
+            self.ctrl.climb(False)   # 发两帧防丢；真丢了运控 1 s 没续约也会自己回 rough
+        self.node.event('INFO', f'爬台模式已关：{reason}，运控切回 rough')
+
+    def climb_tick(self):
+        """safety 循环 5 Hz：开着就续约；出状况就关。"""
+        c = self.climb
+        if c is None:
+            return
+        s, ready, _ = self.ctrl_get()
+        ws = c['ws']
+        gap = time.monotonic() - self.clients[ws]['last_ping'] if ws in self.clients else None
+        reason = ('急停' if self.estop
+                  else '开启爬台模式的网页断开了' if gap is None
+                  else f'开启爬台模式的网页心跳丢失 {gap:.1f} s' if gap > self.heartbeat
+                  else f'运控状态 {s or "离线"}，不在行走状态' if s != 'Velocity'
+                  else '运控状态里没有融合策略信息' if self.ctrl.get_dual(CTRL_STALE) is None
+                  else f'已开 {CLIMB_MAX:.0f} s，自动关闭' if time.monotonic() - c['t'] > CLIMB_MAX
+                  else None)
+        if reason:
+            self.climb_off(reason)
+        else:
+            self.ctrl.climb(True)
+
     def ctrl_busy(self):
         """有事在做，不算空闲：任务、导航、遥控、巡逻、检查、自动定位、站起趴下、档位切换、网页自检中、保持站立、还在走。"""
         n = self.node
         return bool(self.route_running() or self.goal_pending or n.nav_active() or self.teleop is not None
                     or self.taught_recording() or self._taught_job is not None
                     or self.checking_route or self.autoloc_busy or self.ctrl_op or self.busy or self.map_loading
-                    or self.stand_hold or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
+                    or self.stand_hold or self.climb is not None or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
                     or self.prof('patrol') != 'stop' or self.moving())
 
     def idle_tick(self):
@@ -2188,11 +2364,14 @@ class Server(TaughtWeb, RT.RtabWeb):
         s, ready, seq = self.ctrl_get()
         left = None if self.idle_since is None else max(0.0, IDLE_LIE - (time.monotonic() - self.idle_since))
         rx = self.ctrl.last_rx()
+        dual = self.ctrl.get_dual(CTRL_STALE)
         return {'on': True, 'state': s, 'ready': ready, 'seq': seq, 'op': self.ctrl_op, 'msg': self.ctrl_msg,
                 'age': None if rx is None else round(time.monotonic() - rx, 1),   # 距最后一次收到运控状态多少秒；从没收到 = None
                 'stood': self.stood_seq, 'auto': self.auto_lie and IDLE_LIE > 0, 'hold': self.stand_hold,
                 'lieIn': None if left is None else round(left, 1), 'hotLie': MOTOR_HOT_LIE,
-                'policy': self.policy_now()[0], 'policies': self.policies()}
+                'policy': self.policy_now()[0], 'policies': self.policies(),
+                'dual': None if dual is None else {'policy': dual[0], 'switching': dual[1], 'req': dual[2]},
+                'climb': None if self.climb is None else {'since': round(time.monotonic() - self.climb['t'], 1), 'max': CLIMB_MAX}}
 
     # ---------- 多点导航 ----------
     @staticmethod
@@ -2349,6 +2528,154 @@ class Server(TaughtWeb, RT.RtabWeb):
             await self.send_all(self.views_message(), key='views')
         return True, ''
 
+    # ---------- 禁行区（v1.1.8，11-23） ----------
+    # 网页画线 / 画区域 → <名字>.keepout.json + keepout/<名字>.yaml 掩膜（server/keepout.py）。
+    # 导航里由 filter_mask_server 发掩膜、KeepoutFilter 叠到全局和局部代价地图；地图本身和 AMCL 不受影响
+    def keepout_message(self):
+        return json.dumps({'t': 'keepout', 'items': self.keepouts}, ensure_ascii=False)
+
+    def keepout_view(self):
+        n = self.node
+        ready = n.maskload_cli.service_is_ready()
+        if ready and not self.keepout_ready and not self.keepout_loading and n.map_current:
+            # 导航刚起来：launch 已按启动地图加载了掩膜，这里按网页认定的当前地图再加载一次，两边一定一致
+            self.background(self.keepout_apply(n.map_current, '导航启动'))
+        if not ready:
+            self.keepout_live = None
+        self.keepout_ready = ready
+        return {'ready': ready, 'live': self.keepout_live, 'loading': self.keepout_loading}
+
+    async def keepout_apply(self, name, why):
+        """把 name 的掩膜加载进正在跑的导航；导航没开 / 旧镜像没有 filter_mask_server 就什么都不做。返回提示（空 = 没加载）。"""
+        n = self.node
+        if not name or not n.maskload_cli.service_is_ready():
+            return ''
+        self.keepout_loading = True
+        try:
+            path = await asyncio.to_thread(KO.ensure_mask, os.path.join(DATA, 'maps'), name)
+            r = await self.aw(n.load_mask(path), 10.0)
+            if r.result != 0:
+                self.keepout_live = None
+                n.event('ERROR', f'禁行区掩膜加载失败（{name}，错误码 {r.result}）：导航可能还在用旧的禁行区')
+                return f'禁行区没有加载进导航（错误码 {r.result}）'
+            self.keepout_live = name
+            k = len(self.keepouts.get(name, []))
+            n.event('INFO', f'禁行区已加载（{name}，{k} 个；{why}）')
+            return f'导航已生效（{k} 个）' if k else '导航里的禁行区已清空'
+        except Exception as e:
+            self.keepout_live = None
+            n.event('ERROR', f'禁行区掩膜加载失败（{name}）：{e!r}')
+            return f'禁行区没有加载进导航（{e}）'
+        finally:
+            self.keepout_loading = False
+
+    async def keepout_save(self, name, shapes, who):
+        if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
+            return False, '地图名不对'
+        if name not in {m['name'] for m in self.maps}:
+            return False, f'data/maps 里没有 {name}'
+        old = self.keepouts.get(name, [])
+        try:
+            clean, _ = await asyncio.to_thread(KO.save, os.path.join(DATA, 'maps'), name, shapes, who)
+        except ValueError as e:
+            return False, str(e)
+        except OSError as e:
+            return False, f'禁行区没有保存：{e.strerror or e}'
+        if clean:
+            self.keepouts[name] = clean
+        else:
+            self.keepouts.pop(name, None)
+        await self.send_all(self.keepout_message(), key='keepout')
+        lines = sum(1 for s in clean if s['kind'] == 'line')
+        self.node.event('INFO', f'禁行区已保存：{name}（{len(old)} → {len(clean)} 个，线 {lines}、区域 {len(clean) - lines}；{who}）')
+        n = self.node
+        live = n.map_current == name and self.prof('navigation') != 'stop'
+        if live and n.maskload_cli.service_is_ready():
+            note = await self.keepout_apply(name, '网页保存')
+            return True, f'禁行区已保存，{note}' if note else '禁行区已保存'
+        if live:
+            return True, '禁行区已保存；这台的导航版本不支持禁行层（没有 filter_mask_server），需要更新导航镜像后才生效'
+        return True, '禁行区已保存，下次用这张图导航时生效'
+
+    def keepout_blocker(self, map_name, points):
+        """目标 / 任务站点落在禁行范围里 → 原因（Nav2 会直接规划失败，先在网页上说清楚）。"""
+        shapes = self.keepouts.get(map_name)
+        if not shapes:
+            return None
+        for i, p in enumerate(points):
+            try:
+                k = KO.hit(shapes, float(p['x']), float(p['y']))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if k is not None:
+                label = shapes[k].get('name') or f"第 {k + 1} 个禁行{'线' if shapes[k]['kind'] == 'line' else '区域'}"
+                where = '目标点' if len(points) == 1 and 'name' not in p else f'第 {i + 1} 站'
+                return f'{where}在「{label}」的禁行范围里（离线不到 {KO.INSCRIBED:.2f} m 或在区域内），换个位置'
+        return None
+
+    # ---------- 地图显示名（11-23） ----------
+    # 只改网页上显示的名字（可以中文），data/maps 里的文件名不动：slam_toolbox / map_server / 云端调度 /
+    # 任务 / 示教 / RTAB 库都还认文件名，所以正在导航用的图也能随时改。存 data/map_labels.json
+    LABEL_MAX = 32
+
+    @classmethod
+    def label_error(cls, label):
+        if len(label) > cls.LABEL_MAX:
+            return f'显示名最多 {cls.LABEL_MAX} 个字'
+        if any(ch in label for ch in '<>"\'\\/') or any(ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 for ch in label):
+            return '显示名不能有 < > " \' \\ / 和控制字符'
+        return None
+
+    def write_labels(self, labels):
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=DATA, delete=False) as f:
+                tmp = f.name
+                json.dump(labels, f, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp, self.labels_file)
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        self.map_labels = labels
+
+    def labels_message(self):
+        return json.dumps({'t': 'map_labels', 'items': self.map_labels}, ensure_ascii=False)
+
+    async def set_label(self, name, label, who):
+        if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
+            return False, '地图名不对'
+        if name not in {m['name'] for m in self.maps}:
+            return False, f'data/maps 里没有 {name}'
+        if not isinstance(label, str):
+            return False, '显示名不对'
+        label = ' '.join(label.split())          # 去掉首尾空白，中间连续空白并成一个
+        if label == name:
+            label = ''
+        if label:
+            err = self.label_error(label)
+            if err:
+                return False, err
+            dup = next((k for k, v in self.map_labels.items() if v == label and k != name), None)
+            if dup:
+                return False, f'「{label}」已经是 {dup} 的显示名了，换一个'
+            if label in {m['name'] for m in self.maps} - {name}:
+                return False, f'「{label}」是另一张地图的文件名，换一个'
+        old = self.map_labels.get(name, '')
+        if label == old:
+            return True, '名字没变'
+        labels = dict(self.map_labels)
+        if label:
+            labels[name] = label
+        else:
+            labels.pop(name, None)
+        try:
+            self.write_labels(labels)
+        except OSError as e:
+            return False, f'保存显示名失败：{e.strerror or e}'
+        await self.send_all(self.labels_message(), key='labels')
+        self.node.event('INFO', f'地图 {name} 显示名：{old or "（无）"} → {label or "（无，显示文件名）"}（{who}）')
+        return True, f'已改名为「{label}」' if label else f'已恢复显示文件名 {name}'
+
     def routes_message(self):
         return json.dumps({'t': 'routes', 'items': list(self.routes.values())})
 
@@ -2472,6 +2799,10 @@ class Server(TaughtWeb, RT.RtabWeb):
         ok, message = await self.check_ordinary_taught_binding(record['map'] if record else n.map_current)
         if not ok:
             return False, message
+        if record:
+            why = self.keepout_blocker(record['map'], record['points'])
+            if why:
+                return False, why
         for key, top in (('vmax', 1.2), ('wmax', 1.5)):
             v = d.get(key)
             if v is None:
@@ -2886,6 +3217,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             # 11-12：不再出发前用 Nav2 规划检查整圈（用户：路线判断不需要）；某段规划不了，跑到那一段时 Nav2 会报失败
             route['checking'] = False
             state = first
+            prev = None   # 上一站被不停车经过时它的 Nav2 目标：下一站没发出去就要取消它，免得狗自己走到那站
             while state:
                 i, loop, back = state
                 if route['stop'].is_set():
@@ -2894,8 +3226,23 @@ class Server(TaughtWeb, RT.RtabWeb):
                 route.update(index=i, loop=loop, back=back, target=point, goal=None)
                 reason = self.route_blocker(ws, record)
                 if reason:
+                    if prev is not None:
+                        await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError(reason)
-                pose = (point['x'], point['y'], point['th'])
+                nxt = self.route_next(len(points), loops, state)
+                passing = nxt is not None      # 后面还有站：不停车经过，朝向面向下一站
+                if passing:
+                    q = self.route_pose(points, nxt[0], nxt[2])
+                    pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
+                else:
+                    pose = (point['x'], point['y'], point['th'])
+                here = n.lookup(BASE_FRAME)
+                # 提前量不超过这段路的一半：站挨得近时（< 1.2 m）不会一过上一站就把这一站也算过了
+                pass_dist = min(ROUTE_PASS_DIST, 0.5 * math.hypot(here[0] - pose[0], here[1] - pose[1])) if here else 0.0
+                if passing and here:   # 拐角 = 来的方向（当前位置 → 本站）和去的方向（本站 → 下一站）的夹角
+                    turn = pose[2] - math.atan2(pose[1] - here[1], pose[0] - here[0])
+                    if abs(math.atan2(math.sin(turn), math.cos(turn))) > ROUTE_PASS_TURN:
+                        passing = False   # 到点停下（朝向已经是面向下一站）
                 request = n.send_goal(*pose)
                 try:
                     handle = await self.aw(request, 3.0)
@@ -2903,7 +3250,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                     request.add_done_callback(self.cancel_late_goal)
                     raise RuntimeError('Nav2 接收目标超时') from None
                 if not handle.accepted:
+                    if prev is not None:
+                        await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError('Nav2 拒绝目标')
+                prev = None
                 if route['stop'].is_set():
                     await self.aw(handle.cancel_goal_async(), 2.0)
                     return
@@ -2911,11 +3261,33 @@ class Server(TaughtWeb, RT.RtabWeb):
                 route['goal'] = dict(zip(('x', 'y', 'th'), pose))
                 stop = asyncio.create_task(route['stop'].wait())
                 done = asyncio.create_task(self.aw(result, 180.0))
+                passed = False
                 try:
-                    await asyncio.wait((stop, done), return_when=asyncio.FIRST_COMPLETED)
-                    if route['stop'].is_set():
-                        return
-                    status = done.result().status
+                    while True:
+                        await asyncio.wait((stop, done), timeout=0.1 if passing else None,
+                                           return_when=asyncio.FIRST_COMPLETED)
+                        if route['stop'].is_set():
+                            return
+                        if done.done():
+                            break
+                        here = n.lookup(BASE_FRAME)
+                        if here and n.fixed == 'map' and math.hypot(here[0] - pose[0], here[1] - pose[1]) < pass_dist:
+                            passed = True
+                            break
+                    if passed:   # passing 为 False 时不会走到这里
+                        with n.lock:
+                            g = n.goal
+                            if g is not None and g['id'] == bytes(handle.goal_id.uuid):
+                                g['passed'] = True
+                                g['status'], g['end'] = 'succeeded', time.monotonic()
+                                t_leg = g['nav_time'] or (g['end'] - g['t0'])
+                            else:
+                                t_leg = 0.0
+                        n.event('INFO', f"经过第 {i + 1} 站 ({pose[0]:.2f}, {pose[1]:.2f})，用时 {t_leg:.1f} s，不停车前往下一站")
+                        status = GoalStatus.STATUS_SUCCEEDED
+                        prev = handle
+                    else:
+                        status = done.result().status
                 except asyncio.TimeoutError:
                     await self.aw(handle.cancel_goal_async(), 2.0)
                     raise RuntimeError('等待到点超时') from None
@@ -3224,6 +3596,33 @@ class Server(TaughtWeb, RT.RtabWeb):
             pass
         self.node.event('INFO', f"回溯录制已{'打开' if on else '关闭'}（{who}）")
         return True, f"回溯录制已{'打开' if on else '关闭'}"
+
+    def taught_nav_set(self, on, who):
+        """网页「启用示教导航」开关：存到 data/taught_nav.json，下次开导航时按它决定带不带示教节点。"""
+        repo, n = self.taught_repo, self.node
+        f = repo.forced()
+        if f is not None:
+            return False, f"示教导航被环境变量 GO2W_TAUGHT={f} 固定为{'开' if f == '1' else '关'}，网页开关不起作用"
+        if on and not repo.installed:
+            return False, '后端没有示教算法包，打不开示教导航'
+        if not on and self.taught_open():
+            return False, '有没结束的示教采集草稿，先结束或放弃再关'
+        repo.enabled = on
+        try:
+            with open(self.taught_nav_file, 'w') as fp:
+                json.dump({'on': on}, fp)
+        except OSError as e:
+            n.event('WARN', f'示教导航开关没存下来（重启网页后会回到原状态）：{e}')
+        node_up = 'taught_route' in n.get_node_names()
+        nav = self.prof('navigation') == 'run'
+        tail = ''
+        if on and nav and not node_up:
+            tail = '；导航正在运行、还没带示教节点，下次「出发」会先自动重开导航（机器人保持静止）'
+        elif not on and node_up:
+            tail = '；示教节点要等下次重开导航才会停'
+        msg = f"示教导航已{'打开' if on else '关闭'}{tail}"
+        n.event('INFO', f'{msg}（{who}）')
+        return True, msg
 
     async def stop_bridge(self, why):
         n = self.node
@@ -3741,13 +4140,15 @@ class Server(TaughtWeb, RT.RtabWeb):
         if any(m['name'] == name for m in self.maps):
             return False, f'已经有同名地图 {name}，换个名字（不会覆盖）'
         self.node.event('INFO', f'保存地图 {name}……')
+        park_pose, park_why = self.save_parking_pose()   # 存图之前取：存图那一刻的位置
         if await self.procs.save_map(name):
             self.maps = P.list_maps(os.path.join(DATA, 'maps'))
             self.node.event('INFO', f'地图已保存：data/maps/{name}')
             self.rtab_link(name)
             if MAPPING_VIEW in self.map_views:   # 建图时调好的显示方向带给新地图
                 await self.set_view(name, self.map_views[MAPPING_VIEW])
-            return True, f'地图已保存：{name}'
+            self.last_save_park = self.park_after_save(name, park_pose, park_why)
+            return True, f'地图已保存：{name}' + self.last_save_park
         return False, '保存失败：' + (P.tail(os.path.join(DATA, 'logs', 'save_map.log'), 6) or '看 data/logs/save_map.log')
 
     # ---------- 续建（docs/地图续建.md） ----------
@@ -3804,6 +4205,41 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, f'存不下停车点：{e}'
         self.node.event('INFO', msg)
         return True, msg
+
+    def save_parking_pose(self):
+        """存图这一刻机器人在建图 map 系里的位姿，用来顺手记成新图的停车点。返回 (pose, 为什么没有)。
+
+        存下的 pgm/yaml 就在建图时的 map 坐标系里（全新建图是 slam_toolbox 新建的 map 系；
+        续建自检通过后 map 系和基准图对齐，存的新图也还是这个系），所以此刻的
+        map→base_footprint 就是机器人在新图上的位置——不需要再定位。
+        冻结时地图停在冻结那一刻，机器人位置可能已经和图对不上，不记。
+        """
+        n = self.node
+        if self.map_frozen:
+            return None, '建图处于冻结状态，机器人位置和存下的图不一定对得上'
+        pose = n.lookup(BASE_FRAME)
+        if pose is None or n.fixed != 'map':   # lookup 没有 map 时会退回 odom，那不算
+            return None, '没有 map→base_footprint'
+        if not all(math.isfinite(v) for v in pose):
+            return None, '位姿不是有限数'
+        return [float(v) for v in pose], ''
+
+    def park_after_save(self, name, pose, why=''):
+        """存图成功后把存图时的位置记成这张新图的停车点。返回附在保存提示后面的一句话。"""
+        if pose is None:
+            return f'；没有记停车点（{why}），下次续建请用自动定位' if why else ''
+        ok, msg = self.set_parking(name, pose)
+        if not ok:
+            return f'；停车点没记上（{msg}），下次续建请用自动定位'
+        tail = (f'；已把狗现在的位置记成这张图的停车点 ({pose[0]:.2f}, {pose[1]:.2f}, '
+                f'{math.degrees(pose[2]):.0f}°)：狗不挪，下次续建可以直接「从停车点开始」')
+        try:
+            good, w = MC.check_start(self._base_grid(name), pose)
+            if not good:
+                tail += f'；注意：{w}'
+        except RuntimeError:
+            pass
+        return tail
 
     def current_parking_pose(self):
         """现在就能当停车点用的位姿：有 map→base_footprint 才有意义（没有定位就是在猜）。"""
@@ -3938,12 +4374,18 @@ class Server(TaughtWeb, RT.RtabWeb):
         req = GetParameters.Request()
         req.names = ['scan_budget']
         try:
-            values = (await self.aw(cli.call_async(req))).values
-            return (not self.cont_blocked and not self.cont_busy and len(values) == 1
-                    and values[0].type == ParameterType.PARAMETER_INTEGER
-                    and values[0].integer_value == -1)
-        except Exception:
+            values = (await self.aw(cli.call_async(req), GATE_QUERY_TIMEOUT)).values
+        except Exception as e:
+            # 11-20 真机：负载 8–10 时闸门的参数服务 3 s 内回不来，普通建图被误报「续建还在验证」存不了图。
+            # 闸门只有网页自己会关（关时 cont_blocked 已置位，冻结另有 map_frozen），没在续建就放行；续建中仍然拒绝。
+            if self.cont is None:
+                self.node.event('WARN', f'问建图扫描闸门状态没有回应（{GATE_QUERY_TIMEOUT:.0f} s，{type(e).__name__}）；'
+                                        '没有在续建，按闸门打开处理，照常保存')
+                return True
             return False
+        return (not self.cont_blocked and not self.cont_busy and len(values) == 1
+                and values[0].type == ParameterType.PARAMETER_INTEGER
+                and values[0].integer_value == -1)
 
     def cont_scan_ready(self):
         scans, why = self.autoloc_scans()
@@ -4216,6 +4658,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '档位或地图正在切换，请稍等'
         self.map_busy = True
         try:
+            self.last_save_park = ''
             ok, msg = await self._save_map(c['name'])
             if not ok:
                 return False, msg
@@ -4248,7 +4691,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.cont = None
             tail = f'，{changed} 条任务已指到新图' if changed else ''
             n.event('INFO', f"续建完成：{c['name']}（基准 {c['base']} 未改动）{tail}")
-            return True, f'已保存 {c["name"]}，基准 {c["base"]} 未改动{tail}'
+            return True, f'已保存 {c["name"]}，基准 {c["base"]} 未改动{tail}{self.last_save_park}'
         finally:
             self.map_busy = False
 
@@ -4281,6 +4724,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return False, (f'当前加载的地图是 {n.map_current or "（还没读到）"}，不是 {base}：'
                                f'停车点是记在基准图坐标系里的，先切到 {base}')
             q = n.match if n.fixed == 'map' else None
+            if q is None and time.monotonic() < n.match_hold + 3.0:
+                return False, '刚设完位姿，定位匹配率还在重新计算，过 1–2 秒再记'
             if q is None:
                 return False, '还没有定位（没设初始位姿？），记下来的位置不可信'
             if q < self.PARKING_MIN_MATCH:
@@ -4383,6 +4828,16 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.map_busy = False
         moved, note = 0, ''
+        # 编辑不改分辨率和原点，禁行区（世界坐标）原样带到新图；网页「禁行区」页有没保存的修改、
+        # 用户勾了一起带过去时，带的是网页发来的那份（原图的禁行区不动）
+        carry = d.get('keepout') if isinstance(d.get('keepout'), list) else self.keepouts.get(source)
+        if carry:
+            try:
+                self.keepouts[name], _ = await asyncio.to_thread(KO.save, maps_dir, name, carry, who)
+                await self.send_all(self.keepout_message(), key='keepout')
+                note += f'；{len(self.keepouts[name])} 个禁行区已带到新图'
+            except (ValueError, OSError) as e:
+                note += f'；禁行区没能带到新图（{e}）'
         if d.get('routes'):
             if self.route_running():
                 note = '；有任务正在执行，路线没有改到新图'
@@ -4420,14 +4875,14 @@ class Server(TaughtWeb, RT.RtabWeb):
         return used
 
     @staticmethod
-    def trash_map(maps_dir, name, dest, routes, view):
+    def trash_map(maps_dir, name, dest, routes, view, label=None):
         """把 <name>.* 挪进 dest（同一个文件系统，rename 不拷数据）。返回挪走的字节数。"""
         files = [f for f in os.listdir(maps_dir) if f.startswith(name + '.') and
                  (os.path.isfile(os.path.join(maps_dir, f)) or f == name + '.taught')]
         os.makedirs(dest)
         with open(os.path.join(dest, 'deleted.json'), 'w', encoding='utf-8') as f:
             json.dump({'map': name, 'deleted': time.strftime('%Y-%m-%d %H:%M:%S'), 'files': sorted(files),
-                       'routes': routes, 'view': view}, f, ensure_ascii=False, indent=2)
+                       'routes': routes, 'view': view, 'label': label}, f, ensure_ascii=False, indent=2)
         size = 0
         # yaml 先挪：中途出错时 list_maps 就不再列这张图，不会留下「有 yaml 没 pgm」的坏图
         for fn in sorted(files, key=lambda f: not f.endswith('.yaml')):
@@ -4478,7 +4933,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '不能删除：' + '；'.join(busy)
         self.map_busy = True
         trash, stamp = os.path.join(maps_dir, '.trash'), time.strftime('%Y%m%d_%H%M%S')
-        routes, views = dict(self.routes), dict(self.map_views)
+        routes, views, labels = dict(self.routes), dict(self.map_views), dict(self.map_labels)
         done, size, err = [], 0, None
         try:
             await asyncio.to_thread(self.purge_trash, trash, self.MAP_TRASH_DAYS)
@@ -4486,18 +4941,27 @@ class Server(TaughtWeb, RT.RtabWeb):
                 mine = {k: r for k, r in routes.items() if r.get('map') == x}
                 dest = os.path.join(trash, f'{stamp}_{x}')
                 try:
-                    size += await asyncio.to_thread(self.trash_map, maps_dir, x, dest, list(mine.values()), views.get(x))
+                    size += await asyncio.to_thread(self.trash_map, maps_dir, x, dest, list(mine.values()), views.get(x),
+                                                    labels.get(x))
                 except OSError as e:
                     err = f'{x}：{e.strerror or e}'
                     break
                 for k in mine:
                     routes.pop(k)
                 views.pop(x, None)
+                labels.pop(x, None)
                 done.append((x, len(mine)))
+                self.keepouts.pop(x, None)          # <名字>.keepout.json 已随 <名字>.* 进回收站
+                try:
+                    KO.remove_mask(maps_dir, x)     # 渲染出来的掩膜随时能重建，直接删
+                except OSError:
+                    pass
             if routes != self.routes:
                 self.write_routes(routes)
             if views != self.map_views:
                 self.write_views(views)
+            if labels != self.map_labels:
+                self.write_labels(labels)
         except OSError as e:
             err = err or f'更新任务 / 显示方向失败：{e.strerror or e}'
         finally:
@@ -4545,6 +5009,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             await self.sync_taught_map(name)
         finally:
             self.map_loading = False
+        await self.keepout_apply(name, '切换地图')
         n.event('WARN', f'已切换到地图 {name}：请重新设置初始位姿')
         return True, f'已切换到 {name}，请重新设置初始位姿'
 
@@ -4721,6 +5186,8 @@ class Server(TaughtWeb, RT.RtabWeb):
         try:
             self.tx_put(ws, self.routes_message(), 'routes')
             self.tx_put(ws, self.views_message(), 'views')
+            self.tx_put(ws, self.labels_message(), 'labels')
+            self.tx_put(ws, self.keepout_message(), 'keepout')
             self.tx_put(ws, self.incidents_message(), 'incidents')
             taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
             if taught_map:
@@ -4772,6 +5239,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.clients.pop(ws, None)
             self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
+            if self.climb is not None and self.climb['ws'] is ws:
+                self.climb_off(f'开启爬台模式的网页断开（{remote}）')
             if ws is self.owner:
                 self.owner = None
                 await self.lose_owner(f'控制方网页断开（{remote}）', owner=ws)
@@ -4881,6 +5350,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                         self.incident('safety_stop', f'导航中机器狗不在行走状态（运控状态 {s}），已取消导航并上锁')
                 if k % 2 == 0:
                     self.fall_tick()
+                    self.climb_tick()
                 if k % 5 == 0:
                     self.hot_tick()
                     self.idle_tick()
@@ -4945,9 +5415,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                               bagSegment=P.BAG_SEGMENT if (self.procs_status or {}).get('bag_seg') else None,
                               cont=self.cont_state(), contBusy=self.cont_busy,
                               contPaused=self.cont_blocked and self.prof('mapping') == 'run',
-                              autosave=self.autosave_view(), lidar=self.lidar_view(), rtab=self.rtab_view(), webVersion=self.version)
+                              autosave=self.autosave_view(), lidar=self.lidar_view(), rtab=self.rtab_view(), webVersion=self.version,
+                              keepout=self.keepout_view())
                     st.update(taughtAvailable=self.taught_repo.available,
-                              taughtNavigation='taught_route' in n.get_node_names())
+                              taughtNavigation='taught_route' in n.get_node_names(),
+                              taughtNav={'on': self.taught_repo.available, 'forced': self.taught_repo.forced(),
+                                         'installed': self.taught_repo.installed})
                     await self.send_all(json.dumps(st), key='state')
                 # topic 查看器：只发给正在看这个 topic 的网页
                 for topic, rec in list(n.inspect.items()):
@@ -5032,7 +5505,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', type=int, default=8080)
     ap.add_argument('--static', default=os.path.join(here, '..', 'static'))
-    ap.add_argument('--heartbeat', type=float, default=1.0, help='控制方网页心跳超时（秒）')
+    ap.add_argument('--heartbeat', type=float, default=5.0, help='控制方网页心跳超时（秒）；1.0 在狗侧 Wi-Fi 上频繁误触发（11-20 一晚 4 次），改 5.0。网页断开仍立即上锁，网页遥控另有 0.3 s 超时')
     args = ap.parse_args()
 
     rclpy.init()

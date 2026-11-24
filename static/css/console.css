@@ -483,13 +483,15 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-launch .btn{width:100%}
 .route-launch .route-hint:not(:empty){margin-top:4px}
 .route-points{list-style:none;margin:6px 0 0;padding:0;max-height:180px;overflow:auto}
-.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:4px;margin-top:6px}
+.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(4,auto);align-items:center;gap:4px;margin-top:6px}
 .route-points span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .route-point-name{grid-column:1/-1;width:100%;min-width:0;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font-size:11px}
 .route-point-note{grid-column:1/-1;width:100%;min-width:0;min-height:38px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:4px 7px;font-family:inherit;font-size:11px;line-height:1.4;resize:vertical}
 .route-points .btn{padding:0 6px}
 .route-controls{margin-top:8px}
 .route-points .route-end{color:#94e8a8}
+.route-points li.route-replacing span{color:#6fb6ff}
+.route-points .btn.on{border-color:#6fb6ff;color:#6fb6ff}
 
 /* ---------- 右栏：任务切换 + 步骤流程（原型 web/prototype/right_panel.html） ---------- */
 .tasks{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
@@ -635,6 +637,23 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .medit .btn:disabled{opacity:.45;cursor:default}
 .medit #meditCompare.on{color:var(--accent);border-color:var(--accent-line)}
 .medit-save{width:100%}
+.medit-tabs button{flex:1;padding:6px 8px;font-weight:500}
+.medit-pane{display:flex;flex-direction:column;gap:8px}
+.keep-list{display:flex;flex-direction:column;gap:4px;max-height:220px;overflow-y:auto}
+.keep-empty{color:var(--muted);font-size:11px;line-height:1.5;padding:6px 0}
+.keep-item{display:flex;align-items:center;gap:6px;padding:3px 4px 3px 6px;border-radius:6px;border:1px solid transparent}
+.keep-item.on{border-color:rgba(255,75,92,.45);background:rgba(255,75,92,.08)}
+.keep-item input{flex:1;min-width:0;background:none;border:0;border-bottom:1px solid var(--line);color:var(--fg);font-size:12px;padding:2px 0}
+.keep-item input:focus{outline:none;border-bottom-color:var(--accent-line)}
+.keep-item .mono{flex:none;color:var(--fg-2);font-size:11px;font-family:var(--f-mono)}
+.keep-item .ib{width:22px;height:22px;flex:none}
+.keep-ic{flex:none;width:14px;height:10px}
+.keep-ic.line{border-top:2px dashed var(--crit);height:0}
+.keep-ic.zone{border:2px solid var(--crit);background:rgba(255,75,92,.25);border-radius:2px}
+.keep-live{font-size:11px;line-height:1.5;color:var(--fg-2)}
+.keep-live.ok{color:var(--ok)}
+.keep-live.warn{color:var(--warn)}
+#keepFinish{align-self:flex-start}
 .modal input.modal-select{font:12px var(--f-mono)}
 
 /* 管理地图（删除）弹窗 */
@@ -649,6 +668,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .mapdel-it:hover{background:var(--raise)}
 .mapdel-it input{grid-row:1 / 3;accent-color:var(--crit,#e5484d);margin:0}
 .mapdel-it .n{font-family:var(--f-mono);color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mapdel-it .n .lb{font-family:var(--f-sans,inherit);font-weight:600}
 .mapdel-it .m{grid-column:2 / 4;color:var(--muted);font-size:11px}
 .mapdel-it .m b{font-weight:500;color:var(--warn)}
 .mapdel-it .tag{font-style:normal;font-size:10px;padding:1px 6px;border-radius:9px;background:var(--raise);color:var(--accent);white-space:nowrap}

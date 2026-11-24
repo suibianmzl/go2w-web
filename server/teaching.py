@@ -113,8 +113,30 @@ class TeachingRepository:
                 ) from exc
         return self._core
 
+    # 网页「示教导航」开关（go2w_web 从 data/taught_nav.json 读、写）。默认关：示教节点开导航时常驻约 0.6 个核。
+    # 环境变量 GO2W_TAUGHT=1 / 0 强制开 / 关，网页开关这时不起作用。
+    enabled = False
+
+    @staticmethod
+    def forced():
+        v = os.environ.get('GO2W_TAUGHT')
+        return v if v in ('0', '1') else None
+
+    @property
+    def installed(self):
+        """后端带不带示教算法包（带了才打得开开关）。"""
+        try:
+            self.core
+            return True
+        except TeachingError:
+            return False
+
     @property
     def available(self):
+        # 关闭时后端不给导航带 GO2W_TAUGHT_ROUTE，网页也不会因为「示教节点缺失」去重启导航。
+        f = self.forced()
+        if f == '0' or (f is None and not self.enabled):
+            return False
         try:
             self.core
             return True

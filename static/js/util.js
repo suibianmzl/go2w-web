@@ -5,6 +5,9 @@ export const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 export const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
 export const deg = r => r * 180 / Math.PI;
 // 只有网页自己起的名字才是建图自动保存（和后端 AUTOSAVE_RE 一致）；autosave_…_c1 这种续建结果不算
+// 地图显示名（11-23）：后端 data/map_labels.json，网页上可以起中文名；文件名不变
+export const mapTitle = (labels, name) => (name && labels?.[name]) || name || '';
+export const mapOptText = (labels, name) => labels?.[name] ? `${labels[name]} · ${name}` : name;
 export const isAutosave = name => /^autosave_\d{4}_\d{6}(?:_prev)?$/.test(name);
 export const fmt = (v, n = 2) => (v >= 0 ? ' ' : '') + v.toFixed(n);
 export const gauss = () => { let u = 0; while (!u) u = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random()); };
