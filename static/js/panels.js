@@ -408,7 +408,8 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const rb = store.rollback;
     $('#rbOn').checked = rb.on;
     $('#rbState').textContent = rb.saving ? '保存中…' : rb.run ? `缓存最近 ${rb.seconds} 秒` : rb.on ? '启动建图 / 定位 / 导航后开始' : '已关闭';
-    $('#rbSave').textContent = `保存前 ${rb.seconds} 秒＋后 ${rb.after ?? 10} 秒`;
+    $('#rbSave').textContent = rb.saving || actions.rollbackCapture.state.busy ? '录制中…' : '录制当前数据';
+    $('#rbSave').title = `Shift+Enter：保存点击前 ${rb.seconds} 秒和后 ${rb.after ?? 10} 秒`;
     $('#rbSave').disabled = !store.link.ok || !rb.run || rb.saving || actions.rollbackCapture.state.busy || !!actions.rollbackCapture.state.pending;
     setHTML('#bagList', store.bags.length ? store.bags.map((b,i) => {
       const live = b.name === liveBag, u = store.uploads[b.name] || {}, upping = u.state === 'run', waiting = upping && u.phase === 'waiting';
@@ -418,9 +419,11 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const st = upping ? `<span class="mm bag-st run">${waiting ? '等语音' : `上传 ${u.pct}%`}</span>` : u.state === 'fail' ? `<span class="mm bag-st fail" title="${(u.msg || '').replace(/"/g, '&quot;')}">上传失败</span>` : u.state === 'stale' ? '<span class="mm bag-st fail">待重传</span>' : u.state === 'done' ? '<span class="mm bag-st done">已上传</span>' : '<span class="mm"></span>';
       const del = `<button class="ib bag-del" data-del="${i}" ${live || upping ? `disabled title="${live ? '正在录制，先停止录包' : '正在上传，等传完再删'}"` : `title="删除 ${b.name}"`} aria-label="删除录包 ${b.name}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`;
       return `<div class="mrow bag"><span class="mn">${b.name}</span><span class="mm">${live ? '录制中' : fmtDur(b.dur)}</span><span class="mm">${b.size>1024?(b.size/1024).toFixed(1)+' GB':b.size.toFixed(0)+' MB'}</span>${st}${up}${del}</div>`; }).join('')
-      : `<div class="empty">data/bags 里没有录包</div>`);
-    $('#bagBtn').textContent = bs==='run' ? '停止录包' : bs==='stop' ? '开始录包' : bs==='starting' ? '启动中…' : '停止中…';
-    $('#bagBtn').title = bs==='run' && store.bagSegment ? `正在录：每 ${store.bagSegment} 秒存一个包，包名按开始时间` : `开始后每 30 秒存一个包，包名按开始时间`;
+      : `<div class="empty">还没有录包</div>`);
+    $('#bagBtn').textContent = bs==='run' ? '停止录制' : bs==='stop' ? '开始持续录制' : bs==='starting' ? '启动中…' : '停止中…';
+    $('#bagBtn').dataset.state = bs;
+    $('#bagRecordingState').hidden = bs !== 'run';
+    $('#bagBtn').title = bs==='run' && store.bagSegment ? `正在录制中，每 ${store.bagSegment} 秒保存一个包` : '持续录制，每30秒保存一个包';
     bagSync(); bagListRender();
     const noneSel = store.bagTopics === '';
     $('#bagSelBtn').disabled = bs !== 'stop';

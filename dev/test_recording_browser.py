@@ -77,7 +77,7 @@ def main():
         # 浏览器安全上下文关闭：仍发录包请求，明确说明语音未录制。
         phone.add_init_script('Object.defineProperty(window,"isSecureContext",{value:false});')
         phone.reload(wait_until='networkidle')
-        expect(phone.locator('#voiceStatus')).to_contain_text('HTTPS')
+        expect(phone.locator('#voiceStatus')).to_be_empty()
         expect(phone.locator('#recordButton')).to_be_enabled(timeout=5000)
         phone.locator('#recordButton').click()
         expect(phone.locator('#voiceStatus')).to_contain_text('数据包已保存；',timeout=30000)

@@ -227,10 +227,9 @@
           <div class="dpane" id="pLogs">
             <div class="mb">
               <div class="logs" id="logBox"></div>
-              <div>
-                <h4>录包 <span class="mono" style="color:var(--muted);font-size:11px">data/bags</span></h4>
-                <!-- 录哪些 topic：下拉多选，默认全选（= *，之后新出现的 topic 也会录）；取消勾选后只录勾着的；刷新页面恢复全选 -->
-                <div class="inrow bag-row">
+              <div id="recordingControls">
+                <div class="bag-header">
+                  <div class="bag-heading"><h4>录包</h4><span class="bag-recording-state" id="bagRecordingState" role="status" hidden>正在录制中</span></div>
                   <div class="tsel" id="bagSel">
                     <button class="tsel-btn" id="bagSelBtn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="bagSelPop"><span class="tsel-k">录制 topic</span><span class="tsel-v" id="bagSelSum">全部</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
                     <div class="tsel-pop" id="bagSelPop" hidden>
@@ -238,14 +237,22 @@
                       <div class="tsel-list" id="bagSelList" role="listbox" aria-multiselectable="true"></div>
                     </div>
                   </div>
-                  <button class="btn sm" id="bagBtn">开始录包</button>
                 </div>
-                <div class="bag-tip">每 30 秒存一个包，包名按开始时间。全选会录包括点云在内的所有 topic，每个包可能几百 MB。</div>
-                <div class="inrow rb-row"><label class="bag-livox"><input type="checkbox" id="rbOn"> 回溯录制</label><span class="meta rb-state" id="rbState"></span><button class="btn sm pri" id="rbSave" title="Shift+Enter：保存点击前20秒和后10秒" aria-keyshortcuts="Shift+Enter">保存前 20 秒＋后 10 秒</button></div>
-                <div class="voice-controls"><label for="voiceSeconds">语音备注 <input id="voiceSeconds" type="number" min="1" max="20" step="1" value="5" inputmode="numeric"> 秒</label><span>1–20秒 · Shift+Enter</span><a id="recordPageLink" href="/record">手机录制页 ↗</a></div>
+                <div class="bag-actions">
+                  <button class="btn pri bag-action" id="bagBtn" type="button">开始持续录制</button>
+                  <button class="btn pri bag-action" id="rbSave" type="button" title="Shift+Enter：保存点击前20秒和后10秒" aria-keyshortcuts="Shift+Enter">录制当前数据</button>
+                </div>
                 <p class="voice-status" id="voiceStatus" role="status" aria-live="polite"></p>
                 <div class="voice-recovery"><button class="btn sm" id="voiceRetry" hidden>重试保存语音</button><a id="voiceDownload" hidden>下载本地语音</a><button class="btn sm ghost" id="voiceDiscard" hidden>结束本次语音处理</button></div>
                 <div id="bagList"></div>
+                <details class="bag-settings" id="bagSettings">
+                  <summary>更多设置<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></summary>
+                  <div class="bag-settings-body">
+                    <div class="inrow rb-row"><label class="bag-livox"><input type="checkbox" id="rbOn" checked> 回溯录制</label><span class="meta rb-state" id="rbState"></span></div>
+                    <div class="voice-controls"><label for="voiceSeconds">语音备注 <input id="voiceSeconds" type="number" min="1" max="20" step="1" value="5" inputmode="numeric"> 秒</label><span>1–20秒 · Shift+Enter</span><a id="recordPageLink" href="/record">手机录制页 ↗</a></div>
+                    <p class="bag-tip">持续录制每30秒保存一个包；录制当前数据保存点击前20秒＋后10秒。topic 默认全选，会包含之后新出现的话题。</p>
+                  </div>
+                </details>
               </div>
             </div>
           </div>

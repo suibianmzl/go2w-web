@@ -180,5 +180,4 @@ export function setupRecordingControls(capture, root=document){
       else download.removeAttribute('href');
     }
   });
-  if(!globalThis.isSecureContext)status.textContent='数据录包可用；语音需要受信任的 HTTPS 连接';
 }
