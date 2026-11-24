@@ -27,6 +27,7 @@ export function createStore(){
     routeDraft: { id: null, map: null, points: [], confirmed: false },
     routeCheck: null,
     routeReplace: null,             // 正在重新选位置的站（下标）；null = 地图上点击是加新站
+    routeInsert: null,              // 地图上点击把新站插到这个下标（原第 routeInsert 站之后）；null = 加到末尾
     // 每图只保留一条活动示教；采集草稿单独存在文档 capture 中，不与多站导航任务混用。
     taught: null, taughtByMap: {}, taughtMap: null, taughtRange: null,
     taughtNav: null,   // 「启用示教导航」开关 { on, forced, installed }

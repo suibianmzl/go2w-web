@@ -130,6 +130,20 @@ export function createActions(store, src){
         store.onRouteEdit?.();
         return true;
       }
+      const at = store.routeInsert;
+      if (Number.isInteger(at) && at >= 0 && at < draft.points.length){
+        // 插入：新站放在下标 at（原来的第 at 站之后），后面的站顺延；插完继续在新站后面插，方便连着插几站
+        const near = [draft.points[at - 1], draft.points[at]].some(q => q && Math.hypot(p.x - q.x, p.y - q.y) < .05);
+        if (near) return toast('和相邻的站重合了，换个位置', 'warn');
+        const points = [...draft.points];
+        points.splice(at, 0, p);
+        store.routeDraft = { ...draft, map, points, confirmed: false };
+        store.routeInsert = at + 1;
+        toast(`已插入为第 ${at + 1} 站，可以接着点下一站，Esc 结束`, 'ok');
+        store.onRouteEdit?.();
+        return 'insert';
+      }
+      store.routeInsert = null;
       const last = draft.points.at(-1);
       if (last && Math.hypot(p.x - last.x, p.y - last.y) < .05) return toast('这一站已添加', 'warn');
       store.routeDraft = { ...draft, map, points: [...draft.points, p], confirmed: false };

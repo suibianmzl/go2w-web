@@ -8,7 +8,7 @@ export function setupRouteEditor(store, actions, setTool){
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
   const rtV = $('#rtV'), rtW = $('#rtW');
-  let lastRoutes, lastMap, lastDraft, lastReplace = null, savedDraft = store.routeDraft, saving = false;
+  let lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false;
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
@@ -27,7 +27,7 @@ export function setupRouteEditor(store, actions, setTool){
   const optsDirty = () => { const r = selected(); return !!r && savedDraft.id === r.id && !sameOpts(readOpts(), optsOf(r)); };
 
   function edit(route = null){
-    store.routeReplace = null;
+    store.routeReplace = store.routeInsert = null;
     store.routeDraft = route ? { ...route, confirmed: true } : { id:null, map:null, points:[], confirmed:false };
     store.routeCheck = null;
     savedDraft = store.routeDraft;
@@ -106,6 +106,62 @@ export function setupRouteEditor(store, actions, setTool){
   const nameDirty = () => name.value !== (savedDraft.name || '');
   const needSave = () => { const r = selected(); return !!r && store.routeDraft === savedDraft && store.routeDraft.id === r.id && (optsDirty() || nameDirty()); };
 
+  // 把第 from 站挪到第 to 站（下标），其余顺延；站名、备注、朝向跟着站走
+  function movePoint(from, to){
+    const current = store.routeDraft;
+    if (from === to || !current.points[from]) { lastDraft = null; render(); return; }
+    const points = [...current.points];
+    const [p] = points.splice(from, 1);
+    points.splice(to, 0, p);
+    store.routeReplace = store.routeInsert = null;
+    store.routeDraft = { ...current, points, confirmed:false };
+    render();
+  }
+  // 列表里拖拽排序：按住 ⠿ 拖，蓝线标出松手后放在哪；拖到列表上下边缘会自动滚动
+  function startDrag(e, li, from){
+    if (e.button > 0) return;
+    e.preventDefault();
+    const grip = e.currentTarget;
+    grip.setPointerCapture(e.pointerId);
+    li.classList.add('route-dragging');
+    let to = from, scroll = 0, lastY = e.clientY;
+    const rows = () => [...list.children];
+    const mark = () => {
+      rows().forEach(r => r.classList.remove('drop-before', 'drop-after'));
+      const rs = rows();
+      if (to === from) return;
+      if (to < from) rs[to]?.classList.add('drop-before');
+      else rs[to]?.classList.add('drop-after');
+    };
+    const locate = y => {
+      lastY = y;
+      const rs = rows();
+      let k = rs.length - 1;
+      for (let j = 0; j < rs.length; j++){
+        const r = rs[j].getBoundingClientRect();
+        if (y < r.top + r.height / 2){ k = j > from ? j - 1 : j; break; }
+      }
+      to = Math.max(0, Math.min(rs.length - 1, k));
+      const box = list.getBoundingClientRect();
+      scroll = y < box.top + 24 ? -8 : y > box.bottom - 24 ? 8 : 0;
+      mark();
+    };
+    const timer = setInterval(() => { if (scroll){ list.scrollTop += scroll; locate(lastY); } }, 30);
+    const move = ev => locate(ev.clientY);
+    const done = ev => {
+      clearInterval(timer);
+      grip.removeEventListener('pointermove', move);
+      grip.removeEventListener('pointerup', done);
+      grip.removeEventListener('pointercancel', done);
+      li.classList.remove('route-dragging');
+      rows().forEach(r => r.classList.remove('drop-before', 'drop-after'));
+      if (ev.type === 'pointerup' && to !== from) movePoint(from, to);
+    };
+    grip.addEventListener('pointermove', move);
+    grip.addEventListener('pointerup', done);
+    grip.addEventListener('pointercancel', done);
+  }
+
   function render(){
     let draft = store.routeDraft;
     if (store.routes !== lastRoutes || store.mapCurrent !== lastMap){
@@ -122,17 +178,20 @@ export function setupRouteEditor(store, actions, setTool){
       select.value = draft.id || '';
     }
     if (store.routeReplace != null && !(store.routeReplace < draft.points.length)) store.routeReplace = null;
-    if (draft !== lastDraft || store.routeReplace !== lastReplace){
-      lastDraft = draft; lastReplace = store.routeReplace;
+    if (store.routeInsert != null && !(store.routeInsert >= 1 && store.routeInsert < draft.points.length)) store.routeInsert = null;
+    if (draft !== lastDraft || store.routeReplace !== lastReplace || store.routeInsert !== lastInsert){
+      lastDraft = draft; lastReplace = store.routeReplace; lastInsert = store.routeInsert;
       list.replaceChildren(...draft.points.map((p, i) => {
         const li = document.createElement('li'), label = document.createElement('span');
         const end = draft.confirmed && i === draft.points.length - 1;
         const angle = `${Math.round(deg(p.th))}°`;
         const heading = p.manualHeading === false ? (draft.confirmed ? `自动 ${angle}` : '自动朝向') : angle;
-        label.textContent = `${i + 1} 号点${end ? (round.checked ? ' · 之后回到 1 号点' : ' · 终点') : ''} · ${heading}`;
-        label.title = `坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
+        label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${heading}`;
+        label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
         label.classList.toggle('route-end', end);
         li.classList.toggle('route-replacing', store.routeReplace === i);
+        li.classList.toggle('route-insert-after', store.routeInsert === i + 1);
+        li.dataset.i = i;
         // 站名、备注：只改文字，不影响路径。保留规划结果和输入框焦点
         const textField = (el, key, cls, max, placeholder) => {
           el.className = cls;
@@ -163,12 +222,32 @@ export function setupRouteEditor(store, actions, setTool){
             const current = store.routeDraft;
             const points = [...current.points];
             action(points);
+            store.routeReplace = store.routeInsert = null;
             store.routeDraft = { ...current, points, confirmed:false };
             render();
           };
           return b;
         };
-        const move = target => points => { [points[i], points[target]] = [points[target], points[i]]; };
+        // 拖拽把手：按住上下拖到想要的位置松手（鼠标、触屏都行）
+        const grip = document.createElement('span');
+        grip.className = 'route-grip'; grip.textContent = '⠿';
+        grip.title = '按住拖动调整第 ' + (i + 1) + ' 点的顺序';
+        grip.onpointerdown = e => startDrag(e, li, i);
+        // 序号：直接改数字就把这一站挪到第几站（Enter / 离开输入框生效，Esc 还原）
+        const order = Object.assign(document.createElement('input'), { type:'text', inputMode:'numeric', value:String(i + 1) });
+        order.className = 'route-order';
+        order.title = '改数字把这一站挪到第几站';
+        order.setAttribute('aria-label', `第 ${i + 1} 点的序号`);
+        order.onfocus = () => order.select();
+        order.onkeydown = e => {
+          if (e.key === 'Enter'){ e.preventDefault(); order.blur(); }
+          if (e.key === 'Escape'){ order.value = String(i + 1); order.blur(); }
+        };
+        order.onchange = () => {
+          const n = Math.round(+order.value);
+          if (!Number.isFinite(n) || n < 1){ order.value = String(i + 1); return; }
+          movePoint(i, Math.min(n, store.routeDraft.points.length) - 1);
+        };
         // 改位置：点了以后地图上点一下（或按住拖朝向）只替换这一站；再点一次取消
         const place = document.createElement('button');
         const placing = store.routeReplace === i;
@@ -177,13 +256,29 @@ export function setupRouteEditor(store, actions, setTool){
         place.title = placing ? '取消重选第 ' + (i + 1) + ' 点位置' : '在地图上重新选第 ' + (i + 1) + ' 点的位置';
         place.setAttribute('aria-label', place.title);
         place.onclick = () => {
+          store.routeInsert = null;
           if (store.routeReplace === i){ store.routeReplace = null; setTool('pan'); }
           else { store.routeReplace = i; setTool('route'); }
           render();
         };
-        li.append(label, place, button('↑', '上移第 ' + (i + 1) + ' 点', move(i - 1), i === 0),
-          button('↓', '下移第 ' + (i + 1) + ' 点', move(i + 1), i === draft.points.length - 1),
-          button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, pointNote);
+        // 插入：在这一站后面插新站（地图上点，可以连着插几站）。最后一站后面就是普通的加点，不需要这个按钮
+        const ins = document.createElement('button');
+        const inserting = store.routeInsert === i + 1;
+        ins.className = 'btn sm' + (inserting ? ' on' : '');
+        ins.textContent = inserting ? '取消' : '＋插入';
+        ins.title = inserting ? '结束插入' : `在第 ${i + 1} 站和第 ${i + 2} 站之间插入新站`;
+        ins.setAttribute('aria-label', ins.title);
+        ins.disabled = i === draft.points.length - 1;
+        ins.onclick = () => {
+          store.routeReplace = null;
+          if (inserting){ store.routeInsert = null; setTool('pan'); }
+          else { store.routeInsert = i + 1; setTool('route'); }
+          render();
+        };
+        const head = document.createElement('div');
+        head.className = 'route-head';
+        head.append(grip, order, label);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, pointNote);
         return li;
       }));
     }
@@ -216,9 +311,9 @@ export function setupRouteEditor(store, actions, setTool){
     if (runHint.textContent !== runMessage) runHint.textContent = runMessage;
     let message = '用「导航点」单击加点，拖拽可指定朝向。至少选两站。';
     if (draft.map && !matching) message = `路线属于地图 ${draft.map}，请先切图。`;
-    else if (!draft.confirmed && draft.points.length >= 2) message = '选完后点击「确认路线」，最后一站将标为终点。';
+    else if (!draft.confirmed && draft.points.length >= 2) message = '选完后点击「确认路线」，最后一站将标为终点。拖 ⠿ 或改序号调整顺序，「＋插入」在某站后面加站。';
     else if (draft.confirmed){
-      message = '路线已确认。';
+      message = '路线已确认。调整顺序：拖 ⠿ 或直接改序号；「＋插入」在某站后面加站。';
     }
     if (hint.textContent !== message) hint.textContent = message;
   }

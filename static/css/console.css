@@ -482,8 +482,18 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-loop input:disabled,.route-loop input:disabled+span{opacity:.45}
 .route-launch .btn{width:100%}
 .route-launch .route-hint:not(:empty){margin-top:4px}
-.route-points{list-style:none;margin:6px 0 0;padding:0;max-height:180px;overflow:auto}
-.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(4,auto);align-items:center;gap:4px;margin-top:6px}
+.route-points{list-style:none;margin:6px 0 0;padding:0;max-height:min(48vh,420px);overflow:auto}
+.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:4px;margin-top:6px;padding:2px 0;border-top:2px solid transparent;border-bottom:2px solid transparent}
+.route-points .route-head{display:flex;align-items:center;gap:4px;min-width:0}
+.route-points .route-grip{flex:none;cursor:grab;touch-action:none;user-select:none;color:var(--fg-2);font-size:14px;line-height:1;padding:2px 1px;overflow:visible}
+.route-points .route-grip:active{cursor:grabbing}
+.route-points .route-order{flex:none;width:28px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);text-align:center;font-size:11px;font-weight:600;padding:0}
+.route-points .route-order:focus{border-color:#6fb6ff;outline:none}
+.route-points .route-head span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.route-points li.route-dragging{opacity:.45}
+.route-points li.drop-before{border-top-color:#6fb6ff}
+.route-points li.drop-after{border-bottom-color:#6fb6ff}
+.route-points li.route-insert-after{border-bottom-color:#6fb6ff;border-bottom-style:dashed}
 .route-points span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .route-point-name{grid-column:1/-1;width:100%;min-width:0;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font-size:11px}
 .route-point-note{grid-column:1/-1;width:100%;min-width:0;min-height:38px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:4px 7px;font-family:inherit;font-size:11px;line-height:1.4;resize:vertical}

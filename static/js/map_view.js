@@ -45,8 +45,9 @@ export function createMapView(store, actions){
     }
     if (V.tool === 'route'){
       hint.hidden = false;
-      const k = store.routeReplace;
+      const k = store.routeReplace, at = store.routeInsert;
       hint.textContent = Number.isInteger(k) ? `给第 ${k + 1} 点重新选位置：点击地图 · 按住拖拽指定朝向 · Esc 取消`
+        : Number.isInteger(at) ? `在第 ${at} 站和第 ${at + 1} 站之间插入新站：点击地图 · 按住拖拽指定朝向 · 可连续插入 · Esc 结束`
         : '点击添加一站 · 按住拖拽指定到站朝向';
       return;
     }
@@ -318,6 +319,13 @@ export function createMapView(store, actions){
         }
         ctx.restore();
       }
+      const at = store.routeInsert;
+      if (Number.isInteger(at) && V.tool === 'route' && draft.points[at - 1] && draft.points[at]){
+        // 插入模式：把新站要插进去的那一段标成蓝色虚线
+        const a = draft.points[at - 1], b = draft.points[at];
+        ctx.save(); ctx.strokeStyle = '#6fb6ff'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
+        ctx.beginPath(); ctx.moveTo(sx(a.x), sy(a.y)); ctx.lineTo(sx(b.x), sy(b.y)); ctx.stroke(); ctx.restore();
+      }
       draft.points.forEach((p, i) => drawPin(p, String(i + 1),
         store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
           : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false));
@@ -373,7 +381,7 @@ export function createMapView(store, actions){
       Object.assign(alignment(), { points:[], target:null, source:null });
     }
     if (tool==='teleop' && V.tool!=='teleop' && onTeleop && !onTeleop()) return;
-    if (tool !== 'route') store.routeReplace = null;   // 离开「导航点」= 取消重选位置
+    if (tool !== 'route') store.routeReplace = store.routeInsert = null;   // 离开「导航点」= 取消重选位置 / 插入
     V.tool = tool; $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool===tool));
     $('#teleHint').hidden = tool!=='teleop'; if (tool!=='measure') V.measure = [];
     V.aim = null; showHint();
@@ -473,8 +481,9 @@ export function createMapView(store, actions){
     if (d.tool === 'route'){
       if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
       const th = d.moved ? Math.atan2(d.y1 - d.y0, d.x1 - d.x0) : 0;
-      const replaced = actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved }) === true;
-      if (replaced) setTool('pan');   // 改完一站就退出，免得下一下误加新站
+      const r = actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved });
+      if (r === true) setTool('pan');   // 改完一站就退出，免得下一下误加新站
+      else showHint();                  // 插入后提示条跟着换成下一段
       return;
     }
     if (d.moved) return commit(d.tool, d.x0, d.y0, d.x1, d.y1);           // 按住拖动
