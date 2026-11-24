@@ -51,7 +51,7 @@ from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from aiohttp import WSCloseCode, WSMsgType, web
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
-from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateThroughPoses, NavigateToPose
 from nav2_msgs.msg import BehaviorTreeLog, ParticleCloud
 from nav2_msgs.srv import ClearCostmapExceptRegion, LoadMap
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
@@ -237,7 +237,23 @@ ROUTE_PASS_DIST = 0.6   # 实际取 min(0.6, 这段路长度的一半)
 # 11-20 晚：拐角大的站提前换目标会「开过点」——狗还在 0.4 m/s 往前冲，Nav2 换目标要 ~1 s，冲过去后倒车 ~1.5 s、
 # 再慢慢原地转，比停下来转还慢。所以只有拐角不超过这个角度（= RotationShim angular_dist_threshold 0.5 rad）
 # 的站才不停车经过；拐角大的站照常到点停下，但朝向仍面向下一站（只转一次，不会先转到站点朝向再转回来）
-ROUTE_PASS_TURN = 0.5
+# 11-24：0.5 rad 时 1–2 m 一站、拐角 37–46° 的小圈（lab_20261118_2，11 站）几乎每站都停，每站减速 + 原地转 + 再起步
+# ≈ 2.5 s，一圈多 18 s（DDS 黑匣子 16:47–16:57）。放宽到 1.05 rad（60°）；要配合把 RotationShim angular_dist_threshold
+# 调大（~0.9 rad，狗上 ~/nav_tune/shim_turn.sh），否则换成下一站的新路径偏角 > 0.5 rad 时 shim 照样原地转
+ROUTE_PASS_TURN = 1.05
+# 11-24：Nav2 报到达时离站点超过这么远就不算（xy 容差 0.25 + 余量）。提前换下一站后，Nav2 有时 0.7 s 就报新目标
+# 「到达」，狗其实离那站还有 ~0.9 m（4/6 趟第 10 站被这样跳过）。这时重新发这一站，最多 ROUTE_FAKE_RETRY 次
+ROUTE_FAKE_ARRIVE = 0.5
+ROUTE_FAKE_RETRY = 2
+ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
+# 11-24 v1.1.11「连续通过」（任务运行参数 opts.through，默认开）：以停留站为界把路线切成几段，每段一个
+# NavigateThroughPoses（Nav2 一次规划经过这段所有站的连续路径），中间站不减速不停车；停留站 / 终点照常停稳。
+# 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
+# 网页离下一站不到 ROUTE_THROUGH_PASS 就算经过（和行为树里的半径一样）；Nav2 先划掉了也算
+ROUTE_THROUGH_PASS = 0.5
+ROUTE_SEG_MAX = 30       # 一段最多几站（一直循环、没有停留站时也要分段）
+THROUGH_BT = os.environ.get('GO2W_THROUGH_BT') or os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), 'bt', 'navigate_through_go2w.xml')
 ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
 # 地图显示方向（只转网页画面，不改地图坐标）：按地图名存在 data/map_views.json，大家看到的方向一样。
 # 建图时还没有地图名，用 MAPPING_VIEW 暂存，存图时带给新地图
@@ -594,6 +610,7 @@ class Bridge(TaughtMeasurements, Node):
         self.goal = None        # 网页发出的当前目标（见 track_goal）
         self.on_goal_fail = None   # 单点目标被 Nav2 放弃时回调 (x, y, th)，在 rclpy 线程里调；Server 设置
         self.statuses = {}      # 所有 navigate_to_pose 目标的状态：uuid → status（含 RViz、patrol 发的）
+        self.statuses_through = {}   # navigate_through_poses 目标的状态（11-24 任务「连续通过」）
         self.bt_running = set()
         self.params = {}
 
@@ -606,6 +623,7 @@ class Bridge(TaughtMeasurements, Node):
         self.create_subscription(Bool, '/odom_healthy', self.on_healthy, 10)
         self.create_subscription(Bool, f'{BRIDGE}/armed', self.on_armed, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status', self.on_status, latched)
+        self.create_subscription(GoalStatusArray, '/navigate_through_poses/_action/status', self.on_status_through, latched)
         self.create_subscription(BehaviorTreeLog, '/behavior_tree_log', self.on_bt, 10)
         # AMCL 的 /amcl_pose 是 transient_local，只在机器人移动后更新；用 latched 订阅才能一连上就拿到最近一次
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.on_amcl, latched)
@@ -639,6 +657,9 @@ class Bridge(TaughtMeasurements, Node):
 
         self.initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        # 11-24 多点导航：任务「连续通过」把一段站点一次发给 Nav2，规划一条连续路径，中间站不停
+        self.nav_through = ActionClient(self, NavigateThroughPoses, 'navigate_through_poses')
+        self.cancel_through_cli = self.create_client(CancelGoal, '/navigate_through_poses/_action/cancel_goal')
         self.planner = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
         self.cancel_cli = self.create_client(CancelGoal, '/navigate_to_pose/_action/cancel_goal')
         self.arm_cli = self.create_client(SetBool, f'{BRIDGE}/arm')
@@ -1076,6 +1097,10 @@ class Bridge(TaughtMeasurements, Node):
         with self.lock:
             self.statuses = {bytes(s.goal_info.goal_id.uuid): s.status for s in m.status_list}
 
+    def on_status_through(self, m):
+        with self.lock:
+            self.statuses_through = {bytes(s.goal_info.goal_id.uuid): s.status for s in m.status_list}
+
     def on_bt(self, m):
         with self.lock:
             for e in m.event_log:
@@ -1095,6 +1120,11 @@ class Bridge(TaughtMeasurements, Node):
             g['nav_time'] = secs(fb.navigation_time)
             g['eta'] = secs(fb.estimated_time_remaining)
             g['recoveries'] = fb.number_of_recoveries
+            left = getattr(fb, 'number_of_poses_remaining', None)   # 多点导航才有：还没经过的点数（含终点）
+            if left is not None:
+                g['poses_left'] = int(left)
+            if g.get('first_fb') is None and fb.distance_remaining > 0:
+                g['first_fb'] = time.monotonic()   # 第一次有路径长度 = 规划出来了（记规划用时）
 
     def on_result(self, gid, fut):
         try:
@@ -1162,6 +1192,12 @@ class Bridge(TaughtMeasurements, Node):
         p.pose.orientation.z, p.pose.orientation.w = math.sin(th / 2), math.cos(th / 2)
         return p
 
+    def send_through(self, poses, behavior_tree=''):
+        g = NavigateThroughPoses.Goal()
+        g.poses = [self.stamped_pose(x, y, th) for x, y, th in poses]
+        g.behavior_tree = behavior_tree
+        return self.nav_through.send_goal_async(g, feedback_callback=self.on_feedback)
+
     def send_goal(self, x, y, th):
         g = NavigateToPose.Goal()
         g.pose = self.stamped_pose(x, y, th)
@@ -1179,13 +1215,16 @@ class Bridge(TaughtMeasurements, Node):
         gid = bytes(handle.goal_id.uuid)
         with self.lock:
             self.goal = {'id': gid, 'pose': pose, 'kind': kind, 't0': time.monotonic(), 'status': 'active', 'end': None,
-                         'remaining': None, 'total': None, 'nav_time': None, 'eta': None, 'recoveries': 0}
+                         'remaining': None, 'total': None, 'nav_time': None, 'eta': None, 'recoveries': 0,
+                         'poses_left': None, 'first_fb': None}
         result = handle.get_result_async()
         result.add_done_callback(lambda f: self.on_result(gid, f))
         return result
 
     def cancel_all(self):
         """取消所有 navigate_to_pose 目标（零 uuid + 零时间戳 = 全部），包括 RViz、patrol 发的。"""
+        if self.cancel_through_cli.service_is_ready():   # 多点导航的目标也一起取消（不等结果）
+            self.cancel_through_cli.call_async(CancelGoal.Request())
         return self.cancel_cli.call_async(CancelGoal.Request())
 
     def clear_costmaps(self):
@@ -1275,14 +1314,16 @@ class Bridge(TaughtMeasurements, Node):
 
     def nav_active(self):
         with self.lock:
-            return any(s in ACTIVE for s in self.statuses.values()) or bool(self.goal and self.goal['status'] == 'active')
+            return (any(s in ACTIVE for s in self.statuses.values()) or any(s in ACTIVE for s in self.statuses_through.values())
+                    or bool(self.goal and self.goal['status'] == 'active'))
 
     def task(self):
         """任务卡片：网页发的目标显示详细进度；别处（RViz、patrol）发的只显示「外部目标」。"""
         with self.lock:
             g = dict(self.goal) if self.goal else None
             running = set(self.bt_running)
-            foreign = [k for k, s in self.statuses.items() if s in ACTIVE and (not g or k != g['id'])]
+            foreign = [k for k, s in [*self.statuses.items(), *self.statuses_through.items()]
+                       if s in ACTIVE and (not g or k != g['id'])]
         recovering = any(n in RECOVERY_NODES or n.startswith('Clear') for n in running)
         phase = 'recover' if recovering else 'follow' if 'FollowPath' in running else 'plan'
         if g:
@@ -1390,7 +1431,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.camera = C.Camera(pack, T_CAM, node.event)
         self.sys = SysStats()
         rid, src = robot_id()
-        node.get_logger().info(f'狗编号 {rid}（来自 {src}），录包名 = {rid}_MMDD_HHMMSS')
+        node.get_logger().info(f'狗编号 {rid}（来自 {src}），录包名 = {rid}_MMDD_HHMMSS（异常自动保存）/ {rid}_trigger_MMDD_HHMMSS（手动录包、保存刚才 N 秒）')
         # P3：进程管理。本地调试（GO2W_FAKE_PROCS=1）换成假模拟器里的进程
         self.simulated = bool(os.environ.get('GO2W_FAKE_PROCS'))
         if self.simulated:
@@ -1809,7 +1850,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'set_taught_nav':
                 return self.taught_nav_set(d.get('on') is True, self.remote(ws))
             if op == 'rollback_save':
-                return await self.rollback_save(self.remote(ws))
+                return await self.rollback_save(self.remote(ws), trigger=True)
             if op == 'bag_upload':
                 return await self.bag_upload(d.get('name'), self.remote(ws))
             if op == 'bag_stop':
@@ -2432,13 +2473,20 @@ class Server(TaughtWeb, RT.RtabWeb):
                 raise ValueError(f'站点备注最多 {ROUTE_NOTE_MAX} 个字符')
             if type(manual) is not bool:
                 raise ValueError('站点朝向类型无效')
-            clean.append({'x': point['x'], 'y': point['y'], 'th': point['th'],
-                          'name': label.strip(), 'note': note.strip(), 'manualHeading': manual})
+            dwell = point.get('dwell', 0)   # 11-24：到这一站停留几秒（0 = 不停留）
+            if isinstance(dwell, bool) or not isinstance(dwell, (int, float)) or not math.isfinite(dwell) \
+                    or not 0 <= dwell <= ROUTE_DWELL_MAX:
+                raise ValueError(f'站点停留时间需要 0–{ROUTE_DWELL_MAX} 秒')
+            item = {'x': point['x'], 'y': point['y'], 'th': point['th'],
+                    'name': label.strip(), 'note': note.strip(), 'manualHeading': manual}
+            if round(dwell) > 0:
+                item['dwell'] = int(round(dwell))
+            clean.append(item)
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
 
     # 任务的运行参数（11-12 起跟任务一起保存）：循环、圈数（0 = 一直循环）、最大 vx / wz。老任务没有就用默认值
-    ROUTE_OPTS = {'loop': False, 'loops': 1, 'vmax': 0.45, 'wmax': 1.2}
+    ROUTE_OPTS = {'loop': False, 'loops': 1, 'vmax': 0.45, 'wmax': 1.2, 'through': True}
 
     @staticmethod
     def route_opts(o, strict=True):
@@ -2449,11 +2497,11 @@ class Server(TaughtWeb, RT.RtabWeb):
             if strict:
                 raise ValueError('运行参数格式不对')
             return out
-        checks = {'loop': lambda v: type(v) is bool,
+        checks = {'loop': lambda v: type(v) is bool, 'through': lambda v: type(v) is bool,
                   'loops': lambda v: type(v) is int and 0 <= v <= 1000,
                   'vmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.1 <= v <= 1.2,
                   'wmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.2 <= v <= 1.5}
-        msgs = {'loop': '循环开关无效', 'loops': '圈数需要 0–1000 的整数', 'vmax': '最大 vx 需要在 0.1–1.2 m/s 之间',
+        msgs = {'loop': '循环开关无效', 'through': '连续通过开关无效', 'loops': '圈数需要 0–1000 的整数', 'vmax': '最大 vx 需要在 0.1–1.2 m/s 之间',
                 'wmax': '最大 wz 需要在 0.2–1.5 rad/s 之间'}
         for k, ok in checks.items():
             if k not in o:
@@ -3334,6 +3382,181 @@ class Server(TaughtWeb, RT.RtabWeb):
         await asyncio.sleep(COSTMAP_REFILL)
         n.event('INFO', '出发前已清除代价地图里的旧障碍标记')
 
+    def through_passed(self, ws, route, seg, k):
+        """连续通过：seg 里第 k 站经过了。记进度、写断点，下一站成为当前目标。"""
+        n, points = self.node, route['record']['points']
+        (i, loop, back), pt = seg[k][0], seg[k][1]
+        route['done'] += 1
+        n.event('INFO', f"经过第 {i + 1} 站{'（回到 1 号点）' if back else ''} ({pt['x']:.2f}, {pt['y']:.2f})，不停车")
+        (j, loop2, back2), q = seg[k + 1][0], seg[k + 1][1]
+        route.update(index=j, loop=loop2, back=back2, target=q)
+        self.resume_checkpoint(route)
+        reason = self.route_blocker(ws, route['record'])
+        if reason:
+            raise RuntimeError(reason)
+
+    async def run_through(self, ws, route, state):
+        """连续通过（v1.1.11）：从 state 起一段一段跑。返回 None = 全部跑完；'stop' = 被取消（已处理）；
+        状态元组 = 多点导航用不了，从这一站起退回一站一站走。"""
+        n, record = self.node, route['record']
+        points, loops = record['points'], route['loops']
+        total = len(points)
+        if not os.path.isfile(THROUGH_BT):
+            n.event('WARN', f'找不到多点导航行为树 {THROUGH_BT}，这次按一站一站走')
+            return state
+        route['through'] = True
+        fake, fake_state = 0, None
+        while state:
+            if route['stop'].is_set():
+                return 'stop'
+            # 这一段：从 state 起，到停留站 / 终点 / ROUTE_SEG_MAX 站为止
+            seg, s = [], state
+            while s:
+                i, loop, back = s
+                nxt = self.route_next(total, loops, s)
+                dwell = points[i].get('dwell', 0) if nxt is not None else 0
+                seg.append((s, self.route_pose(points, i, back), dwell, nxt))
+                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX:
+                    break
+                s = nxt
+            poses = []
+            for k, (_, pt, dwell, nxt) in enumerate(seg):
+                last = k == len(seg) - 1
+                if last and (dwell or nxt is None):
+                    th = pt['th']                       # 要停下来的站：站点自己的朝向
+                else:                                   # 途经点 / 分段处：面向下一站
+                    q = seg[k + 1][1] if not last else self.route_pose(points, nxt[0], nxt[2])
+                    th = math.atan2(q['y'] - pt['y'], q['x'] - pt['x'])
+                poses.append((pt['x'], pt['y'], th))
+            i, loop, back = state
+            route.update(index=i, loop=loop, back=back, target=seg[0][1], goal=None)
+            self.resume_checkpoint(route)
+            reason = self.route_blocker(ws, record)
+            if reason:
+                raise RuntimeError(reason)
+            here = n.lookup(BASE_FRAME)
+            length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip([here or poses[0]] + poses, poses))
+            t_send = time.monotonic()
+            request = n.send_through(poses, THROUGH_BT)
+            try:
+                handle = await self.aw(request, 3.0)
+            except asyncio.TimeoutError:
+                request.add_done_callback(self.cancel_late_goal)
+                raise RuntimeError('Nav2 接收多点目标超时') from None
+            if not handle.accepted:
+                n.event('WARN', 'Nav2 拒绝多点目标，这次按一站一站走')
+                return state
+            if route['stop'].is_set():
+                await self.aw(handle.cancel_goal_async(), 2.0)
+                return 'stop'
+            end = poses[-1]
+            gid = bytes(handle.goal_id.uuid)
+            result = n.track_goal(handle, end, 'route')
+            route['goal'] = dict(zip(('x', 'y', 'th'), end))
+            a, b = seg[0][0], seg[-1][0]
+            span = f'{a[0] + 1}' if len(seg) == 1 else f'{a[0] + 1}–{b[0] + 1}'
+            n.event('INFO', f"连续通过：第 {span} 站（{len(seg)} 站，约 {length:.1f} m）"
+                            f"{'，到了停留' if seg[-1][2] else ''}")
+            stop = asyncio.create_task(route['stop'].wait())
+            done = asyncio.create_task(self.aw(result, 120.0 + length / 0.1))
+            k, planned, left = 0, False, None
+            try:
+                while True:
+                    await asyncio.wait((stop, done), timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                    if route['stop'].is_set():
+                        await self.aw(handle.cancel_goal_async(), 2.0)
+                        return 'stop'
+                    with n.lock:
+                        g = n.goal if n.goal and n.goal['id'] == gid else None
+                        left = g.get('poses_left') if g else None
+                        first_fb = g.get('first_fb') if g else None
+                    if not planned and first_fb:
+                        planned = True
+                        n.event('INFO', f'多点规划用时 {first_fb - t_send:.1f} s（{len(seg)} 站）')
+                    here = n.lookup(BASE_FRAME)
+                    while k < len(seg) - 1:
+                        pt = seg[k][1]
+                        near = here and n.fixed == 'map' and math.hypot(here[0] - pt['x'], here[1] - pt['y']) <= ROUTE_THROUGH_PASS
+                        dropped = left is not None and len(seg) - left > k   # Nav2 已经划掉了这一站
+                        if not (near or dropped):
+                            break
+                        self.through_passed(ws, route, seg, k)
+                        k += 1
+                    if done.done():
+                        break
+                status = done.result().status
+            except asyncio.TimeoutError:
+                await self.aw(handle.cancel_goal_async(), 2.0)
+                raise RuntimeError('等待到点超时') from None
+            except RuntimeError:   # 经过某站时发现阻断条件（断线、上锁…）：先停下多点目标再报错
+                try:
+                    await self.aw(handle.cancel_goal_async(), 2.0)
+                except Exception:
+                    pass
+                raise
+            finally:
+                stop.cancel()
+                done.cancel()
+                await asyncio.gather(stop, done, return_exceptions=True)
+            if route['stop'].is_set():
+                return 'stop'
+            if status == GoalStatus.STATUS_CANCELED:
+                self.finish_route(route, 'canceled', f'第 {route["index"] + 1} 点已取消')
+                return 'stop'
+            if status != GoalStatus.STATUS_SUCCEEDED and not planned and time.monotonic() - t_send < 5.0:
+                # 一点反馈都没有就放弃了：多半是行为树没加载上（navigation.log 里有 BT 报错）
+                n.event('WARN', '多点导航一开始就失败（行为树没加载上？看 navigation.log），这次按一站一站走')
+                return seg[k][0]
+            last_state, end_pt, dwell, nxt = seg[-1]
+            here = n.lookup(BASE_FRAME)
+            off = math.hypot(here[0] - end[0], here[1] - end[1]) if here and n.fixed == 'map' else None
+            # Nav2 报整段到了，但中间还有站狗没经过、Nav2 也没划掉（剩余点数还多于 1）：中间站不能白送，按假到达处理
+            skipped = status == GoalStatus.STATUS_SUCCEEDED and k < len(seg) - 1 and not (left is not None and left <= 1)
+            if status == GoalStatus.STATUS_SUCCEEDED and ((off is not None and off > ROUTE_FAKE_ARRIVE) or skipped):
+                cur = seg[k][0]
+                fake = fake + 1 if fake_state == cur else 1
+                fake_state = cur
+                why = f'第 {cur[0] + 1} 站还没经过' if skipped else f'离第 {last_state[0] + 1} 站还有 {off:.2f} m'
+                if fake > ROUTE_FAKE_RETRY:
+                    raise RuntimeError(f'Nav2 报到达，但{why}（已重发 {ROUTE_FAKE_RETRY} 次）')
+                n.event('WARN', f'Nav2 报到达，但{why}：不算到达，从第 {cur[0] + 1} 站重新出发（第 {fake} 次）')
+                state = cur
+                continue
+            if status != GoalStatus.STATUS_SUCCEEDED:
+                if k < len(seg) - 1 or off is None or off > ROUTE_ARRIVE_TOL:
+                    raise RuntimeError('Nav2 未能到达' + (f'（离第 {last_state[0] + 1} 站 {off:.2f} m）' if off is not None else ''))
+                n.event('WARN', f'第 {last_state[0] + 1} 站未精确到达（偏差 {off:.2f} m），视为已到')
+            while k < len(seg) - 1:   # Nav2 到了终点：中间没来得及记的站都算经过
+                self.through_passed(ws, route, seg, k)
+                k += 1
+            if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
+                return 'stop'
+            route['done'] += 1
+            state = nxt
+        return None
+
+    async def route_dwell(self, ws, route, i, seconds):
+        """到第 i 站后原地停留 seconds 秒。被取消 / 急停返回 False。停留中阻断条件（断线、上锁…）照常生效。"""
+        n = self.node
+        name = route['record']['points'][i].get('name') or f'第 {i + 1} 站'
+        n.event('INFO', f'{name}停留 {seconds} s')
+        route['dwell_until'] = time.monotonic() + seconds
+        try:
+            while True:
+                left = route['dwell_until'] - time.monotonic()
+                if left <= 0:
+                    return True
+                try:
+                    await asyncio.wait_for(route['stop'].wait(), min(left, 0.5))
+                    return False
+                except asyncio.TimeoutError:
+                    pass
+                reason = self.route_blocker(ws, route['record'])
+                if reason:
+                    raise RuntimeError(f'停留中：{reason}')
+        finally:
+            route['dwell_until'] = None
+
     async def run_route(self, ws, route):
         n, record = self.node, route['record']
         try:
@@ -3348,13 +3571,27 @@ class Server(TaughtWeb, RT.RtabWeb):
             first = route['resume'] or (0, 1, False)
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
             if route['resume'] is None and near < ROUTE_NEAR_START:
+                if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
+                    route.update(index=0, target=points[0])
+                    if not await self.route_dwell(ws, route, 0, points[0]['dwell']):
+                        return
                 first = self.route_next(len(points), loops, first)
                 route['done'] = 1
                 n.event('INFO', f'已在第 1 站附近（{near:.2f} m），直接前往第 2 站')
             # 11-12：不再出发前用 Nav2 规划检查整圈（用户：路线判断不需要）；某段规划不了，跑到那一段时 Nav2 会报失败
             route['checking'] = False
             state = first
+            if record['opts'].get('through', True):
+                if n.nav_through.server_is_ready():
+                    state = await self.run_through(ws, route, state)
+                    if state == 'stop':
+                        return
+                else:
+                    n.event('WARN', '导航没有多点导航服务（navigate_through_poses），这次按一站一站走')
+            if state:
+                route['through'] = False   # 退回一站一站走
             prev = None   # 上一站被不停车经过时它的 Nav2 目标：下一站没发出去就要取消它，免得狗自己走到那站
+            fake, fake_state = 0, None   # 假到达重发次数（同一站连续计数）
             while state:
                 i, loop, back = state
                 if route['stop'].is_set():
@@ -3368,7 +3605,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                         await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError(reason)
                 nxt = self.route_next(len(points), loops, state)
-                passing = nxt is not None      # 后面还有站：不停车经过，朝向面向下一站
+                dwell = points[i].get('dwell', 0) if nxt is not None else 0   # 终点停不停留都一样
+                passing = nxt is not None and not dwell   # 后面还有站：不停车经过，朝向面向下一站；要停留的站照常停稳
                 if passing:
                     q = self.route_pose(points, nxt[0], nxt[2])
                     pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
@@ -3438,12 +3676,24 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if status == GoalStatus.STATUS_CANCELED:
                     self.finish_route(route, 'canceled', f'第 {i + 1} 点已取消')
                     return
+                if status == GoalStatus.STATUS_SUCCEEDED and not passed:
+                    here = n.lookup(BASE_FRAME)
+                    off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
+                    if off is not None and off > ROUTE_FAKE_ARRIVE:
+                        fake = fake + 1 if fake_state == state else 1
+                        fake_state = state
+                        if fake > ROUTE_FAKE_RETRY:
+                            raise RuntimeError(f'Nav2 报到达，但离站点还有 {off:.2f} m（已重发 {ROUTE_FAKE_RETRY} 次）')
+                        n.event('WARN', f'第 {i + 1} 站 Nav2 报到达，但离站点还有 {off:.2f} m：不算到达，重新前往（第 {fake} 次）')
+                        continue
                 if status != GoalStatus.STATUS_SUCCEEDED:
                     here = n.lookup(BASE_FRAME)
                     off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
                     if off is None or off > ROUTE_ARRIVE_TOL:
                         raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
                     n.event('WARN', f'第 {i + 1} 站未精确到达（偏差 {off:.2f} m），视为已到，继续下一站')
+                if dwell and not await self.route_dwell(ws, route, i, dwell):
+                    return
                 route['done'] += 1
                 state = self.route_next(len(points), loops, state)
             self.finish_route(route, 'succeeded', '已到达全部导航点' if loops is None else f'已完成循环 {loops} 圈')
@@ -3465,9 +3715,14 @@ class Server(TaughtWeb, RT.RtabWeb):
             return goal
         record, i = route['record'], route['index']
         leg = goal if goal and goal['type'] == 'goal' and goal['goal'] == route['goal'] else {}
+        if leg and route.get('through') and status == 'active':   # 连续通过：Nav2 给的是到这段终点的距离
+            here, t = self.node.lookup(BASE_FRAME), route['target']
+            leg = {**leg, 'remaining': math.hypot(here[0] - t['x'], here[1] - t['y']) if here else None, 'eta': None}
         phase = status
         if status == 'active':
             phase = 'checking' if route['checking'] else leg['phase'] if leg.get('status') == 'active' else 'plan'
+            if route.get('dwell_until'):
+                phase = 'dwell'
         n, loops = len(record['points']), route['loops']
         if status == 'succeeded':
             progress = 1.0
@@ -3484,6 +3739,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 'message': route['message'], 'elapsed': route.get('ended', time.monotonic()) - route['started'],
                 # resumed：这次是从断点接着跑的；resumable：停下了且记了断点，可以「继续任务」
                 'resumed': route['resume'] is not None,
+                'through': bool(route.get('through')),   # 11-24 这趟是不是「连续通过」（多点导航）
+                # 停留中：还剩几秒（11-24）；不在停留就是 null
+                'dwellLeft': max(0.0, route['dwell_until'] - time.monotonic()) if route.get('dwell_until') else None,
+                'pointDwell': record['points'][i].get('dwell', 0),
                 'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------
@@ -3612,8 +3871,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.busy = False
 
     async def bag_start(self, name, topics):
-        """分段录包：每 BAG_SEGMENT 秒一个包，包名 = 前缀_MMDD_HHMMSS。name 是前缀，不填用狗编号（robot_id）。"""
-        name = name or robot_id()[0]
+        """分段录包：每 BAG_SEGMENT 秒一个包，包名 = 前缀_MMDD_HHMMSS。name 是前缀，不填（网页「开始录包」）用
+        狗编号_trigger（11-24：人主动录的包带 _trigger_，和异常自动保存的 狗编号_MMDD_HHMMSS 区分开）。"""
+        name = name or f'{robot_id()[0][:22]}_trigger'
         if not P.SAFE_NAME.match(name) or len(name) > 30:
             return False, '包名前缀只能用字母、数字、下划线和减号，最多 30 个字符'
         bad = [t for t in topics if t != P.ALL_TOPICS and not P.SAFE_TOPIC.match(t)]
@@ -3963,7 +4223,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False),
                                  headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
-    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS):
+    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False):
+        """trigger：人在网页上点「保存刚才 N 秒」→ 包名 狗编号_trigger_MMDD_HHMMSS；异常自动保存不带（11-24）。"""
         if not (self.procs_status or {}).get('rollback'):
             return False, '回溯录制没在运行：先打开回溯，并启动建图 / 定位 / 导航'
         if self.rollback_saving:
@@ -3972,7 +4233,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         bags_dir = os.path.join(DATA, 'bags')
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
-        base = time.strftime(f'{robot_id()[0]}_%m%d_%H%M%S')
+        base = time.strftime(f"{robot_id()[0]}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
         name, k = base, 1
         while any(os.path.exists(os.path.join(d, name)) for d in (bags_dir, work, os.path.join(bags_dir, '.recording'))):
             k += 1

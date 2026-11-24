@@ -57,6 +57,7 @@ START_DELAY = 3.0     # 档位启动到节点出现的时间（真机上 FAST-LI
 MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
+THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
 
 
 def load_map(yaml_path):
@@ -448,7 +449,7 @@ class Sim:
             return self.ready('navigation') and self.taught_route_enabled
         if name.startswith('/go2w_cmd_bridge/'):
             return self.bridge_up()
-        if name == '/navigate_to_pose/_action/cancel_goal' or '/clear_except_' in name:
+        if name in ('/navigate_to_pose/_action/cancel_goal', '/navigate_through_poses/_action/cancel_goal') or '/clear_except_' in name:
             return self.ready('navigation')
         if name.startswith('/map_server/'):
             return self.loc_ready()
@@ -635,13 +636,47 @@ class Sim:
         if self.goal and self.goal['status'] in (ACCEPTED, EXECUTING):
             self.finish(ABORTED)     # 新目标抢占旧目标（Nav2 里旧目标显示为被抢占 / 放弃）
         gid = uuid.uuid4().bytes
-        p = goal.pose.pose
+        # 11-24 多点导航（NavigateThroughPoses）：goal.poses 依次经过。via = 还没经过的点；离第一个点 ≤ THROUGH_RADIUS
+        # 就划掉（和 Go2W 行为树里每轮都跑的 RemovePassedGoals 一样），最后一个点照单点导航停稳、对准朝向
+        through = hasattr(goal, 'poses')
+        ps = [q.pose for q in goal.poses] if through else [goal.pose.pose]
+        p = ps[-1]
         self.goal = {'id': gid, 'x': p.position.x, 'y': p.position.y, 'th': 2*math.atan2(p.orientation.z, p.orientation.w),
                      'status': ACCEPTED, 'fb': fb_cb, 'result': Future(), 'path': None, 'i': 0,
                      't0': time.monotonic(), 'plan_at': time.monotonic() + 0.3, 'recoveries': 0,
-                     'mark': (time.monotonic(), self.x, self.y), 'recover_until': 0.0}
+                     'mark': (time.monotonic(), self.x, self.y), 'recover_until': 0.0,
+                     'through': through, 'via': [(q.position.x, q.position.y) for q in ps]}
+        bt_file = getattr(goal, 'behavior_tree', '')
+        if through and (not ps or (bt_file and not os.path.isfile(bt_file))):
+            # 真机 bt_navigator：行为树文件读不到 → 接受后马上放弃这个目标
+            self.rosout(40, 'bt_navigator', f'BT file not found: {bt_file}' if ps else 'No goals')
+            self.goal['plan_at'] = float('inf')
+            self.later(lambda: self.goal and self.goal['id'] == gid and self.finish(ABORTED))
         self.publish_status()
         self.bt(('ComputePathToPose', 'IDLE', 'RUNNING'))
+        # 11-24 假到达：有 GO2W_FAKE_EARLY_OK 文件（默认 /tmp/go2w_fake_early_ok）时，这个目标 0.3 s 后直接报成功
+        # （真机上提前换下一站后，Nav2 有时 0.7 s 就报新目标到达，狗其实还离得远）。文件里的数字 = 还要假几次，用完删掉
+        early = os.environ.get('GO2W_FAKE_EARLY_OK', '/tmp/go2w_fake_early_ok')
+        if os.path.exists(early):
+            try:
+                left = int(open(early).read().strip() or 1) - 1
+            except (OSError, ValueError):
+                left = 0
+            try:
+                if left > 0:
+                    open(early, 'w').write(str(left))
+                else:
+                    os.unlink(early)
+            except OSError:
+                pass
+
+            def fake_ok():
+                time.sleep(0.3)
+                def apply():
+                    if self.goal and self.goal['id'] == gid and self.goal['status'] in (ACCEPTED, EXECUTING):
+                        self.finish(SUCCEEDED)
+                self.later(apply)
+            threading.Thread(target=fake_ok, daemon=True).start()
         def cancel():
             f = Future()
 
@@ -673,7 +708,8 @@ class Sim:
     def publish_status(self):
         from action_msgs.msg import GoalStatusArray
         g = self.goal
-        self.node.deliver('/navigate_to_pose/_action/status', GoalStatusArray([(g['id'], g['status'])] if g else []))
+        topic = '/navigate_through_poses/_action/status' if g and g.get('through') else '/navigate_to_pose/_action/status'
+        self.node.deliver(topic, GoalStatusArray([(g['id'], g['status'])] if g else []))
 
     def bt(self, *events):
         from nav2_msgs.msg import BehaviorTreeLog
@@ -770,7 +806,18 @@ class Sim:
         if g['status'] == ACCEPTED:
             if now < g['plan_at']:
                 return 0.0, 0.0
-            g['path'] = self.plan(g['x'], g['y'])
+            if g['through']:
+                path, start = [], (self.x, self.y)
+                for vx, vy in g['via']:
+                    seg = self.plan(vx, vy, start)
+                    if seg is None:
+                        path = None
+                        break
+                    path += seg
+                    start = (vx, vy)
+                g['path'] = path
+            else:
+                g['path'] = self.plan(g['x'], g['y'])
             if g['path'] is None:
                 self.node.get_logger().warn('fake nav: 找不到路径，放弃目标')
                 self.rosout(40, 'planner_server', 'GridBased: failed to create plan, no valid path found.')
@@ -782,6 +829,9 @@ class Sim:
             self.node.deliver('/plan', self.path_msg())
             self.rosout(20, 'controller_server', 'Received a goal, begin computing control effort.')
             g['mark'] = (now, self.x, self.y)
+        if g['through']:
+            while len(g['via']) > 1 and math.hypot(g['via'][0][0] - self.x, g['via'][0][1] - self.y) <= THROUGH_RADIUS:
+                g['via'].pop(0)
         if now < g['recover_until']:
             return 0.0, 0.0
         # 进展检查：和 nav2.yaml 的 progress_checker 一样，10 s 内没走出 0.3 m 就恢复，多次后放弃
@@ -832,9 +882,11 @@ class Sim:
         msg = N(goal_id=N(uuid=list(g['id'])),
                 feedback=N(distance_remaining=rem, navigation_time=dur(nav), estimated_time_remaining=dur(eta),
                            number_of_recoveries=g['recoveries']))
+        if g['through']:
+            msg.feedback.number_of_poses_remaining = len(g['via'])
         if g['fb']:
             g['fb'](msg)
-        self.node.deliver('/navigate_to_pose/_action/feedback', msg)   # 所有目标都有，含 patrol 发的
+        self.node.deliver('/navigate_through_poses/_action/feedback' if g['through'] else '/navigate_to_pose/_action/feedback', msg)
 
     # ---------- 运动 ----------
     def step(self, dt, now):

@@ -753,3 +753,10 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-resume-stops li{min-width:22px;padding:1px 5px;border:1px solid var(--line-2);border-radius:10px;font:11px var(--f-mono);text-align:center;color:var(--muted)}
 .route-resume-stops li[data-s="done"]{border-color:var(--ok);color:var(--ok)}
 .route-resume-stops li[data-s="next"]{border-color:var(--warn);color:var(--warn);font-weight:600}
+
+/* 站点停留秒数（11-24） */
+.route-point-dwell{grid-column:1/-1;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.route-point-dwell input{width:64px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 6px;font:11px var(--f-mono)}
+.route-point-dwell input:disabled{opacity:.4}
+/* 设了停留的站：列表里和地图上一样用橙色 */
+.route-points .route-head span.route-stay{color:#ff9f5a}

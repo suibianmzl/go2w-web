@@ -139,7 +139,8 @@ export function createMapView(store, actions){
     }
     if (d.capture?.map === store.mapCurrent && !['finished','abandoned'].includes(d.capture.state)) line(d.capture.points,'#38e1dc',[],3.5);
   }
-  function drawPin(p, label, col, showHeading = true){
+  // badge：编号框右边的小标签（11-24 站点停留「停 N s」）
+  function drawPin(p, label, col, showHeading = true, badge = ''){
     const x = sx(p.x), y = sy(p.y);
     ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
     ctx.globalAlpha = .25; ctx.beginPath(); ctx.arc(x, y, 10, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
@@ -147,8 +148,16 @@ export function createMapView(store, actions){
     if (showHeading){ ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(-p.th)*20, y + Math.sin(-p.th)*20); ctx.stroke(); }
     ctx.fillStyle = '#04070c'; ctx.beginPath(); ctx.roundRect(x-9, y-32, 18, 18, 4); ctx.fill(); ctx.stroke();
     ctx.fillStyle = col; ctx.font = '600 11px "Chakra Petch",sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, x, y-23);
-    ctx.beginPath(); ctx.moveTo(x, y-14); ctx.lineTo(x, y-4); ctx.stroke(); ctx.restore();
+    ctx.beginPath(); ctx.moveTo(x, y-14); ctx.lineTo(x, y-4); ctx.stroke();
+    if (badge){
+      ctx.font = '600 10px "JetBrains Mono",monospace'; ctx.textAlign = 'left';
+      const w = ctx.measureText(badge).width + 8;
+      ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(x+11, y-31, w, 16, 4); ctx.fill();
+      ctx.fillStyle = '#04070c'; ctx.fillText(badge, x+15, y-23);
+    }
+    ctx.restore();
   }
+  const DWELL_COL = '#ff9f5a';
   function drawArrow(x0, y0, x1, y1, col){
     ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.5;
     ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
@@ -326,9 +335,12 @@ export function createMapView(store, actions){
         ctx.save(); ctx.strokeStyle = '#6fb6ff'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
         ctx.beginPath(); ctx.moveTo(sx(a.x), sy(a.y)); ctx.lineTo(sx(b.x), sy(b.y)); ctx.stroke(); ctx.restore();
       }
+      // 颜色：蓝 = 正在改位置，橙 = 设了停留（11-24），绿 = 终点，黄 = 直接经过
       draft.points.forEach((p, i) => drawPin(p, String(i + 1),
         store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
-          : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false));
+          : p.dwell > 0 ? DWELL_COL
+          : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false,
+        p.dwell > 0 ? `停${p.dwell}s` : ''));
     }
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();

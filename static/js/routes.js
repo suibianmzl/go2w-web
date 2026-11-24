@@ -13,17 +13,19 @@ export function setupRouteEditor(store, actions, setTool){
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
-  const DEFAULT_OPTS = { loop:false, loops:1, vmax:0.45, wmax:1.2 };
+  const DEFAULT_OPTS = { loop:false, loops:1, vmax:0.45, wmax:1.2, through:true };
+  const through = $('#routeThrough');
   const optsOf = route => ({ ...DEFAULT_OPTS, ...(route?.opts || {}) });
   const readLoops = () => Math.min(1000, Math.max(0, Math.round(+loops.value || 0)));
-  const readOpts = () => ({ loop:round.checked, loops:readLoops(), vmax:+(+rtV.value).toFixed(2), wmax:+(+rtW.value).toFixed(2) });
+  const readOpts = () => ({ loop:round.checked, loops:readLoops(), vmax:+(+rtV.value).toFixed(2), wmax:+(+rtW.value).toFixed(2), through:through.checked });
   const showOpts = () => { $('#oRtV').textContent = `${(+rtV.value).toFixed(2)} m/s`; $('#oRtW').textContent = `${(+rtW.value).toFixed(1)} rad/s`; };
   function setOpts(o){
-    round.checked = !!o.loop; loops.value = o.loops; loops.disabled = !o.loop;
+    round.checked = !!o.loop; loops.value = o.loops; loops.disabled = !o.loop; through.checked = o.through !== false;
     rtV.value = o.vmax; rtW.value = o.wmax; showOpts();
     lastDraft = null;            // 循环开关影响站点列表里终点的写法
   }
-  const sameOpts = (a, b) => a.loop === b.loop && (!a.loop || a.loops === b.loops) && Math.abs(a.vmax - b.vmax) < 1e-6 && Math.abs(a.wmax - b.wmax) < 1e-6;
+  const sameOpts = (a, b) => a.loop === b.loop && (!a.loop || a.loops === b.loops) && Math.abs(a.vmax - b.vmax) < 1e-6 && Math.abs(a.wmax - b.wmax) < 1e-6
+    && (a.through !== false) === (b.through !== false);
   // 参数和保存的任务不一样（新路线没有「保存的」，不算）
   const optsDirty = () => { const r = selected(); return !!r && savedDraft.id === r.id && !sameOpts(readOpts(), optsOf(r)); };
 
@@ -41,6 +43,7 @@ export function setupRouteEditor(store, actions, setTool){
   loops.oninput = render;
   loops.onchange = () => { loops.value = readLoops(); render(); };
   rtV.oninput = rtW.oninput = () => { showOpts(); render(); };
+  through.onchange = render;
   revert.onclick = () => { setOpts(optsOf(selected())); render(); };
 
   select.onchange = () => { edit(selected()); setTool('pan'); render(); };
@@ -220,9 +223,11 @@ export function setupRouteEditor(store, actions, setTool){
         const end = draft.confirmed && i === draft.points.length - 1;
         const angle = `${Math.round(deg(p.th))}°`;
         const heading = p.manualHeading === false ? (draft.confirmed ? `自动 ${angle}` : '自动朝向') : angle;
-        label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${heading}`;
+        const stay = p.dwell > 0 && !(end && !round.checked) ? `停 ${p.dwell} s · ` : '';
+        label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${stay}${heading}`;
         label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
         label.classList.toggle('route-end', end);
+        label.classList.toggle('route-stay', !!stay);   // 设了停留：和地图上一样用橙色
         li.classList.toggle('route-replacing', store.routeReplace === i);
         li.classList.toggle('route-insert-after', store.routeInsert === i + 1);
         li.dataset.i = i;
@@ -248,6 +253,31 @@ export function setupRouteEditor(store, actions, setTool){
           'name', 'route-point-name', 40, `第 ${i + 1} 站名称（可选）`);
         const pointNote = textField(Object.assign(document.createElement('textarea'), { rows:2 }),
           'note', 'route-point-note', 200, `第 ${i + 1} 站备注（可选）`);
+        // 停留（11-24）：到这一站停稳后原地等几秒再走；0 / 空 = 不停留，不停车经过（拐角小的话）。终点（单程）不需要
+        const dwellRow = document.createElement('label');
+        dwellRow.className = 'route-point-dwell';
+        const dwell = Object.assign(document.createElement('input'), { type:'number', min:0, max:3600, step:1, inputMode:'numeric',
+          value: p.dwell > 0 ? String(p.dwell) : '', placeholder:'0' });
+        dwell.setAttribute('aria-label', `第 ${i + 1} 站停留秒数`);
+        dwell.disabled = end && !round.checked;
+        dwellRow.title = dwell.disabled ? '终点到了就停，不需要停留时间' : '到这一站停稳后停留几秒再走，0 = 不停留';
+        dwell.oninput = () => {
+          const v = Math.round(+dwell.value);
+          const sec = Number.isFinite(v) ? Math.min(3600, Math.max(0, v)) : 0;
+          const current = store.routeDraft;
+          const points = current.points.map((point, j) => {
+            if (j !== i) return point;
+            const { dwell: _, ...rest } = point;
+            return sec > 0 ? { ...rest, dwell: sec } : rest;
+          });
+          const edited = { ...current, points };
+          store.routeDraft = edited;
+          if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+          if (lastDraft === current) lastDraft = edited;
+          render();
+        };
+        dwell.onchange = () => { const v = Math.round(+dwell.value); dwell.value = v > 0 ? String(Math.min(3600, v)) : ''; };
+        dwellRow.append('停留', dwell, '秒');
         const button = (text, title, action, disabled = false) => {
           const b = document.createElement('button');
           b.className = 'btn sm'; b.textContent = text; b.title = title;
@@ -312,7 +342,7 @@ export function setupRouteEditor(store, actions, setTool){
         const head = document.createElement('div');
         head.className = 'route-head';
         head.append(grip, order, label);
-        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, pointNote);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, dwellRow, pointNote);
         return li;
       }));
     }
@@ -351,7 +381,7 @@ export function setupRouteEditor(store, actions, setTool){
     if (draft.map && !matching) message = `路线属于地图 ${draft.map}，请先切图。`;
     else if (!draft.confirmed && draft.points.length >= 2) message = '选完后点击「确认路线」，最后一站将标为终点。拖 ⠿ 或改序号调整顺序，「＋插入」在某站后面加站。';
     else if (draft.confirmed){
-      message = '路线已确认。调整顺序：拖 ⠿ 或直接改序号；「＋插入」在某站后面加站。';
+      message = '路线已确认。调整顺序：拖 ⠿ 或直接改序号；「＋插入」在某站后面加站。地图上黄色 = 直接经过，橙色 = 停留，绿色 = 终点。';
     }
     if (hint.textContent !== message) hint.textContent = message;
   }

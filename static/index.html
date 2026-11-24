@@ -292,6 +292,8 @@
                   <div class="route-opts-h">运行参数<span id="routeOptsDirty" hidden>已修改</span></div>
                   <div class="patrol-opt route-loop"><label><input type="checkbox" id="routeRound" aria-describedby="routeLoopTip">循环</label><input id="routeLoops" type="number" min="0" max="1000" value="1" aria-label="循环圈数" disabled><span>圈</span></div>
                   <div class="route-hint route-loop-tip" id="routeLoopTip">到终点后直接回 1 号点算一圈，不原路返回 · 0 圈 = 一直循环</div>
+                  <div class="patrol-opt route-loop"><label><input type="checkbox" id="routeThrough" aria-describedby="routeThroughTip" checked>连续通过</label></div>
+                  <div class="route-hint route-loop-tip" id="routeThroughTip">一次规划经过各站的连续路径，中间站不减速、不停车；设了停留的站和终点照常停稳。关掉 = 一站一站走</div>
                   <div class="sl"><label for="rtV">最大 vx</label><input type="range" id="rtV" min="0.1" max="1.2" step="0.05" value="0.45"><output id="oRtV">0.45 m/s</output></div>
                   <div class="sl"><label for="rtW">最大 wz</label><input type="range" id="rtW" min="0.2" max="1.5" step="0.1" value="1.2"><output id="oRtW">1.2 rad/s</output></div>
                 </div>

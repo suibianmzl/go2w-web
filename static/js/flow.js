@@ -392,7 +392,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       const o = route?.opts;
       setStep('stRoute', mapOk ? 'cur' : 'todo',
         prep.on ? (prep.fail ? `出发失败：${prep.fail.msg}` : `${prep.resume ? '接续' : '出发'}中 · ${STEP_NAME[prep.step]}…`)
-        : route && !editing ? `${route.name} · ${route.points.length} 站${o ? ` · ${o.loop ? (o.loops ? `循环 ${o.loops} 圈` : '一直循环') : '单程'} · ${(+o.vmax).toFixed(2)} m/s` : ''}`
+        : route && !editing ? `${route.name} · ${route.points.length} 站${o ? ` · ${o.loop ? (o.loops ? `循环 ${o.loops} 圈` : '一直循环') : '单程'}${o.through === false ? ' · 一站一站走' : ' · 连续通过'} · ${(+o.vmax).toFixed(2)} m/s` : ''}`
         : editing ? '正在编辑路线' : store.routes.some(r => r.map === store.mapCurrent) ? '选择一个任务' : '这张地图还没有任务，点「新建」');
       prepRender();
     }

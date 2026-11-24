@@ -155,7 +155,9 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     if (T.type==='route'){
       $('#taskTitle').textContent = T.name;
       const lap = !T.roundTrip ? '' : `${T.loops ? `第 ${T.loop} / ${T.loops} 圈` : `第 ${T.loop} 圈（一直循环）`}${T.back ? ' · 回到起点' : ''} · `;
-      $('#taskSub').textContent = T.message || (T.phase === 'checking' ? '出发前清除旧障碍标记' : `${lap}正在前往第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''}`);
+      $('#taskSub').textContent = T.message || (T.phase === 'checking' ? '出发前清除旧障碍标记'
+        : T.phase === 'dwell' && T.dwellLeft != null ? `${lap}第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''} 停留中 · 还剩 ${Math.ceil(T.dwellLeft)} s`
+        : `${lap}正在前往第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''}`);
     }
     else if (T.type==='external'){ $('#taskTitle').textContent = '外部导航目标'; $('#taskSub').textContent = 'RViz 或命令行发出的目标 ·「取消」同样有效'; }
     else { const g = T.goal; $('#taskTitle').textContent = '单点导航'; $('#taskSub').textContent = `目标 (${g.x.toFixed(2)}, ${g.y.toFixed(2)}) · ${deg(g.th).toFixed(0)}°`; }

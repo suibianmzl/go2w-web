@@ -1,0 +1,43 @@
+<!--
+  Go2W 多点导航行为树（网页 v1.1.11 任务「连续通过」用，下发 NavigateThroughPoses 时在 goal.behavior_tree 里指定）
+  基于 Humble 默认 navigate_through_poses_w_replanning_and_recovery.xml，恢复动作和 navigate_go2w.xml 一致：
+    清代价地图 → 倒车 0.6 m / 0.15 m/s → 原地转 1.57 → 等待 5 s（默认的 0.05 m/s 倒车 Go2W 不执行）
+    清全局代价地图用 ClearCostmapExceptRegion（只清雷达障碍层，保留静态地图）
+  和默认树的区别：
+    RemovePassedGoals 单独放在 PipelineSequence 第一个，每轮 BT 都跑（默认树里它在 0.333 Hz 的 RateController 里，
+    狗 0.45 m/s 两次判断之间走 1.35 m，可能穿过途经点时恰好没判到，下一次重新规划就掉头回去找那个点）
+    半径 0.5 m（网页按同样的半径判断经过了第几站）
+    重新规划 1 Hz（和 navigate_go2w.xml 一样；默认 0.333 Hz）
+  注释里不能出现两个连续的减号
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.5" global_frame="map" robot_base_frame="base_footprint"/>
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
+            <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_except_global_costmap" reset_distance="0.0"/>
+          </Sequence>
+          <BackUp backup_dist="0.6" backup_speed="0.15"/>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="5"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
