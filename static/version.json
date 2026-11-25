@@ -1,7 +1,15 @@
 {
-  "version": "v1.4.2",
+  "version": "v1.4.3",
   "date": "2026-11-25",
   "notes": [
+    {
+      "version": "v1.4.3",
+      "date": "2026-11-25",
+      "items": [
+        "回溯录制 C++ 版在狗上自动编译：网页包里只带 C++ 源码时（同事打的 p-web 包都是这样），以前入口把源码目录当成程序去跑，报 Permission denied 后退回 Python 版，--all 录点云吃满一个核。现在第一次启动时用包里的 build.sh 在运行镜像里编译（Orin 约 1 分钟，这段时间回溯还没开始录），结果按源码哈希缓存到 data/cache/rollback_cpp/，之后启动直接用。源码变了会重编，运行镜像换了导致缓存的程序加载不了也会自动重编；编译失败才退回 Python 版，原因写在 rollback.log",
+        "rollback_recorder.py --build-only：只编译和自检，不录包，装完新网页包可以先跑一次预热"
+      ]
+    },
     {
       "version": "v1.4.2",
       "date": "2026-11-25",
