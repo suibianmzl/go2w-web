@@ -152,13 +152,21 @@ static void chown_tree(const fs::path & path)
   }
 }
 
-static void write_bag(
-  const fs::path & path, const std::vector<Item> & records,
-  const std::vector<std::string> & names, const std::vector<std::string> & types)
+static rosbag2_storage::StorageOptions mcap_options(const fs::path & path)
 {
   rosbag2_storage::StorageOptions storage;
   storage.uri = path.string();
   storage.storage_id = "mcap";
+  storage.storage_config_uri =
+    (fs::canonical("/proc/self/exe").parent_path() / "mcap_writer.yaml").string();
+  return storage;
+}
+
+static void write_bag(
+  const fs::path & path, const std::vector<Item> & records,
+  const std::vector<std::string> & names, const std::vector<std::string> & types)
+{
+  const auto storage = mcap_options(path);
   rosbag2_cpp::ConverterOptions conv;
   conv.input_serialization_format = "cdr";
   conv.output_serialization_format = "cdr";
@@ -293,9 +301,7 @@ static int self_check()
   const fs::path dir(tmpl);
   std::error_code ec;
   try {
-    rosbag2_storage::StorageOptions storage;
-    storage.uri = (dir / "bag").string();
-    storage.storage_id = "mcap";
+    const auto storage = mcap_options(dir / "bag");
     rosbag2_cpp::ConverterOptions conv{"cdr", "cdr"};
     {
       rosbag2_cpp::Writer writer;

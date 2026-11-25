@@ -13,6 +13,7 @@ find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 
 add_executable(rollback_recorder_cpp rollback_recorder.cpp)
+configure_file(../mcap_writer.yaml mcap_writer.yaml COPYONLY)
 target_compile_options(rollback_recorder_cpp PRIVATE -Wall -Wextra)
 ament_target_dependencies(rollback_recorder_cpp rclcpp rosbag2_cpp rosbag2_storage)
 # 运行时靠容器里 source 过的 /opt/ros/humble 环境（LD_LIBRARY_PATH）找库
