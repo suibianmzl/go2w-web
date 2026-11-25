@@ -63,7 +63,8 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         host = Server.__new__(Server)
         trace, logs = [], []
         node = NS(fixed='map', lock=threading.Lock(), goal=None, position=pos,
-                  nav_through=NS(server_is_ready=lambda: True), sent_poses=[])
+                  nav_through=NS(server_is_ready=lambda: True), sent_poses=[], sent_speeds=[],
+                  params={'vmax':.45, 'wmax':1.2}, pset_cli=NS(service_is_ready=lambda: True))
         node.lookup = lambda _: node.position
         node.event = lambda level, message: logs.append((level, message))
         counter = 0
@@ -72,12 +73,19 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
             counter += 1
             trace.append(('send', tuple(p[0] for p in poses)))
             node.sent_poses.extend(poses)
+            node.sent_speeds.extend((p[0], node.params['vmax']) for p in poses)
             handle = NS(accepted=True, goal_id=NS(uuid=[counter]), poses=poses,
                         cancel_goal_async=AsyncMock(return_value=None))
             future = asyncio.get_running_loop().create_future(); future.set_result(handle)
             return future
         node.send_goal = lambda *pose: send([pose])
         node.send_through = send
+        def set_param(key, value):
+            trace.append(('speed', value))
+            result = asyncio.get_running_loop().create_future()
+            result.set_result(NS(results=[NS(successful=True)]))
+            return result
+        node.set_param = set_param
         def track(handle, pose, kind):
             node.goal = dict(id=bytes(handle.goal_id.uuid), poses_left=1, first_fb=None)
             async def arrive():
@@ -164,6 +172,18 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(last_value, '终点回起点必须使用正常避障参数 true')
                     returns += 1
             self.assertEqual(returns, 2)
+
+    async def test_point_speed_limits_and_crossing_boundaries_work_together(self):
+        for through in (False, True):
+            with self.subTest(through=through):
+                host, route, trace, _ = self.rig(through=through)
+                for point, speed in zip(route['record']['points'], [.4, .2, .3, .5, .35]):
+                    point['vmax'] = speed
+                await host.run_route(None, route)
+                self.assertEqual(route['status'], 'succeeded', route.get('message'))
+                self.assertEqual(dict(host.node.sent_speeds), {1.:.4, 2.:.2, 3.:.2, 4.:.3, 5.:.35})
+                self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+                self.assertEqual(host.node.params['vmax'], .45, '任务结束后恢复任务速度上限')
 
     async def test_cancel_during_enable_restores_true_and_sends_no_next_goal(self):
         host, route, trace, _ = self.rig()
