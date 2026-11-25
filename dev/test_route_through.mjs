@@ -112,21 +112,22 @@ try {
   assert.equal(c.logs.some(m => /报到达，但/.test(m)), false, '没有假到达');
   console.log('PASS 停留站把路线切成两段，停留站停稳停够再走下一段');
 
-  // 3 中途取消：断点在下一站；继续 = 从这一站起新的一段
+  // 3 中途取消：断点在下一站；继续 = 从这一站起新的一段（A、B、C 两两只隔 0.7 m，经过半径 1.0 m 时到 B 就把 C 也划掉了，
+  // 所以在去 D 的路上取消）
   await run(r1);
-  await until(() => c.task?.name === r1.name && c.task.point === 3 && c.task.phase === 'follow', '过了 B 去 C', 60000);
+  await until(() => c.task?.name === r1.name && c.task.point === 4 && c.task.phase === 'follow', '过了 C 去 D', 60000);
   await cmd('cancel');
   await until(() => c.task?.status === 'canceled', '取消');
-  await until(() => c.routes.find(x => x.id === r1.id)?.resume?.point === 3, '断点第 3 站');
-  assert.equal(c.routes.find(x => x.id === r1.id).resume.done, 2);
+  await until(() => c.routes.find(x => x.id === r1.id)?.resume?.point === 4, '断点第 4 站');
+  assert.equal(c.routes.find(x => x.id === r1.id).resume.done, 3);
   await cmd('arm', { on:true });
   c.tasks.length = 0; c.logs = [];
   await cmd('route_start', { route_id:r1.id, resume:'continue' });
   await until(() => c.task?.name === r1.name && c.task.status === 'active' && c.task.resumed, '接续开始');   // 旧卡片「已取消」还留 10 s
   await ended(r1.name);
   assert.equal(c.task.status, 'succeeded', c.task.message);
-  assert.ok(c.logs.some(m => /连续通过：第 3–4 站/.test(m)), `接续段 ${c.logs.filter(m => /连续/.test(m))}`);
-  assert.deepEqual(pts(r1.name), [3, 4]);
+  assert.ok(c.logs.some(m => /连续通过：第 4 站/.test(m)), `接续段 ${c.logs.filter(m => /连续/.test(m))}`);
+  assert.deepEqual(pts(r1.name), [4]);
   console.log('PASS 连续通过中途取消，断点在下一站，继续从那一站起新的一段');
 
   // 4 循环 2 圈：1 段跑完（1 2 3 4 ↩1 2 3 4 ↩1 = 9 站 < 30）
@@ -137,8 +138,9 @@ try {
   assert.equal(c.task.message, '已完成循环 2 圈');
   assert.equal(c.logs.filter(m => /连续通过：/.test(m)).length, 1, '两圈一段');
   const laps = c.tasks.filter(t => t.name === r3.name && t.phase !== 'checking').map(t => `${t.loop}:${t.back ? '↩' : ''}${t.point}`).filter((v, i, a) => v !== a[i - 1]);
-  // 第 2 站离 1 号点只有 0.7 m（经过半径 0.5 m），「去第 2 站」不一定采得到，比较时去掉
-  assert.deepEqual(laps.filter(v => !v.endsWith(':2')), ['1:1', '1:3', '1:4', '1:↩1', '2:3', '2:4', '2:↩1'], `${laps}`);
+  // 第 1、2、3 站两两只隔 0.7 m（经过半径 1.0 m），「去第 2 / 3 站」不一定采得到，比较时去掉
+  assert.deepEqual(laps.filter(v => !/:[23]$/.test(v)), ['1:1', '1:4', '1:↩1', '2:4', '2:↩1'], `${laps}`);
+  assert.ok(c.logs.filter(m => /经过第 3 站/.test(m)).length === 2, '两圈都经过第 3 站');
   assert.ok(c.logs.filter(m => /经过第 2 站/.test(m)).length === 2, '两圈都经过第 2 站');
   console.log('PASS 循环 2 圈连续通过，圈数、回 1 号点都对');
 
@@ -166,6 +168,33 @@ try {
   assert.ok(Math.hypot(c.pose.x - four[2].x, c.pose.y - four[2].y) < .3, '最后回到 C');
   console.log('PASS 终点就在出发位置：先跑到倒数第二站，终点单独发，不再 0 s 假到达');
 
+  // 4d 擦过站点（11-25 真机：切内道从站旁 0.6–1.2 m 过去，没进经过半径，Nav2 不划掉，重规划掉头回去找）。
+  // 假 Nav2 这次规划跳过 P1（狗沿 y=-0.6 直线走，离 P1 1.3 m）→ 网页判「已越过」，从 P2 起重新下发，不回头
+  const P = [{ x:3.0, y:.7, th:0, name:'P1' }, { x:4.5, y:-.5, th:0, name:'P2' }, { x:2.0, y:-.5, th:Math.PI, name:'P3', manualHeading:true }];
+  const r6 = await save('擦过站点', P);
+  await cmd('initial_pose', { x:1.3, y:-.6, th:0 });
+  await cmd('arm', { on:true });
+  c.tasks.length = 0; c.logs = [];
+  writeFileSync('/tmp/go2w_fake_through_skip', '1');
+  let back = false, minP1 = 9, passedAt = null;
+  await cmd('route_start', { route_id:r6.id });
+  await until(() => c.task?.name === r6.name && c.task.status === 'active', `${r6.name} 开始`);
+  await until(() => {
+    if (c.pose) minP1 = Math.min(minP1, Math.hypot(c.pose.x - P[0].x, c.pose.y - P[0].y));
+    if (c.logs.some(m => /擦过/.test(m)) && passedAt === null) passedAt = c.pose?.x;
+    if (passedAt !== null && c.pose && c.pose.x < passedAt - .3 && !c.logs.some(m => /经过第 2 站/.test(m))) back = true;   // 没到 P2 就往回走 = 掉头
+    return c.task?.name === r6.name && c.task.status !== 'active';
+  }, `${r6.name} 结束`, 90000);
+  assert.equal(c.task.status, 'succeeded', c.task.message);
+  assert.ok(minP1 > 1.0, `狗真的没进 P1 的 1.0 m（最近 ${minP1.toFixed(2)} m）`);
+  assert.ok(c.logs.some(m => /第 1 站从旁边 [\d.]+ m 擦过.*算经过/.test(m)), `判已越过：${c.logs.filter(m => /经过|擦过|下发/.test(m))}`);
+  assert.ok(c.logs.some(m => /从第 2 站起重新下发/.test(m)), '从第 2 站重新下发');
+  assert.ok(c.logs.some(m => /经过第 1 站/.test(m)) && c.logs.some(m => /经过第 2 站/.test(m)), '两站都算经过');
+  assert.equal(back, false, '没有掉头回去找 P1');
+  assert.equal(c.logs.some(m => /报到达，但/.test(m)), false, '没有假到达');
+  assert.ok(Math.hypot(c.pose.x - P[2].x, c.pose.y - P[2].y) < .3, '最后到 P3');
+  console.log(`PASS 擦过站点（最近 ${minP1.toFixed(2)} m）算经过，从下一站重新下发，不掉头`);
+
   // 5 关掉连续通过：一站一站走（没有「连续通过」日志，每站都有 Nav2 目标）
   const r4 = await save('一站一站', four, { loop:false, loops:1, vmax:.45, wmax:1.2, through:false });
   await run(r4);
@@ -174,6 +203,6 @@ try {
   assert.equal(c.task.through, false);
   assert.equal(c.logs.some(m => /连续通过：/.test(m)), false);
   console.log('PASS 关掉连续通过 = 原来的一站一站走');
-  for (const x of [r1, r2, r3, r4, r5]) await c.cmd('route_delete', { route_id:x.id });
+  for (const x of [r1, r2, r3, r4, r5, r6]) await c.cmd('route_delete', { route_id:x.id });
   console.log('ALL PASS');
-} finally { rmSync('/tmp/go2w_fake_early_ok', { force:true }); c.close(); }
+} finally { rmSync('/tmp/go2w_fake_early_ok', { force:true }); rmSync('/tmp/go2w_fake_through_skip', { force:true }); c.close(); }
