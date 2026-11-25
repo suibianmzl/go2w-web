@@ -193,12 +193,32 @@ try {
   await safetyCase('手动取消', () => command('cancel'), false);
   await safetyCase('急停', () => command('estop'), true);
   await command('release_estop');
-  await safetyCase('心跳丢失', () => { c.ping = false; }, true);
+  console.log('PASS 取消、急停均不会派发下一点');
+
+  // v1.5.1：自动任务中控制方网页断网（心跳丢失 / 关掉）不停车；别的网页能照常叫停
+  async function netlossCase(name, drop){
+    await command('initial_pose', first);
+    await command('arm', { on:true });
+    const r = await save(name, [{ x:3.06, y:-2.71, th:0 }, first, points[2]]);
+    await command('route_start', { route_id:r.id });
+    await until(() => observer.task?.name === r.name && observer.task.status === 'active' &&
+      observer.task.phase === 'follow', `${name}开始跟随`);
+    await drop();
+    await sleep(7000);     // 超过心跳超时 5 s
+    assert.equal(observer.task.name, r.name);
+    assert.ok(['active', 'succeeded'].includes(observer.task.status), `${name}后任务 ${observer.task.status}：${observer.task.message}`);
+    if (observer.task.status === 'active') assert.equal(observer.state.armed, true, `${name}后不该上锁`);
+    if (observer.task.status === 'active'){
+      assert.equal((await observer.cmd('cancel')).ok, true, '断网后别的网页可以取消');
+      await until(() => observer.task.status === 'canceled', `${name}后别的网页取消`);
+    }
+    await sleep(500);
+  }
+  await netlossCase('心跳丢失', () => { c.ping = false; });
   c.ping = true;
   await sleep(500);
-  assert.equal(observer.state.armed, false);
-  await safetyCase('网页关闭', () => c.close(), true);
-  console.log('PASS 取消、急停、心跳丢失、关闭网页均不会派发下一点');
+  await netlossCase('网页关闭', () => c.close());
+  console.log('PASS 心跳丢失、关闭网页：自动任务继续不停车，其他网页可以取消');
 
   // 任务刚取消（卡片还保留着「已取消」）就发新目标：等 Nav2 接受的那段时间里，卡片不能显示旧的「已取消」
   const seen = [];

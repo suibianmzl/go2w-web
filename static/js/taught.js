@@ -102,7 +102,7 @@ export function setupTaught(store, src, setTool){
     const c = currentCapture(); if (!c?.session_id) return;
     stopTeleop();
     const r = await command('taughtPause',c.session_id);
-    if (store.armed && src.can('arm')) await Promise.resolve(src.cmd.arm(false));
+    if (store.armed && src.can('arm')) await Promise.resolve(src.cmd.arm(false, '示教'));
     return r;
   }
   $('#taughtTeleop').onclick = () => setTool('teleop');

@@ -257,9 +257,9 @@ export function createRosSource(store, bus){
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
     autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
     autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）
-    cancel: () => send('cancel'),
-    arm: on => send('arm', { on }),
-    estop: () => send('estop'),
+    cancel: why => send('cancel', why ? { why } : {}),
+    arm: (on, why) => send('arm', why ? { on, why } : { on }),
+    estop: why => send('estop', why ? { why } : {}),
     releaseEstop: () => send('release_estop'),
     setParam: (key, value) => send('set_param', { key, value }),
     // P3：运行档位、巡逻、录包、地图

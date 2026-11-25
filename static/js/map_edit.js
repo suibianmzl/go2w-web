@@ -386,7 +386,7 @@ export function createMapEditor(store, actions, { exit, onHint }){
         f.append(t, inp, msg);
         const chk = (key, text, on) => { const l = document.createElement('label'); l.className = 'modal-chk';
           l.innerHTML = `<input type="checkbox" data-${key}${on ? ' checked' : ''}><span></span>`; l.querySelector('span').textContent = text; f.appendChild(l); };
-        if (nRoutes) chk('routes', `把原图上的 ${nRoutes} 条任务改到新图（坐标不用重标）`, true);
+        if (nRoutes) chk('routes', `把原图上的 ${nRoutes} 条任务复制一份到新图（原图任务保留，坐标不用重标）`, true);
         if (keepDirty()) chk('keepout', '把「禁行区」页还没保存的修改一起带到新图（原图的禁行区不改）', true);
         else if (K?.shapes.length) { const t = document.createElement('div'); t.className = 'modal-label'; t.textContent = `这张图的 ${K.shapes.length} 个禁行区会一起带到新图`; f.appendChild(t); }
         const live = ['localization', 'navigation'].some(k => store.profiles[k] === 'run');
