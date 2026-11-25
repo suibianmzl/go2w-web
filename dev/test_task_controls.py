@@ -177,6 +177,7 @@ class SpeedExecution(unittest.IsolatedAsyncioTestCase):
             return future(NS(status=W.GoalStatus.STATUS_SUCCEEDED))
         node.track_goal = track
         server.node=node; server.clear_before_start=AsyncMock()
+        server.obstacles_critic=NS(apply=AsyncMock(return_value='OK'))
         async def aw(f, timeout): return await f
         server.aw=aw; server.route_blocker=lambda *args:None
         server.resume_checkpoint=Mock(); server.route_audio=Mock()

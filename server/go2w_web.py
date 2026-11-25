@@ -3818,9 +3818,13 @@ class Server(TaughtWeb, RT.RtabWeb):
         selected = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
         route['crossing'] = (selected[0], selected[-1]) if selected else None
         try:
-            if getattr(self, 'crossing_dirty', False):
+            # 从头出发先恢复正常避障，断点所在区间在下方单独恢复。
+            if route['resume'] is None or getattr(self, 'crossing_dirty', False):
                 route['crossing_dirty'] = True
+                self.crossing_dirty = True
                 await self.route_crossing_set(route, False)
+                if route['stop'].is_set():
+                    return
             await self.clear_before_start()
             if route['stop'].is_set():
                 return

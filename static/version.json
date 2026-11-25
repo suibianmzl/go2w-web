@@ -16,7 +16,9 @@
       "date": "2026-11-25",
       "items": [
         "回溯录制 C++ 版在狗上自动编译：网页包里只带 C++ 源码时（同事打的 p-web 包都是这样），以前入口把源码目录当成程序去跑，报 Permission denied 后退回 Python 版，--all 录点云吃满一个核。现在第一次启动时用包里的 build.sh 在运行镜像里编译（Orin 约 1 分钟，这段时间回溯还没开始录），结果按源码哈希缓存到 data/cache/rollback_cpp/，之后启动直接用。源码变了会重编，运行镜像换了导致缓存的程序加载不了也会自动重编；编译失败才退回 Python 版，原因写在 rollback.log",
-        "rollback_recorder.py --build-only：只编译和自检，不录包，装完新网页包可以先跑一次预热"
+        "rollback_recorder.py --build-only：只编译和自检，不录包，装完新网页包可以先跑一次预热",
+        "从头启动导航任务时，先将 ObstaclesCritic.enabled 设置为 true，确认成功后才导航到起点；未勾选强制跨越的路线同样初始化正常避障。",
+        "初始化失败或初始化时取消不下发导航目标；失败保留恢复门槛。到达首个跨越点再设置 false，末点和异常恢复 true，断点区间恢复规则保持不变。"
       ]
     },
     {

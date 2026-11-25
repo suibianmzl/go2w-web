@@ -124,27 +124,56 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sequential_switches_only_after_boundary_arrivals(self):
         _, _, trace, _ = await self.run_case()
-        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
-        self.assertLess(trace.index(('arrive', 2.)), trace.index(('param', False)))
-        self.assertLess(trace.index(('param', False)), trace.index(('send', (3.,))))
-        self.assertLess(trace.index(('arrive', 4.)), trace.index(('param', True)))
-        self.assertLess(trace.index(('param', True)), trace.index(('send', (5.,))))
+        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
+        opened = trace.index(('param', False))
+        closed = trace.index(('param', True), opened)
+        self.assertLess(trace.index(('arrive', 2.)), opened)
+        self.assertLess(opened, trace.index(('send', (3.,))))
+        self.assertLess(trace.index(('arrive', 4.)), closed)
+        self.assertLess(closed, trace.index(('send', (5.,))))
 
     async def test_through_segments_end_at_boundaries(self):
         _, _, trace, _ = await self.run_case(through=True)
         self.assertEqual([e for e in trace if e[0] == 'send'],
                          [('send', (1., 2.)), ('send', (3., 4.)), ('send', (5.,))])
-        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
 
-    async def test_unmarked_routes_never_set_parameter(self):
+    async def test_unmarked_routes_initialize_normal_avoidance_only(self):
         for through in (True, False):
             _, _, trace, _ = await self.run_case(through=through, marked=())
-            self.assertFalse(any(e[0] == 'param' for e in trace))
+            self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True)])
+
+    async def test_fresh_route_resets_parameter_before_any_navigation(self):
+        for through in (False, True):
+            for marked in ((), (1, 3)):
+                _, _, trace, _ = await self.run_case(through=through, marked=marked)
+                self.assertEqual(trace[0], ('param', True))
+
+    async def test_initialization_failure_dispatches_no_navigation_and_blocks_next_goal(self):
+        host, route, trace, _ = self.rig(marked=())
+        async def fail(enabled):
+            trace.append(('param', enabled))
+            raise RuntimeError('初始化被拒绝')
+        host.obstacles_critic.apply.side_effect = fail
+        await host.run_route(None, route)
+        self.assertEqual(route['status'], 'aborted')
+        self.assertFalse(any(e[0] == 'send' for e in trace))
+        self.assertTrue(host.crossing_dirty)
+
+    async def test_cancel_during_initialization_dispatches_no_navigation(self):
+        host, route, trace, _ = self.rig()
+        async def cancel(enabled):
+            trace.append(('param', enabled))
+            host.finish_route(route, 'canceled', '初始化时取消')
+        host.obstacles_critic.apply.side_effect = cancel
+        await host.run_route(None, route)
+        self.assertEqual(route['status'], 'canceled')
+        self.assertFalse(any(e[0] == 'send' for e in trace))
 
     async def test_starting_at_marked_first_point_enables_before_departing(self):
         _, _, trace, _ = await self.run_case(marked=(0, 3), pos=(1., 0., 0.))
-        self.assertEqual(trace[0], ('param', False))
-        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+        self.assertEqual(trace[:2], [('param', True), ('param', False)])
+        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
 
     async def test_resume_inside_span_reenables_before_sending_goal(self):
         _, _, trace, _ = await self.run_case(resume=(2, 1, False))
@@ -159,16 +188,17 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         for through in (False, True):
             _, _, trace, _ = await self.run_case(through=through, marked=(0, 3), loops=2)
             self.assertEqual([e for e in trace if e[0] == 'param'],
-                             [('param', False), ('param', True)] * 2)
+                             [('param', True)] + [('param', False), ('param', True)] * 2)
 
     async def test_return_leg_keeps_obstacles_critic_enabled(self):
         for through in (False, True):
             _, _, trace, _ = await self.run_case(through=through, marked=(0, 3), loops=2)
-            last_value, returns = None, 0
+            last_value, returns, crossing_started = None, 0, False
             for event in trace:
                 if event[0] == 'param':
                     last_value = event[1]
-                elif event[0] == 'send' and 1. in event[1] and last_value is not None:
+                    crossing_started = crossing_started or not last_value
+                elif event[0] == 'send' and 1. in event[1] and crossing_started:
                     self.assertTrue(last_value, '终点回起点必须使用正常避障参数 true')
                     returns += 1
             self.assertEqual(returns, 2)
@@ -182,7 +212,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
                 await host.run_route(None, route)
                 self.assertEqual(route['status'], 'succeeded', route.get('message'))
                 self.assertEqual(dict(host.node.sent_speeds), {1.:.4, 2.:.2, 3.:.2, 4.:.3, 5.:.35})
-                self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+                self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
                 self.assertEqual(host.node.params['vmax'], .45, '任务结束后恢复任务速度上限')
 
     async def test_cancel_during_enable_restores_true_and_sends_no_next_goal(self):
@@ -195,7 +225,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         host.obstacles_critic.apply.side_effect = cancel
         await host.run_route(None, route)
         self.assertEqual(route['status'], 'canceled')
-        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
         self.assertFalse(any(e[0] == 'send' and max(e[1]) > 2 for e in trace))
 
     async def test_enable_failure_stops_and_attempts_true(self):
@@ -207,14 +237,14 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         host.obstacles_critic.apply.side_effect = fail
         await host.run_route(None, route)
         self.assertEqual(route['status'], 'aborted')
-        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
+        self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
         self.assertFalse(any(e[0] == 'send' and max(e[1]) > 2 for e in trace))
 
     async def test_disable_failure_cannot_finish_successfully(self):
         host, route, trace, logs = self.rig()
         async def fail(enabled):
             trace.append(('param', enabled))
-            if enabled:
+            if enabled and ('param', False) in trace:
                 raise RuntimeError('关闭失败')
         host.obstacles_critic.apply.side_effect = fail
         await host.run_route(None, route)
@@ -258,8 +288,12 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_single_goal_cannot_bypass_failed_crossing_reset(self):
         host, route, trace, _ = self.rig()
+        crossed = False
         async def fail(enabled):
-            if enabled:
+            nonlocal crossed
+            if not enabled:
+                crossed = True
+            elif crossed:
                 raise RuntimeError('reset unavailable')
         host.obstacles_critic.apply.side_effect = fail
         await host.run_route(None, route)
