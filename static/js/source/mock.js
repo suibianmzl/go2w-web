@@ -586,11 +586,12 @@ export function createMockSource(store, bus){
     },
     contAbort(){ store.cont = null; store.contPaused = true; return { ok: true, msg: '已放弃（模拟）' }; },
     simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 5.0 s)');
+      const keep = routeActive();   // v1.5.1：自动任务中断网不停车
       setTimeout(() => {
-        if (routeActive()) cancelTask('网页断开，已取消路线任务');
-        lock('web heartbeat lost');
+        if (keep) log('WARN','go2w_web','控制方网页心跳丢失：自动导航继续，不停车');
+        else lock('web heartbeat lost');
       }, 1000);
-      setTimeout(() => { S.link = true; log('INFO','go2w_web','client reconnected, chassis stays LOCKED'); toast('已重连，底盘保持锁定，需要手动解锁','warn'); }, 3000); },
+      setTimeout(() => { S.link = true; log('INFO','go2w_web', keep ? 'client reconnected, task still running' : 'client reconnected, chassis stays LOCKED'); toast(keep ? '已重连，任务一直在跑' : '已重连，底盘保持锁定，需要手动解锁','warn'); }, 3000); },
   };
 
   /* ---------- topic 消息内容（检查器） ---------- */
