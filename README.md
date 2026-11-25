@@ -28,7 +28,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - 11-12 起扩展坞跑的是统一运行容器 `go2w_runtime`（镜像 `go2w-runtime:<release>`，由 systemd 的 `go2w-runtime.service` 启动），不再有 `go2w_humble` / `go2w_web` 两个容器。网页打包在镜像里：后端 `/opt/go2w/console/server`，前端 `/opt/go2w/console/static`。
 - 导航、巡逻、录包、回溯、速度桥都是容器里 supervisor 管的进程组，后端经 `/run/go2w/supervisor.sock`（环境变量 `GO2W_SUPERVISOR_SOCKET`）请求启停；运控 control 组和 DDS 录制不归网页管。
 - 存图、对齐地图由后端直接起子进程，脚本在 `/opt/go2w/console/tools/`（`save_map.sh`、`align_map.py`）。
-- 调整 Nav2 障碍物 critic：`POST /api/obstacles-critic/true` 会执行 `ros2 param set /controller_server FollowPath.ObstaclesCritic.enabled true`；`POST /api/obstacles-critic/false` 会将参数设为 `false`。成功返回 JSON（包括实际参数值）；执行失败、超时或 ROS 2 命令不可用时返回对应 HTTP 错误。两个接口要求部署进程的 PATH 可找到 `ros2`，并且当前 ROS 2 环境可访问 `/controller_server`。
+- 调整 Nav2 障碍物处理：`POST /api/obstacles-critic/true` 会将 `/controller_server` 的 `FollowPath.ObstaclesCritic.enabled` 和 `/global_costmap/global_costmap` 的 `voxel_layer.enabled` 都设为 `true`；`POST /api/obstacles-critic/false` 会将两者都设为 `false`。两个 ROS 参数依次设置，全部成功才返回成功，响应中的 `parameters` 列出两个节点、参数名、设置值及命令输出；执行失败、超时或 ROS 2 命令不可用时返回对应 HTTP 错误。部署进程的 PATH 需能找到 `ros2`，当前 ROS 2 环境需能访问上述节点。
 - 数据目录是容器里的 `/go2w/data`（扩展坞上 `/opt/go2w/data`），可以用 `GO2W_DATA` 改。地图、路线、录包都在那里，不进这个仓库。导航日志在 `data/logs/navigation.log`，遥控速度桥在 `data/logs/bridge.log`。
 
 ## CPU 明细（v1.5.0）
@@ -439,7 +439,7 @@ docker restart go2w_web
 
 恢复失败后，普通单点目标也会被拒绝。多点任务下次启动时自动尝试恢复；也可以调用下方的 `true` HTTP 入口，成功后解除单点目标的拦截。ROS 明确返回 `Setting parameter failed` 时，即使命令退出码为 0，也会返回 HTTP 502 并停止任务，不把节点拒绝当作成功。
 
-两个原有 HTTP 入口仍为无请求体的 `POST /api/obstacles-critic/true` 与 `POST /api/obstacles-critic/false`。HTTP 与路线复用同一个异步设置服务，参数命令串行执行；配置了强制跨越的任务执行期间，手动 HTTP 写入返回 409，避免覆盖任务设置。“强制跨越”开启时，`FollowPath.ObstaclesCritic.enabled=false`；退出跨越、取消或失败时恢复 `true`。HTTP 地址中的 true/false 直接对应该 ROS 参数值。成功仍只代表 `ros2 param set` 命令成功，没有额外读回参数。实机可用 `ros2 param get /controller_server FollowPath.ObstaclesCritic.enabled` 核对实际值。
+两个原有 HTTP 入口仍为无请求体的 `POST /api/obstacles-critic/true` 与 `POST /api/obstacles-critic/false`。HTTP 与路线复用同一个异步设置服务，参数命令串行执行；配置了强制跨越的任务执行期间，手动 HTTP 写入返回 409，避免覆盖任务设置。“强制跨越”开启时，`FollowPath.ObstaclesCritic.enabled` 和 `voxel_layer.enabled` 都设为 `false`；退出跨越、取消或失败时都恢复为 `true`。HTTP 地址中的 true/false 直接对应该 ROS 参数值。成功响应中的 `parameters` 列出两个参数的命令执行结果；实机可分别用 `ros2 param get /controller_server FollowPath.ObstaclesCritic.enabled` 和 `ros2 param get /global_costmap/global_costmap voxel_layer.enabled` 核对实际值。
 
 本地回归（全部使用假机器人或参数替身，不连接硬件）：
 

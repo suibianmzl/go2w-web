@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 tools/rollback_recorder_cpp/*.arm64
+build/

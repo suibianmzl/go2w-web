@@ -6,8 +6,10 @@ from aiohttp import web
 
 
 class ObstaclesCriticAPI:
-    NODE = '/controller_server'
-    PARAMETER = 'FollowPath.ObstaclesCritic.enabled'
+    PARAMETERS = (
+        ('/controller_server', 'FollowPath.ObstaclesCritic.enabled'),
+        ('/global_costmap/global_costmap', 'voxel_layer.enabled'),
+    )
     TIMEOUT = 10.0
 
     def __init__(self, busy=lambda: False, on_enabled=lambda: None):
@@ -38,7 +40,7 @@ class ObstaclesCriticAPI:
                 raise web.HTTPConflict(text='导航任务正在控制强制跨越参数，请先结束任务')
             output = await self._apply(enabled)
         return web.json_response({'ok': True, 'requested': req.path.rsplit('/', 1)[-1],
-                                  'enabled': enabled, 'output': output})
+                                  'enabled': enabled, 'parameters': output})
 
     async def apply(self, enabled):
         """HTTP路由和后端任务共用设置入口，等待命令完成后才允许下一次设置。"""
@@ -47,10 +49,18 @@ class ObstaclesCriticAPI:
 
     async def _apply(self, enabled):
         value = 'true' if enabled else 'false'
+        outputs = []
+        for node, parameter in self.PARAMETERS:
+            outputs.append(await self._set_parameter(node, parameter, value))
+        if enabled:
+            self.on_enabled()
+        return outputs
+
+    async def _set_parameter(self, node, parameter, value):
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                'ros2', 'param', 'set', self.NODE, self.PARAMETER, value,
+                'ros2', 'param', 'set', node, parameter, value,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
         except (asyncio.TimeoutError, asyncio.CancelledError) as e:
@@ -59,14 +69,13 @@ class ObstaclesCriticAPI:
                 await proc.communicate()
             if isinstance(e, asyncio.CancelledError):
                 raise
-            raise web.HTTPGatewayTimeout(text='设置 ROS 参数超时')
+            raise web.HTTPGatewayTimeout(text=f'设置 ROS 参数 {node} {parameter} 超时')
         except OSError as e:
             raise web.HTTPBadGateway(text=f'无法执行 ros2：{e.strerror or e}')
         output = b'\n'.join(part for part in (stdout, stderr) if part).decode('utf-8', errors='replace').strip()
         # Humble 的 ros2param 在节点拒绝修改时仍可能以 0 退出。
         rejected = any(line.strip().startswith('Setting parameter failed') for line in output.splitlines())
         if proc.returncode != 0 or rejected:
-            raise web.HTTPBadGateway(text=output or f'ros2 命令失败（退出码 {proc.returncode}）')
-        if enabled:
-            self.on_enabled()
-        return output
+            detail = output or f'命令失败（退出码 {proc.returncode}）'
+            raise web.HTTPBadGateway(text=f'设置 ROS 参数 {node} {parameter} 失败：{detail}')
+        return {'node': node, 'parameter': parameter, 'enabled': value == 'true', 'output': output}

@@ -26,33 +26,38 @@ class ObstaclesCriticAPITests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
 
     @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
-    async def test_true_endpoint_enables_critic(self, create_process):
-        process = AsyncMock()
+    async def test_true_endpoint_enables_both_obstacle_parameters(self, create_process):
+        process = AsyncMock(returncode=0)
         process.communicate.return_value = (b'Successfully set parameter', b'')
-        process.returncode = 0
         create_process.return_value = process
 
         response = await self.client.post('/api/obstacles-critic/true')
 
         self.assertEqual(response.status, 200)
-        self.assertTrue((await response.json())['enabled'])
-        create_process.assert_awaited_once_with(
-            'ros2', 'param', 'set', '/controller_server',
-            'FollowPath.ObstaclesCritic.enabled', 'true',
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        body = await response.json()
+        self.assertTrue(body['enabled'])
+        self.assertEqual([item['enabled'] for item in body['parameters']], [True, True])
+        self.assertEqual(
+            [call.args for call in create_process.await_args_list],
+            [('ros2', 'param', 'set', '/controller_server',
+              'FollowPath.ObstaclesCritic.enabled', 'true'),
+             ('ros2', 'param', 'set', '/global_costmap/global_costmap',
+              'voxel_layer.enabled', 'true')])
 
     @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
-    async def test_false_endpoint_disables_critic(self, create_process):
-        process = AsyncMock()
+    async def test_false_endpoint_disables_both_obstacle_parameters(self, create_process):
+        process = AsyncMock(returncode=0)
         process.communicate.return_value = (b'Successfully set parameter', b'')
-        process.returncode = 0
         create_process.return_value = process
 
         response = await self.client.post('/api/obstacles-critic/false')
 
         self.assertEqual(response.status, 200)
-        self.assertFalse((await response.json())['enabled'])
-        self.assertEqual(create_process.await_args.args[-1], 'false')
+        body = await response.json()
+        self.assertFalse(body['enabled'])
+        self.assertEqual([item['enabled'] for item in body['parameters']], [False, False])
+        self.assertEqual(
+            [call.args[-1] for call in create_process.await_args_list], ['false', 'false'])
 
     @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
     async def test_ros_command_failure_returns_gateway_error(self, create_process):
