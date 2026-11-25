@@ -14,6 +14,7 @@ import { setupFlow } from './flow.js';
 import { setupReloc } from './reloc.js';
 import { setupTaught } from './taught.js';
 import { setupRtab } from './rtab.js';
+import { setupAudio } from './audio.js';
 import { toast } from './ui.js';
 import { recordingShortcut, setupRecordingControls } from './recording-capture.js';
 
@@ -37,6 +38,7 @@ const reloc = setupReloc(store, actions, mapView);
 const taught = setupTaught(store, src, setTool);
 flow = setupFlow(store, src, actions, setTool, reloc, taught, mapView);
 const rtab = setupRtab(store, src);   // RTAB 影子库卡片
+const audio = setupAudio(store, src);   // 播报
 const replay = early.splice(0); bus.h.log.shift(); replay.forEach(a => bus.emit('log', ...a));
 bus.on('map', () => mapView.onMap());
 setupCamera(src, bus);
@@ -115,14 +117,14 @@ window.addEventListener('blur', () => { if (Object.values(keys).some(Boolean)){ 
 
 /* ---------- 主循环 ---------- */
 setTool('pan');
-panels.fast(); panels.medium(); panels.slow(); alerts(); flow.render(); rtab.render(); runState();
+panels.fast(); panels.medium(); panels.slow(); alerts(); flow.render(); rtab.render(); audio(); runState();
 let last = performance.now(), a10 = 0, a5 = 0, a4 = 0, a1 = 0;
 function frame(t){
   const dt = Math.min(.05, (t - last)/1000); last = t;
   src.tick(dt);
   a10 += dt; a5 += dt; a4 += dt; a1 += dt;
   if (a10 >= .1){ a10 = 0; panels.pushHist(); }
-  if (a5 >= .2){ a5 = 0; panels.fast(); alerts(); flow.render(); rtab.render(); runState(); }
+  if (a5 >= .2){ a5 = 0; panels.fast(); alerts(); flow.render(); rtab.render(); audio(); runState(); }
   if (a4 >= .25){ a4 = 0; panels.medium(); }
   if (a1 >= 1){ a1 = 0; panels.slow(); }
   mapView.draw(dt);

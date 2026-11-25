@@ -8,6 +8,7 @@ const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, 
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
   'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
+  'audioPlay', 'audioStop', 'audioVolume', 'audioRename', 'audioDelete', 'audioRefresh', 'audioUpload',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
   'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
   'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
@@ -102,6 +103,7 @@ export function createRosSource(store, bus){
       case 'taught': storeTaughtDocument(store, m); break;
       case 'map_views': store.mapViews = m.items || {}; break;
       case 'map_labels': store.mapLabels = m.items || {}; break;
+      case 'audio': store.audio = { ...m, rx: performance.now() }; break;
       case 'keepout': store.keepouts = m.items || {}; break;
       case 'task': onTask(m.task); break;
       case 'pose': {
@@ -247,6 +249,16 @@ export function createRosSource(store, bus){
     setPolicy: name => send('set_policy', { name }, 60000),   // 停运控 + 重启 + 等状态，失败还要退回
     climb: on => send('climb', { on }),
     prepHold: () => send('prep_hold'),
+    // 播报：音频走 HTTP 上传（WebSocket 单条上限 1 MB），其余走指令
+    audioPlay: clip => send('audio_play', { clip }, 10000),
+    audioStop: () => send('audio_stop'),
+    audioVolume: v => send('audio_volume', { v }, 8000),
+    audioRename: (clip, name) => send('audio_rename', { clip, name }),
+    audioDelete: clip => send('audio_delete', { clip }),
+    audioRefresh: () => (store.audio ? send('audio_refresh', {}, 5000) : undefined),
+    audioUpload: (name, wav) => fetch(`/api/audio?name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'X-Go2w': '1' }, body: wav })
+      .then(r => r.json().catch(() => ({ ok: false, msg: `上传失败（HTTP ${r.status}）` })))
+      .catch(() => ({ ok: false, msg: '上传失败：连不上后端' })),
     deleteRoute: route_id => send('route_delete', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
     deleteMaps: names => send('map_delete', { names }, 60000),

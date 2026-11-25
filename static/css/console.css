@@ -307,6 +307,12 @@ body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
 .mrow:hover{background:var(--panel)}
 .mrow .mn{font-family:var(--f-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mrow .mm{font-family:var(--f-mono);font-size:11px;color:var(--muted)}
+.mrow.au{grid-template-columns:1fr auto auto auto auto;gap:6px}
+.mrow.au.on{background:var(--accent-soft)}
+.au-now{font-size:12.5px;color:var(--fg-2);padding:2px 0 10px;overflow-wrap:anywhere}
+.au-now[data-s=run]{color:var(--accent)}
+.au-now[data-s=warn]{color:var(--warn)}
+.au-vol{display:grid;grid-template-columns:auto 1fr 24px;gap:10px;align-items:center;font-size:12px;color:var(--fg-2);margin-bottom:8px}
 .mrow.bag{grid-template-columns:1fr auto auto auto auto auto}
 .bag-up{width:26px;height:26px;color:var(--muted)}
 .bag-up svg{width:15px;height:15px}
@@ -758,5 +764,12 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-point-dwell{grid-column:1/-1;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
 .route-point-dwell input{width:64px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 6px;font:11px var(--f-mono)}
 .route-point-dwell input:disabled{opacity:.4}
+/* 站点播报音频（11-25） */
+.route-point-audio{grid-column:1/-1;display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:3px 6px;font-size:11px;color:var(--muted)}
+.route-point-audio[hidden]{display:none}
+.route-point-audio select{min-width:0;width:100%;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg-2);padding:0 4px;font-size:11px}
+.route-point-audio.on select{border-color:var(--accent-line);color:var(--fg)}
+.route-audio-tip{grid-column:2;color:var(--muted)}
+.route-audio-tip:empty{display:none}
 /* 设了停留的站：列表里和地图上一样用橙色 */
 .route-points .route-head span.route-stay{color:#ff9f5a}

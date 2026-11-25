@@ -205,6 +205,7 @@
         <div class="dh">
           <button class="dtab on" data-pane="pLogs">日志与录包</button>
           <button class="dtab" data-pane="pPlots">曲线</button>
+          <button class="dtab" data-pane="pAudio">播报</button>
           <div class="sp"></div>
           <div id="logFilters" style="display:flex;gap:4px">
             <button class="fchip on" data-lv="ALL">全部</button><button class="fchip" data-lv="INFO">INFO</button><button class="fchip" data-lv="WARN">WARN</button><button class="fchip" data-lv="ERROR">ERROR</button>
@@ -222,6 +223,21 @@
                 <button data-m="loc" aria-pressed="false">定位匹配率</button>
               </div>
               <div class="plot-grid" id="plotGrid"></div>
+            </div>
+          </div>
+          <div class="dpane" id="pAudio" hidden>
+            <div class="mb">
+              <div>
+                <h4>音频 <button class="btn sm pri" id="auUp">上传音频</button></h4>
+                <input type="file" id="auFile" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" hidden>
+                <div id="auList"></div>
+              </div>
+              <div>
+                <h4>喇叭 <button class="btn sm" id="auStop" disabled>停止播报</button></h4>
+                <div class="au-now" id="auNow" aria-live="polite">--</div>
+                <label class="au-vol"><span>音量</span><input type="range" id="auVol" min="0" max="10" step="1" disabled><b class="mono" id="auVolTxt">--</b></label>
+                <p class="bag-tip">用狗本体的喇叭。新的播报会打断正在播的；播报不影响导航和任务。上传时自动统一音量。</p>
+              </div>
             </div>
           </div>
           <div class="dpane" id="pLogs">

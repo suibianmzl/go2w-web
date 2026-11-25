@@ -58,6 +58,7 @@ MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
 THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
+GOAL_XY = float(os.environ.get('GO2W_FAKE_GOAL_XY', '0.25'))   # nav2.yaml goal checker xy_goal_tolerance
 
 
 def load_map(yaml_path):
@@ -291,7 +292,46 @@ class Sim:
     def subscribers(self, topic):
         if topic == '/patrol_pose':
             return 1 if self.pat and time.monotonic() >= self.pat['ready_at'] else 0
+        if topic in ('/api/audiohub/request', '/api/vui/request'):
+            return 0 if os.path.exists('/tmp/go2w_fake_audio_off') else 1
         return 0
+
+    def audio_req(self, service, msg):
+        """假喇叭：喊话 4001 / 4003 / 4002 和音量。每次退出喊话把拼回来的 WAV 写到 /tmp/go2w_fake_audio.wav，api 顺序写到 .log。
+        /tmp/go2w_fake_audio_fail 存在：里面写的 api_id 回错误码 7。"""
+        import base64
+        import json
+        from unitree_api.msg import Response
+        if not hasattr(self, 'hub'):
+            self.hub = {'vol': 5, 'blocks': [], 'log': []}
+            if os.path.exists('/tmp/go2w_fake_audio.log'):   # 上一个进程留下的
+                os.unlink('/tmp/go2w_fake_audio.log')
+        h = self.hub
+        api, r = msg.header.identity.api_id, Response()
+        r.header.identity.id, r.header.identity.api_id = msg.header.identity.id, api
+        try:
+            with open('/tmp/go2w_fake_audio_fail') as f:
+                fail = int(f.read())
+        except (OSError, ValueError):
+            fail = None
+        if api == fail:
+            r.header.status.code = 7
+        elif service == 'vui' and api == 1003:
+            h['vol'] = json.loads(msg.parameter)['volume']
+        elif service == 'vui' and api == 1004:
+            r.data = json.dumps({'volume': h['vol']})
+        elif service == 'audiohub' and api == 4001:
+            h['blocks'] = []
+        elif service == 'audiohub' and api == 4003:
+            h['blocks'].append(json.loads(msg.parameter)['block_content'])
+        if service == 'audiohub':
+            h['log'].append(api)
+            with open('/tmp/go2w_fake_audio.log', 'w') as f:
+                json.dump(h['log'], f)
+            if api == 4002:
+                with open('/tmp/go2w_fake_audio.wav', 'wb') as f:
+                    f.write(base64.b64decode(''.join(h['blocks'])))
+        self.node.deliver(f'/api/{service}/response', r)
 
     def start_mode(self, mode, map_yaml=None, *, taught_route=False):
         self.mode_environment = {'GO2W_NAVIGATION_MODE': mode}
@@ -601,6 +641,8 @@ class Sim:
             yaw = 2 * math.atan2(p.orientation.z, p.orientation.w)
             self.pat['points'].append((p.position.x, p.position.y, yaw))
             self.plog(20, '%s 点：(%.2f, %.2f)，朝向 %.0f°' % ('AB'[len(self.pat['points']) - 1], p.position.x, p.position.y, math.degrees(yaw)))
+        elif topic in ('/api/audiohub/request', '/api/vui/request'):
+            self.audio_req(topic.split('/')[2], msg)
         elif topic == '/api/sport/request':
             if msg.header.identity.api_id == 2101:
                 if self.dual is not None:
@@ -829,6 +871,12 @@ class Sim:
             self.node.deliver('/plan', self.path_msg())
             self.rosout(20, 'controller_server', 'Received a goal, begin computing control effort.')
             g['mark'] = (now, self.x, self.y)
+            # 11-25 真机：控制器的 goal checker 只看整条路径的终点（xy 0.25 m）。多点目标的终点就在狗旁边时
+            # （环线回到起点），一开始就满足 → 同一拍 "Reached the goal!"，中间站一个都没走（bag go2w-01_1125_114120）
+            if g['through'] and math.hypot(g['x'] - self.x, g['y'] - self.y) <= GOAL_XY:
+                self.rosout(20, 'controller_server', 'Reached the goal!')
+                self.finish(SUCCEEDED)
+                return 0.0, 0.0
         if g['through']:
             while len(g['via']) > 1 and math.hypot(g['via'][0][0] - self.x, g['via'][0][1] - self.y) <= THROUGH_RADIUS:
                 g['via'].pop(0)

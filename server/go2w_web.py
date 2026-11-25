@@ -82,6 +82,7 @@ except ImportError:  # pragma: no cover
     SerializePoseGraph = None
 from geometry_msgs.msg import Pose2D
 
+import audio as AU
 import camera as C
 import incidents as INC
 import keepout as KO
@@ -255,7 +256,9 @@ ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
 # 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
 # 网页离下一站不到 ROUTE_THROUGH_PASS 就算经过（和行为树里的半径一样）；Nav2 先划掉了也算
 ROUTE_THROUGH_PASS = 0.5
-ROUTE_SEG_MAX = 30       # 一段最多几站（一直循环、没有停留站时也要分段）
+# 11-25：一段的终点离狗不到这么远（goal checker xy 0.25 + 定位余量）就不能当这段的终点发，见 run_through
+ROUTE_THROUGH_NEAR_END = 0.6
+ROUTE_SEG_MAX = 30      # 一段最多几站（一直循环、没有停留站时也要分段）
 THROUGH_BT = os.environ.get('GO2W_THROUGH_BT') or os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'bt', 'navigate_through_go2w.xml')
 ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
@@ -1581,6 +1584,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.ctrl = R.CtrlLink(node, node.event, fake=self.simulated)
             except Exception as e:
                 node.event('ERROR', f'无法连接运控状态（域 0）：{e!r}；站起 / 趴下不可用')
+        # 播报（audio.py）：本体喇叭，挂在运控那个域 0 节点上
+        self.audio = AU.Audio(node.event, DATA, self.ctrl.ros if self.ctrl else None, self.push_audio, self.label_error,
+                              os.environ.get('GO2W_AUDIO_LOCAL_EDIT', '1' if self.simulated else '0') == '1',
+                              why='' if self.ctrl else '没连上域 0，喇叭不可用')
+        self.audio.used = self.audio_used
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
         self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
@@ -1682,6 +1690,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return await self.handle_taught(ws, d)
             except (TeachingError, ValueError) as e:
                 return False, str(e)
+        if isinstance(op, str) and op.startswith('audio_'):   # 播报：不算运动操作，不抢控制权
+            return await self.audio.handle(d, self.remote(ws))
         if self._taught_job is not None and (op in ('goal', 'route_start', 'set_mode', 'load_map', 'autoloc_move')
                                             or (op == 'arm' and d.get('on'))):
             return False, '示教正在加载地图或定位自检，请保持静止并等待结果'
@@ -2493,6 +2503,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                     'name': label.strip(), 'note': note.strip(), 'manualHeading': manual}
             if round(dwell) > 0:
                 item['dwell'] = int(round(dwell))
+            clip = point.get('audio')       # 11-25：到这一站播哪段音频（audio.py 的 id），没有 = 不播
+            if clip not in (None, ''):
+                if isinstance(clip, str) and re.fullmatch('[0-9a-f]{12}', clip):
+                    item['audio'] = clip
+                elif strict:
+                    raise ValueError('站点播报音频无效')
             clean.append(item)
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
@@ -2535,6 +2551,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '找不到要更新的任务'
         route_id = route_id or uuid.uuid4().hex
         record = self.route_record(d, route_id)
+        for i, p in enumerate(record['points'], 1):
+            if p.get('audio') and p['audio'] not in self.audio.items:
+                return False, f'第 {i} 站选的播报音频已经不在了，重新选一段或改成不播报'
         self.write_routes({**self.routes, route_id: record})
         return True, f"已保存任务：{record['name']}", record
 
@@ -3038,6 +3057,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.incident('nav_fail', f"巡逻任务「{route['record']['name']}」{message}")   # 先记，任务信息还是执行中的
         route.update(status=status, message=message, ended=time.monotonic())
         route['stop'].set()
+        if status != 'succeeded':   # 取消 / 失败 / 急停：任务自己播的那段也停；正常跑完的让最后一站播完
+            self.background(self.audio.stop_tag(route, '任务停止'))
         try:
             self.resume_checkpoint(route, status, message)
         except Exception as e:   # 记断点出错不能影响停车
@@ -3394,6 +3415,33 @@ class Server(TaughtWeb, RT.RtabWeb):
         await asyncio.sleep(COSTMAP_REFILL)
         n.event('INFO', '出发前已清除代价地图里的旧障碍标记')
 
+    # ---------- 站点播报（11-25） ----------
+    def audio_used(self, clip):
+        return [f"任务「{r['name']}」第 {i} 站" for r in self.routes.values()
+                for i, p in enumerate(r['points'], 1) if p.get('audio') == clip]
+
+    def route_audio(self, route, i):
+        """到 / 经过第 i 站：这站选了音频就播。后台播，播不出来只记日志，不影响任务。
+        一口气补记好几站（Nav2 一次划掉几站）时只播最后一个配了音频的站。"""
+        if not route['record']['points'][i].get('audio'):
+            return
+        route['audio'] = i
+
+        async def go():
+            await asyncio.sleep(0)
+            if route['audio'] != i:
+                return
+            name = route['record']['points'][i].get('name') or f'第 {i + 1} 站'
+            try:
+                ok, msg = await self.audio.play(
+                    route['record']['points'][i]['audio'], f'任务 {name}', tag=route,
+                    valid=lambda: route['status'] in ('active', 'succeeded') and route['audio'] == i)
+            except Exception as e:
+                ok, msg = False, repr(e)
+            if not ok:
+                self.node.event('WARN', f'{name}播报没播：{msg}')
+        self.background(go())
+
     def through_passed(self, ws, route, seg, k):
         """连续通过：seg 里第 k 站经过了。记进度、写断点，下一站成为当前目标。"""
         n, points = self.node, route['record']['points']
@@ -3406,6 +3454,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         reason = self.route_blocker(ws, route['record'])
         if reason:
             raise RuntimeError(reason)
+        self.route_audio(route, i)
 
     async def run_through(self, ws, route, state):
         """连续通过（v1.1.11）：从 state 起一段一段跑。返回 None = 全部跑完；'stop' = 被取消（已处理）；
@@ -3431,6 +3480,18 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX:
                     break
                 s = nxt
+            # 这段的终点就在狗旁边（环线回到出发位置）：控制器的 goal checker 只看路径终点，一开始就满足，
+            # 同一拍报到达、中间站一个没走（11-25 bag go2w-01_1125_114120）。终点先拿掉，这段跑到它前一站，
+            # 拿掉的站下一段再单独发（那时狗已经走远了）
+            here = n.lookup(BASE_FRAME) if n.fixed == 'map' else None
+            if here and len(seg) > 1:
+                cut = seg[-1]
+                while len(seg) > 1 and math.hypot(here[0] - seg[-1][1]['x'], here[1] - seg[-1][1]['y']) <= ROUTE_THROUGH_NEAR_END:
+                    seg.pop()
+                if seg[-1] is not cut:
+                    d = math.hypot(here[0] - cut[1]['x'], here[1] - cut[1]['y'])
+                    n.event('INFO', f'这段的终点第 {cut[0][0] + 1} 站离狗只有 {d:.2f} m（Nav2 会当场判到达），'
+                                    f'先跑到第 {seg[-1][0][0] + 1} 站，后面的站再单独发')
             poses = []
             for k, (_, pt, dwell, nxt) in enumerate(seg):
                 last = k == len(seg) - 1
@@ -3541,6 +3602,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             while k < len(seg) - 1:   # Nav2 到了终点：中间没来得及记的站都算经过
                 self.through_passed(ws, route, seg, k)
                 k += 1
+            self.route_audio(route, last_state[0])
             if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
                 return 'stop'
             route['done'] += 1
@@ -3583,6 +3645,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             first = route['resume'] or (0, 1, False)
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
             if route['resume'] is None and near < ROUTE_NEAR_START:
+                self.route_audio(route, 0)
                 if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
                     route.update(index=0, target=points[0])
                     if not await self.route_dwell(ws, route, 0, points[0]['dwell']):
@@ -3704,6 +3767,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     if off is None or off > ROUTE_ARRIVE_TOL:
                         raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
                     n.event('WARN', f'第 {i + 1} 站未精确到达（偏差 {off:.2f} m），视为已到，继续下一站')
+                self.route_audio(route, i)
                 if dwell and not await self.route_dwell(ws, route, i, dwell):
                     return
                 route['done'] += 1
@@ -3755,6 +3819,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 # 停留中：还剩几秒（11-24）；不在停留就是 null
                 'dwellLeft': max(0.0, route['dwell_until'] - time.monotonic()) if route.get('dwell_until') else None,
                 'pointDwell': record['points'][i].get('dwell', 0),
+                'pointAudio': (self.audio.items.get(record['points'][i].get('audio')) or {}).get('name'),   # 这站的播报音频名，没有 = null
                 'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------
@@ -5686,6 +5751,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.tx_put(ws, self.labels_message(), 'labels')
             self.tx_put(ws, self.keepout_message(), 'keepout')
             self.tx_put(ws, self.incidents_message(), 'incidents')
+            self.tx_put(ws, self.audio.message(), 'audio')
             taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
             if taught_map:
                 c['taught_map'] = taught_map
@@ -5930,6 +5996,29 @@ class Server(TaughtWeb, RT.RtabWeb):
             except Exception as e:  # 别让一次异常停掉推送
                 n.get_logger().warn(f'broadcast: {e!r}')
 
+    async def push_audio(self, text):
+        await self.send_all(text, key='audio')
+
+    async def api_audio(self, req):
+        """上传一段音频（网页已转成 16 kHz 单声道 WAV）。要求自定义头：别的网站的表单 / 跨域请求带不上。"""
+        def bad(msg, status=400):
+            return web.json_response({'ok': False, 'msg': msg}, status=status)
+        remote = client_ip(req)
+        if req.headers.get('X-Go2w') != '1' or not self.audio.editable(remote):
+            return bad('这个入口不能上传音频', 403)
+        raw = bytearray()
+        async for chunk in req.content.iter_chunked(65536):
+            raw += chunk
+            if len(raw) > AU.BODY_MAX:
+                return bad(f'音频太长：最多 {AU.DUR_MAX:.0f} s', 413)
+        try:
+            x = await self.audio.add(req.query.get('name', ''), bytes(raw), remote)
+        except AU.AudioError as e:
+            return bad(str(e))
+        except OSError as e:
+            return bad(f'保存音频失败：{e.strerror or e}', 500)
+        return web.json_response({'ok': True, 'msg': f'已上传「{x["name"]}」', 'item': x})
+
     def app(self):
         @web.middleware
         async def no_cache(req, handler):  # 开发期改完前端直接刷新就生效
@@ -5944,6 +6033,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.recording_api.routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
+        app.router.add_post('/api/audio', self.api_audio)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):
                 app.router.add_static(f'/{sub}/', os.path.join(self.static_dir, sub))
@@ -5954,8 +6044,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             a['tasks'] = [asyncio.create_task(self.broadcast()), asyncio.create_task(self.safety()),
                           asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor()),
                           asyncio.create_task(self.taught_loop())]
+            await self.audio.start()
 
         async def stop(a):
+            await self.audio.close()      # 正在播就退出喊话；要在 ctrl.close() 之前
             if self.taught_recording():
                 await self.disarm_and_cancel('网页服务关闭，示教草稿已保留')
             if self.route_running():
