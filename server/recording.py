@@ -215,7 +215,8 @@ class RecordingAPI:
                     if request_id is not None and capture.get('request_id') != request_id:
                         continue
                     result.append({**item, 'audio': self.voice(bag), 'request_id': capture.get('request_id'),
-                                   'voice_state': capture.get('voice', {}).get('state')})
+                                   'voice_state': capture.get('voice', {}).get('state'),
+                                   'voice_reason': capture.get('voice', {}).get('reason', '')})
                 except (web.HTTPException, OSError):
                     continue
             return result

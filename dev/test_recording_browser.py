@@ -36,6 +36,14 @@ def main():
         expect(page.locator('#voiceStatus')).to_contain_text('正在录语音', timeout=5000)
         page.wait_for_function("go2w.actions.rollbackCapture.state.message === '数据包与语音备注已保存'", timeout=30000)
         assert len(saves) == 1, saves
+        recorded_name=page.evaluate('go2w.store.bags[0].name')
+        page.locator('#bagHistory > summary').click()
+        play=page.get_by_role('button',name='播放录音 '+recorded_name,exact=True)
+        expect(play).to_be_enabled(timeout=10000)
+        play.click()
+        page.wait_for_function('document.querySelector("#bagVoiceAudio").duration>0')
+        assert 4.5 <= page.locator('#bagVoiceAudio').evaluate('(a)=>a.duration') <= 6
+        page.locator('#bagVoiceClose').click()
         page.screenshot(path=str(out/'console.png'), full_page=True)
         print('PASS 主控制台快捷键、误触保护、真实5秒录音与落盘', flush=True)
 

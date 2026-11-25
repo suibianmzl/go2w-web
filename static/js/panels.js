@@ -1,4 +1,5 @@
 import { setupRouteEditor } from './routes.js';
+import { setupBagVoice } from './bag-voice.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
 import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount, mapTitle, mapOptText } from './util.js';
 import { LAYERS, L } from './layers.js';
@@ -404,6 +405,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   }
 
   /* ---------- 录包 ---------- */
+  const bagVoice = setupBagVoice(store, { mock:!ros, onChange:() => renderMaps() });
   const bagChosen = new Set();
   const bagUploading = name => ['queued', 'run'].includes(store.uploads[name]?.state);
   const bagSelectable = () => store.bags.filter(b => !bagUploading(b.name) && !(store.profiles.bag !== 'stop' && (store.bagLive || []).includes(b.name)));
@@ -440,7 +442,9 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const st = queued ? '<span class="mm bag-st queued">排队中</span>' : upping ? `<span class="mm bag-st run" title="${esc(u.msg || '')}">${waiting ? '等语音' : `上传 ${u.pct}%`}</span>` : u.state === 'fail' ? `<span class="mm bag-st fail" title="${esc(u.msg || '')}">上传失败</span>` : u.state === 'stale' ? '<span class="mm bag-st fail">待重传</span>' : u.state === 'done' ? '<span class="mm bag-st done">已上传</span>' : '';
       const del = `<button class="ib bag-del" data-del="${esc(b.name)}" ${live || busy ? `disabled title="${live ? '正在录制，先停止录包' : '已排队或正在上传，等传完再删'}"` : `title="删除 ${esc(b.name)}"`} aria-label="删除录包 ${esc(b.name)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`;
       const select = `<label class="bag-check"><input type="checkbox" data-bag-select="${esc(b.name)}" aria-label="选择录包 ${esc(b.name)}" ${bagChosen.has(b.name) ? 'checked' : ''} ${live || busy ? 'disabled' : ''}></label>`;
-      return `<div class="mrow bag">${select}<span class="mn" title="${esc(b.name)}">${esc(b.name)}</span><span class="bag-meta"><span class="mm">${live ? '录制中' : fmtDur(b.dur)}</span><span class="mm">${b.size>1024?(b.size/1024).toFixed(1)+' GB':b.size.toFixed(0)+' MB'}</span>${st}</span>${up}${del}</div>`; }).join('')
+      const voice = bagVoice.info(b.name), playing = bagVoice.isPlaying(b.name);
+      const play = `<button class="ib bag-voice" data-voice="${esc(b.name)}" ${!voice.ready ? 'disabled' : ''} title="${esc(voice.title)}" aria-label="${playing ? '暂停' : '播放'}录音 ${esc(b.name)}" aria-pressed="${playing}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">${playing ? '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>' : '<path d="M7 4v16l14-8z"/>'}</svg></button>`;
+      return `<div class="mrow bag">${select}<span class="mn" title="${esc(b.name)}">${esc(b.name)}</span><span class="bag-meta"><span class="mm">${live ? '录制中' : fmtDur(b.dur)}</span><span class="mm">${b.size>1024?(b.size/1024).toFixed(1)+' GB':b.size.toFixed(0)+' MB'}</span><span class="mm bag-voice-state" title="${esc(voice.title)}">${voice.label}</span>${st}</span>${play}${up}${del}</div>`; }).join('')
       : `<div class="empty">还没有录包</div>`);
     $('#bagBtn').textContent = bs==='run' ? '停止录制' : bs==='stop' ? '开始持续录制' : bs==='starting' ? '启动中…' : '停止中…';
     $('#bagBtn').dataset.state = bs;
@@ -685,6 +689,8 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     renderMaps();
   };
   $('#bagList').onclick = e => {
+    const play = e.target.closest('[data-voice]');
+    if (play){ if (!play.disabled) bagVoice.play(play.dataset.voice); return; }
     const b = e.target.closest('[data-del],[data-up]'); if (!b || b.disabled) return;
     const bag = store.bags.find(bag => bag.name === (b.dataset.del ?? b.dataset.up)); if (!bag) return;
     b.dataset.del != null ? actions.deleteBag(bag) : actions.uploadBag(bag);

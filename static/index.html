@@ -267,6 +267,11 @@
                     <button class="btn" id="bagUploadSelected" type="button" disabled>上传所选</button>
                     <span class="meta" id="bagUploadSummary" role="status">可同时上传 2 个包，其余排队</span>
                   </div>
+                  <div class="bag-voice-player" id="bagVoicePlayback" hidden>
+                    <div class="bag-voice-heading"><span id="bagVoiceName"></span><button class="ib" id="bagVoiceClose" aria-label="关闭录音播放" title="关闭录音播放">×</button></div>
+                    <audio id="bagVoiceAudio" controls preload="none" aria-label="录包语音备注"></audio>
+                    <p id="bagVoiceMessage" role="status"></p>
+                  </div>
                   <div id="bagList"></div>
                 </details>
                 <details class="bag-disclosure bag-settings" id="bagSettings">
