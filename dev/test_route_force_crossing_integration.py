@@ -101,7 +101,8 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             return [json.loads(line)[-1] for line in command_log.read_text().splitlines()]
                         tasks = [asyncio.create_task(read()), asyncio.create_task(ping())]
                         try:
-                            await until(lambda: state.get('pose', {}).get('frame') == 'map'
+                            await until(lambda: state.get('state', {}).get('ctrl', {}).get('ready')
+                                        and state.get('pose', {}).get('frame') == 'map'
                                         and state.get('state', {}).get('mapCurrent') == 'lab_20261021', '定位')
                             pts = [dict(x=float(i), y=0., th=0., name=str(i), **({'forceCrossing':True} if i in (1, 2) else {}))
                                    for i in range(4)]

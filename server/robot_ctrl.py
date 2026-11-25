@@ -31,7 +31,7 @@ STATES = ('Passive', 'FixStand', 'Velocity')
 
 
 class CtrlLink:
-    def __init__(self, main_node, event, fake=False):
+    def __init__(self, main_node, event, fake=False, on_lowstate=None, control=True):
         """event(level, msg)：写进网页日志。fake：本地假 ROS，挂在 main_node 上。"""
         from std_msgs.msg import String
         from unitree_api.msg import Request
@@ -40,6 +40,7 @@ class CtrlLink:
         self.steady_t = None                  # 进入当前 (state, ready=true) 的时间；没 ready 时 None
         self.dual = None                      # 融合策略：(policy, switching, climb_req)；单策略 / 没收到时 None
         self.n = 0
+        self.epoch = 0
         self.executor = self.thread = None
         if fake:
             self.ctx, self.ros = None, main_node
@@ -65,9 +66,20 @@ class CtrlLink:
             self.thread.start()
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         # BEST_EFFORT 订阅能和可靠 / 不可靠的发布者都匹配上
-        self.ros.create_subscription(String, '/go2w_ctrl/state', self.on_state,
-                                     QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
-        self.pub = self.ros.create_publisher(Request, '/api/sport/request', 10)
+        if control:
+            self.ros.create_subscription(String, '/go2w_ctrl/state', self.on_state,
+                                         QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.pub = self.ros.create_publisher(Request, '/api/sport/request', 10) if control else None
+        if on_lowstate is not None:
+            from rosidl_runtime_py.utilities import get_message
+            self.lowstate_t = -float('inf')
+            def receive(raw):
+                now = time.monotonic()
+                if now-self.lowstate_t >= .2:  # raw callback: decode at most 5 Hz, including when navigation is off.
+                    self.lowstate_t = now
+                    on_lowstate(raw)
+            self.ros.create_subscription(get_message('unitree_go/msg/LowState'), '/lowstate', receive,
+                                         QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT), raw=True)
 
     def close(self):
         """只释放网页自己的域 0 监听器；不发 Sport 请求，不停止控制进程。"""
@@ -90,6 +102,8 @@ class CtrlLink:
             self.event('INFO', f'运控策略：{od[0]} → {dual[0]}' + ('（有爬台请求：网页 / 遥控器 RB）' if dual[2] else ''))
         old = self.snap
         now = time.monotonic()
+        if state != old[0] or seq != old[2] or (old[1] and not ready) or now-old[3] > 2.:
+            self.epoch += 1
         if not ready or state != old[0] or seq != old[2] or not old[1]:
             self.steady_t = now if ready else None
         self.snap = (state, ready, seq, now)
@@ -119,6 +133,8 @@ class CtrlLink:
         return self.dual
 
     def send(self, api_id, parameter=''):
+        if self.pub is None:
+            raise RuntimeError('read-only robot connection')
         self.n += 1
         r = self.Request()
         r.header.identity.id = int(time.time() * 1e6) * 100 + self.n % 100

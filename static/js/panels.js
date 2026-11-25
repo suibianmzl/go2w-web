@@ -216,7 +216,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   /* ---------- 顶栏 / HUD / 机器人卡片 ---------- */
   function chip(id, s, txt){ const c = $(id); c.dataset.s = s; c.querySelector('b').textContent = txt; }
   // 运控姿态（store.ctrl，后端 ctrl_view）：顶栏「姿态」+ 机器人卡片上的站起 / 趴下 / 保持站立
-  const POSE = { Passive: '趴着', FixStand: '站立', Velocity: '行走' };
+  const POSE = { Passive: '趴着', FixStand: '站立', Velocity: '已站起' };
   $('#poseUp').onclick = () => actions.standUp();
   $('#poseDown').onclick = () => actions.lieDown();
   $('#poseHold').onclick = () => actions.standHold(!store.ctrl?.hold);
@@ -230,15 +230,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     if (!on) $('#policyRow').hidden = $('#climbRow').hidden = true;
     if (!on) return;
     const name = C.state == null ? '运控离线' : POSE[C.state] || String(C.state).replace(/[<>&"]/g, '');
-    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…' : C.state === 'FixStand' && !C.ready ? '站起中…'
+    const physical = ros ? store.robotFeedback : { fresh:true, posture:C.state === 'Passive' ? 'lying' : 'standing' };
+    const unconfirmed = ['FixStand','Velocity'].includes(C.state) && physical?.posture !== 'standing';
+    const dynamic = C.state === 'Velocity' && C.physicalReady && physical?.fresh && physical?.valid && physical.posture === 'unknown';
+    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…'
+      : dynamic ? '策略运行' : unconfirmed ? '未确认站起' : C.state === 'Passive' && physical?.posture !== 'lying' ? '姿态未确认' : C.state === 'FixStand' && !C.ready ? '站起中…'
       : C.lieIn != null ? `${Math.ceil(C.lieIn)} s 后趴下` : name;
-    chip('#chPose', C.state == null ? 'crit' : C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
+    chip('#chPose', C.state == null ? 'crit' : unconfirmed || !physical?.fresh || C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
     renderPolicy(C);
     renderClimb(C);
     const pt = $('#poseTxt');
     pt.className = 'pose-txt' + (C.lieIn != null ? ' warn' : '');
     pt.innerHTML = C.op === 'policy' ? '姿态 <b>切换策略中…</b> · 运控重启'
       : C.state == null ? '<b class="crit">运控离线</b> · 收不到运控状态'
+      : dynamic ? '策略运行 · 当前关节处于变化姿态'
+      : unconfirmed ? '<b class="warn">未确认站起</b> · 请检查电量和实测关节反馈'
       : C.lieIn != null ? `空闲 · <b>${Math.ceil(C.lieIn)} s 后原地趴下</b>`
       : `姿态 <b>${txt}</b>${C.hold ? ' · 保持站立' : ''}`;
     const busy = !!C.op || C.state == null;

@@ -114,13 +114,14 @@ FAKE_MOTOR_TAU = [5.9, -1.8, 7.2, -6.8, 0.2, 8.1, 3.8, 0.6, 6.8, -3.8, 0.8, 7.1,
 _fake_lost = [120, 3400, 0, 7, 0, 0, 15, 0, 0, 2, 0, 0, 0, 980, 0, 0]
 
 
-def fake_lowstate():
+def fake_lowstate(state='Passive'):
     b = bytearray(1180)
     b[1] = 1                       # 小端 CDR 头 00 01 00 00
     b[4 + 1039] = 76               # bms_state.soc
     for i, t in enumerate(FAKE_MOTOR_TEMP[:16]):
         b[4 + 108 + 48*i] = t & 0xFF   # motor_state[i].temperature（int8）
-        struct.pack_into('<f', b, 4 + 80 + 48*i, FAKE_MOTOR_Q[i % 3] if i < 12 else 700.0 + i)   # q（rad）
+        q = FAKE_MOTOR_Q if state == 'Passive' or os.environ.get('GO2W_FAKE_STUCK_POSTURE') == '1' else [0., .8, -1.5]
+        struct.pack_into('<f', b, 4 + 80 + 48*i, q[i % 3] if i < 12 else 700.0 + i)   # q（rad）
         struct.pack_into('<f', b, 4 + 92 + 48*i, FAKE_MOTOR_TAU[i] + random.uniform(-0.5, 0.5))   # tau_est（N·m）
         struct.pack_into('<I', b, 4 + 112 + 48*i, _fake_lost[i])   # lost（累计丢包）
         struct.pack_into('<I', b, 4 + 116 + 48*i, FAKE_MOTOR_ERR[i])   # reserve[0]（错误标志）
@@ -148,6 +149,8 @@ class Sim:
         # 进程：开机时导航已经在跑（和平时 nav.sh start 之后一样）
         self.procs = {'mapping': False, 'localization': False, 'navigation': True, 'patrol': False, 'bag': False, 'bridge': False, 'bag_seg': False}
         self.ready_at = {'navigation': 0.0}
+        if os.environ.get('GO2W_FAKE_NAV_OFF') == '1':
+            self.procs['navigation'] = False
         # 假 cmd_bridge
         self.armed = False
         self.params = {'max_vx': 1.0, 'max_wz': 1.2, 'cmd_timeout': 0.3}
@@ -1234,7 +1237,10 @@ def run(node):
         if nav and k % 20 == 0:   # 全局代价地图 1 Hz（内容不变，后端会去重）
             node.deliver('/global_costmap/costmap', sim.costmap_msg(local=False))
         if k % 4 == 2:   # /go2w/robot_lowstate（真机约 230 Hz，这里 5 Hz 够测力矩 2 Hz 刷新）：后端只按 CDR 偏移读 soc 和电机温度，这里只拼这几个字节
-            node.deliver('/go2w/robot_lowstate', fake_lowstate())
+            raw = fake_lowstate(sim.ctrl['state'])
+            node.deliver('/go2w/robot_lowstate', raw)
+            if not os.path.exists(os.environ.get('GO2W_FAKE_LOWSTATE_OFF', '/tmp/go2w_fake_lowstate_off')):
+                node.deliver('/lowstate', raw)
         if sim.loc_ready() and k % 20 == 0:  # /amcl_pose：假定位误差很小，走起来略大
             a = PoseWithCovarianceStamped()
             a.header.stamp.sec, a.header.stamp.nanosec = sim.stamp()

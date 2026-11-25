@@ -70,6 +70,7 @@ from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 from recording import RecordingAPI
 from cpu_stats import CpuStats
+from robot_feedback import RobotFeedback
 from obstacles_critic import ObstaclesCriticAPI
 
 # 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
@@ -179,23 +180,7 @@ INSPECT_DT = 0.5    # topic 查看器每条 topic 最多 2 Hz 刷新
 ROS_LEVEL = {20: 'INFO', 30: 'WARN', 40: 'ERROR', 50: 'ERROR'}
 BASE_FRAME = 'base_footprint'
 STALE = 3.0  # 秒；超过这么久没收到就当没有
-BAT_TOPIC = '/go2w/robot_lowstate'
-BAT_PERIOD = 5.0    # 秒；多久读一次 lowstate（电量 + 电机温度）
-BAT_STALE = 70.0    # 秒；超过这么久没读到电量，网页显示 --
-MOTOR_STALE = 20.0  # 秒；超过这么久没读到电机温度，网页显示 --
-# LowState 里 bms_state.soc 的位置：4 字节 CDR 头 + 1039（定长数组、按 CDR 对齐算出；11-16 录包验证 = 73%、29.9 V）
-BAT_SOC_OFFSET = 4 + 1039
-# motor_state[i].temperature（int8，℃）：motor_state 从 77 开始、每个 48 字节，temperature 在元素内 +31
-# （11-17 用 11-13/11-16 录包验证：关节角按 FR/FL/RR/RL × 髋/大腿/小腿 排列，12–15 是轮子，温度 23–81 ℃）
-MOTOR_TEMP_OFFSET, MOTOR_STRIDE, MOTOR_N = 4 + 108, 48, 16
-# motor_state[i].reserve[0]（uint32）当错误标志（同 app「狗腿信息 → 错误标志」），在元素内 +39 = temperature 后 8 字节。
-# 11-17 用 go2w-01_1116_172503 录包核对（14772 帧）：16 个电机全程 0（= 正常）；reserve[1] 一直 507/508，不是错误码
-MOTOR_ERR_OFFSET = MOTOR_TEMP_OFFSET + 8
-# motor_state[i].tau_est（float32，N·m，估计力矩）：元素内 q +0 / dq +4 / ddq +8 / tau_est +12 → temperature 前 16 字节。
-# 11-17 用 go2w-01_1116_172503 核对：站着时小腿约 +7、左右髋符号相反（±4~7），轮子 ±2 以内
-MOTOR_TAU_OFFSET = MOTOR_TEMP_OFFSET - 16
-# 网页打开「力矩」视图时 lowstate 改成每 MOTOR_FAST_PERIOD 秒读一次（= 状态推送 2 Hz），关掉后回到 BAT_PERIOD
-MOTOR_FAST_PERIOD = 0.5
+MOTOR_STALE = RobotFeedback.STALE
 # 建图自动保存（11-17，用户：「报错自动保存地图」「两分钟太长，三十秒」）：建图时每 AUTOSAVE_PERIOD 秒、
 # 停止建图前、雷达 / FAST-LIO / 里程计出问题时，把当前地图存成 data/maps/autosave_<建图开始时间>，
 # 同一次建图覆盖同一份。只在地图有变化时存；单次存图耗时超过周期的 1/10 就自动拉长间隔，免得拖慢 slam。
@@ -384,7 +369,7 @@ CLIMB_MAX = float(os.environ.get('GO2W_CLIMB_MAX', '300'))
 IDLE_LIE = float(os.environ.get('GO2W_IDLE_LIE', '30'))
 # 电机过热自动趴下（11-18，用户：「有关节到 68 度就自动趴下」）：16 个电机（12 个腿关节 + 4 个轮子）任何一个
 # ≥ 这个温度，站着就趴下（先取消任务、上锁、等停稳，和手动趴下同一流程），不管是不是「保持站立」、有没有任务；
-# 还在这个温度以上时不让站起。温度每 BAT_PERIOD 秒读一次，超过 MOTOR_STALE 没读到就不判断。0 = 关掉
+# 还在这个温度以上时不让站起。温度直接来自域0反馈，超过 MOTOR_STALE 没读到就不判断。0 = 关掉
 MOTOR_HOT_LIE = float(os.environ.get('GO2W_MOTOR_HOT_LIE', '68'))
 MOTOR_HOT_RETRY = 5.0  # s：趴下失败（运控没响应等）隔这么久再试
 MOTOR_NAMES = [f'{leg}{j}' for leg in ('右前', '左前', '右后', '左后') for j in ('髋', '大腿', '小腿')] + \
@@ -617,16 +602,12 @@ class Bridge(TaughtMeasurements, Node):
         self.inspect = {}        # topic → {'sub', 'text', 't', 'ver', 'rate'}；只在有网页查看时订阅
         self.ros_ops = deque()   # 要在 rclpy 线程里做的事（建 / 删订阅），由定时器执行
         self.create_timer(0.1, self.run_ros_ops)
-        # 电量：/go2w/robot_lowstate（unitree_go/LowState，约 230 Hz、每帧 1.2 KB）里的 bms_state.soc。
-        # 一直订阅太费 CPU（planar_odom 订同类消息吃 50%+），所以每 BAT_PERIOD 秒临时订一次，收到一帧就退订，
-        # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
-        self.battery, self.battery_t, self.bat_sub = None, 0.0, None
-        self.motor_temp, self.motor_temp_t = None, 0.0   # 16 个电机温度 ℃（顺序见 MOTOR_TEMP_OFFSET）
+        # 电量、温度和实测关节直接来自域0 /lowstate，不依赖planar_odom转发。
+        self.battery, self.battery_t = None, 0.0
+        self.motor_temp, self.motor_temp_t = None, 0.0   # FR/FL/RR/RL × 髋/大腿/小腿，后4个是轮子
         self.motor_info = None   # 同一帧的错误标志 / 力矩，和 motor_temp 一起更新、一起过期
-        self.motor_fast = False  # 有网页在看力矩：读得勤一点（WebApp 维护）
-        self.bat_poll_t = 0.0
-        self.create_timer(MOTOR_FAST_PERIOD, self.poll_tick)
-        self.poll_battery()
+        self.motor_fast = False  # 保留旧页面标志；现在统一raw限频采样5Hz
+        self.robot_feedback = RobotFeedback()
 
         self.map_blob, self.map_ver = None, 0
         self.map_file = None     # 网页上显示的是 data/maps 里直接读的哪张图（导航没开时）；None = 来自 /map
@@ -1095,44 +1076,12 @@ class Bridge(TaughtMeasurements, Node):
         self.rates['/odom_healthy'].tick()
         self.healthy, self.healthy_t = m.data, time.monotonic()
 
-    def poll_tick(self):
-        # 上一个临时订阅还在等第一帧（DDS 发现可能要几百 ms）就别重建，等满 BAT_PERIOD 还没收到才重订
-        due = time.monotonic() - self.bat_poll_t >= BAT_PERIOD - 0.01
-        if due or (self.motor_fast and self.bat_sub is None):
-            self.poll_battery()
-
-    def poll_battery(self):
-        self.bat_poll_t = time.monotonic()
-        if self.bat_sub is not None:
-            self.destroy_subscription(self.bat_sub)   # 上一轮没收到（话题不在），这轮重订
-            self.bat_sub = None
-        try:
-            self.bat_sub = self.create_subscription(get_message('unitree_go/msg/LowState'), BAT_TOPIC,
-                                                    self.on_lowstate_raw, qos_profile_sensor_data, raw=True)
-        except Exception as e:
-            self.get_logger().warn(f'订阅 {BAT_TOPIC} 失败，网页不显示电量和电机温度：{e}', once=True)
-
     def on_lowstate_raw(self, data):
-        if len(data) > BAT_SOC_OFFSET and data[1] == 1:   # 只认小端 CDR（00 01 ..）
-            soc = data[BAT_SOC_OFFSET]
-            if 0 < soc <= 100:   # 0 = BMS 还没报
-                self.battery, self.battery_t = soc, time.monotonic()
-            end = MOTOR_TEMP_OFFSET + MOTOR_STRIDE * (MOTOR_N - 1)
-            if len(data) > end:
-                t = [((data[MOTOR_TEMP_OFFSET + MOTOR_STRIDE*i] + 128) & 0xFF) - 128 for i in range(MOTOR_N)]   # int8
-                if any(t) and all(-30 <= v <= 150 for v in t):   # 全 0 = 电机还没上报
-                    self.motor_temp, self.motor_temp_t = t, time.monotonic()
-                    self.motor_info = self._parse_motor_info(data, self.motor_temp_t)
-        if self.bat_sub is not None:
-            self.destroy_subscription(self.bat_sub)
-            self.bat_sub = None
-
-    def _parse_motor_info(self, data, now):
-        if len(data) < MOTOR_ERR_OFFSET + 4 + MOTOR_STRIDE * (MOTOR_N - 1):
-            return None
-        tau = [struct.unpack_from('<f', data, MOTOR_TAU_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]
-        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)],
-                'tau': [round(v, 2) if math.isfinite(v) else None for v in tau]}
+        if self.robot_feedback.update(data):
+            health = self.robot_feedback.view()
+            self.battery, self.battery_t = health['battery'], self.robot_feedback.received
+            self.motor_temp, self.motor_temp_t = health['motorTemp'], self.robot_feedback.received
+            self.motor_info = health['motorInfo']
 
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
@@ -1412,9 +1361,7 @@ class Bridge(TaughtMeasurements, Node):
             'fixed': self.fixed,
             'odomOk': bool(self.healthy) and now - self.healthy_t < STALE,
             'armed': self.is_armed() if 'go2w_cmd_bridge' in names else None,
-            'battery': self.battery if now - self.battery_t < BAT_STALE else None,
-            'motorTemp': self.motor_temp if now - self.motor_temp_t < MOTOR_STALE else None,
-            'motorInfo': self.motor_info if now - self.motor_temp_t < MOTOR_STALE else None,
+            **self.robot_feedback.view(),
             'navReady': self.nav.server_is_ready(),
             'nodes': nodes, 'profiles': profiles, 'topics': topics,
             'hasMap': self.map_blob is not None,
@@ -1623,12 +1570,14 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.autoloc_moves = 0     # 这一轮已经「移动后重试」了几次
         self.pose_set_t = 0.0   # 最近一次（手动或自动）设置初始位姿的时间；启动后自动定位前用户已经手动给了就不再覆盖
         # 运控：站起 / 趴下（robot_ctrl.py）
-        self.ctrl = None
-        if CTRL_ON:
-            try:
-                self.ctrl = R.CtrlLink(node, node.event, fake=self.simulated)
-            except Exception as e:
-                node.event('ERROR', f'无法连接运控状态（域 0）：{e!r}；站起 / 趴下不可用')
+        self.ctrl = self.robot_link = None
+        try:
+            self.robot_link = R.CtrlLink(node, node.event, fake=self.simulated,
+                                         on_lowstate=node.on_lowstate_raw, control=CTRL_ON)
+            self.ctrl = self.robot_link if CTRL_ON else None
+        except Exception as e:
+            node.event('ERROR', f'无法连接机器人状态（域 0）：{e!r}；电量和实际姿态不可用')
+        self.refresh_stand_targets()
         # 播报（audio.py）：本体喇叭，挂在运控那个域 0 节点上
         self.audio = AU.Audio(node.event, DATA, self.ctrl.ros if self.ctrl else None, self.push_audio, self.label_error,
                               os.environ.get('GO2W_AUDIO_LOCAL_EDIT', '1' if self.simulated else '0') == '1',
@@ -1998,6 +1947,58 @@ class Server(TaughtWeb, RT.RtabWeb):
     def ctrl_get(self):
         return self.ctrl.get(CTRL_STALE) if self.ctrl else (None, False, -1)
 
+    def refresh_stand_targets(self):
+        if self.simulated:
+            if self.node.robot_feedback.stand is None:
+                self.node.robot_feedback.set_targets([0.,.8,-1.5]*4, [0.,1.36,-2.65]*4)
+            return
+        self.node.robot_feedback.load_running_config(self.procs.groups)
+
+    def feedback_blocker(self):
+        feedback = self.node.robot_feedback.view()['robotFeedback']
+        state, ready, seq = self.ctrl_get()
+        token = (state, seq, self.node.robot_feedback.generation, getattr(self.ctrl, 'epoch', 0))
+        candidate = getattr(self, 'stand_candidate', None)
+        if candidate is None or candidate[0] != token:
+            self.stand_candidate = (token, time.monotonic())
+        if getattr(self, 'stand_verified', None) != token:
+            self.stand_verified = None
+        if not feedback['fresh']:
+            self.stand_verified = None
+            return '收不到新鲜的机器人反馈（/lowstate），无法确认实际姿态'
+        if not feedback['configured']:
+            self.stand_verified = None
+            return '无法读取当前运控的站姿配置，不能确认实际站起'
+        if not feedback['valid'] or feedback['posture'] == 'lying':
+            self.stand_verified = None
+            return '实测关节或机身姿态未确认站起，请检查电量和电机状态'
+        if ready and self.node.robot_feedback.confirmed(self.stand_candidate[1]):
+            self.stand_verified = token
+            return None
+        if state == 'Velocity' and ready and getattr(self, 'stand_verified', None) == token:
+            return None  # A verified walking policy need not stay at the static FixStand target.
+        return '实测关节尚未到达站姿，不能确认机器狗已站起'
+
+    def record_stand_confirmation(self, after):
+        state, ready, seq = self.ctrl_get()
+        if state == 'Velocity' and ready and self.node.robot_feedback.confirmed(after):
+            token = (state, seq, self.node.robot_feedback.generation, getattr(self.ctrl, 'epoch', 0))
+            self.stand_candidate = (token, after)
+            self.stand_verified = token
+
+    async def wait_standing(self, after, valid=None, expected=None):
+        deadline = time.monotonic() + CTRL_WAIT
+        while time.monotonic() < deadline:
+            if self.ctrl_abort or self.estop or (valid is not None and not valid()):
+                return '操作已取消，未继续启动策略'
+            state, ready, _ = self.ctrl_get()
+            if state not in ('FixStand', 'Velocity') or (expected is not None and state != expected):
+                return f'运控状态变成了 {state}，未确认站起'
+            if ready and self.node.robot_feedback.confirmed(after):
+                return None
+            await asyncio.sleep(.05)
+        return self.feedback_blocker() or '实测站姿尚未连续稳定，请检查电量和电机反馈'
+
     def ctrl_blocker(self):
         """导航能不能让机器狗动：要在策略（Velocity）里。没接运控（GO2W_CTRL=0）时不拦。"""
         if self.ctrl is None:
@@ -2006,8 +2007,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         if s is None:
             return '收不到运控状态（/go2w_ctrl/state），请检查运行容器的 control 组和域 0 通信'
         if s != 'Velocity' or not ready:
+            self.stand_verified = None
             return f'机器狗没有站起来（运控状态 {s}）'
-        return None
+        return self.feedback_blocker()
 
     def moving(self):
         n = self.node
@@ -2025,6 +2027,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return '发起页面已断开、准备已取消或控制权变化，已停止后续站立动作'
             if self.ctrl_abort and api != R.API_STANDDOWN:
                 return '被「趴下」打断'
+            if self.estop and api != R.API_STANDDOWN:
+                return '急停中，未继续发送站起或策略请求'
             s, ready, _ = self.ctrl_get()
             if s is None:
                 return '收不到运控状态'
@@ -2054,6 +2058,20 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '正在站起 / 趴下，请稍等'
         if self.estop:
             return False, '急停中：先解除急停'
+        await asyncio.to_thread(self.refresh_stand_targets)
+        if valid is not None and not valid():
+            return False, '准备已取消，未发送站起请求'
+        if self.ctrl_op:
+            return False, '正在站起 / 趴下，请稍等'
+        if self.estop:
+            return False, '急停中，未发送站起请求'
+        health = self.node.robot_feedback.view()
+        if not health['robotFeedback']['fresh']:
+            return False, '收不到新鲜的机器人反馈，未发送站起请求'
+        if not health['robotFeedback']['configured']:
+            return False, '无法读取当前运控站姿配置，未发送站起请求'
+        if health['battery'] == 0:
+            return False, '电量为 0%，未发送站起请求'
         s, ready, _ = self.ctrl_get()
         if s is None:
             return False, '收不到运控状态（/go2w_ctrl/state），请检查运行容器的 control 组和域 0 通信'
@@ -2062,10 +2080,15 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, f'{MOTOR_NAMES[hot[1]]} {hot[0]} ℃，电机过热（≥{MOTOR_HOT_LIE:.0f} ℃），降温后再站起'
         self.auto_lie, self.stand_hold, self.idle_since = True, False, None   # 网页站起来的：空闲了自动趴下
         if s == 'Velocity' and ready:
-            return True, '已经站好（策略运行中）'
+            after = time.monotonic()
+            err = await self.wait_standing(after, valid, expected='Velocity')
+            if not err:
+                self.record_stand_confirmation(after)
+            return self.ctrl_done(not err, err or '实测站姿已确认（策略运行中）')
         if s not in R.STATES:
             return False, f'运控状态 {s}，不能站起'
         self.ctrl_op, self.ctrl_abort, lying = 'up', False, s == 'Passive'
+        started = time.monotonic()
         try:
             n = self.node
             if lying:
@@ -2073,9 +2096,13 @@ class Server(TaughtWeb, RT.RtabWeb):
                 err = await self.ctrl_switch(R.API_STANDUP, ('Passive',), 'FixStand', CTRL_INTERP + CTRL_WAIT, valid=valid)
                 if err:
                     return self.ctrl_done(False, f'站起失败：{err}')
+            err = await self.wait_standing(started, valid)
+            if err:
+                return self.ctrl_done(False, f'站起未确认：{err}；请检查电量和电机状态')
             if self.estop:
                 return self.ctrl_done(False, '急停中：停在站立姿态，没有启动策略')
             s, ready, _ = self.ctrl_get()
+            policy_started = time.monotonic()
             if s != 'Velocity':
                 n.event('INFO', '启动策略：FixStand → Velocity')
                 # FixStand 没站稳时运控也接受 1002，会在半站的姿态下切进策略：ctrl_switch 等 ready 才发
@@ -2083,6 +2110,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                                              CTRL_WAIT + (0 if ready else CTRL_INTERP), valid=valid)
                 if err:
                     return self.ctrl_done(False, f'启动策略失败：{err}')
+            err = await self.wait_standing(policy_started, valid, expected='Velocity')
+            if err:
+                return self.ctrl_done(False, f'策略启动后站姿未确认：{err}')
+            self.record_stand_confirmation(policy_started)
             if lying:
                 self.stood_seq += 1
                 self.autoloc_reset()   # 雷达高度变了，趴着时的结果不算
@@ -2494,10 +2525,18 @@ class Server(TaughtWeb, RT.RtabWeb):
         if self.ctrl is None:
             return {'on': CTRL_ON, 'state': None, 'ready': False, 'age': None}
         s, ready, seq = self.ctrl_get()
+        feedback = self.node.robot_feedback.view()['robotFeedback']
+        physical_ready = self.feedback_blocker() is None if s in ('FixStand', 'Velocity') else False
+        if s in ('FixStand', 'Velocity'):
+            ready = ready and physical_ready and not self.ctrl_op
+        else:
+            self.stand_verified = None
         left = None if self.idle_since is None else max(0.0, IDLE_LIE - (time.monotonic() - self.idle_since))
         rx = self.ctrl.last_rx()
         dual = self.ctrl.get_dual(CTRL_STALE)
         return {'on': True, 'state': s, 'ready': ready, 'seq': seq, 'op': self.ctrl_op, 'msg': self.ctrl_msg,
+                'feedback': feedback,
+                'physicalReady':physical_ready,
                 'age': None if rx is None else round(time.monotonic() - rx, 1),   # 距最后一次收到运控状态多少秒；从没收到 = None
                 'stood': self.stood_seq, 'auto': self.auto_lie and IDLE_LIE > 0, 'hold': self.stand_hold,
                 'lieIn': None if left is None else round(left, 1), 'hotLie': MOTOR_HOT_LIE,
@@ -5921,6 +5960,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if self.procs_status is not None or k == 1:
                     n.get_logger().warn(f'查不到进程状态（{e!r}），运行档位只按节点判断')
                 self.procs_status = None
+            await asyncio.to_thread(self.refresh_stand_targets)
             try:
                 await self.rollback_tick()
             except Exception as e:
@@ -6227,6 +6267,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not self.clients:
                 n.events.clear()
                 continue
+            if k % 10 == 0:
+                # 基础状态独立于地图、TF、Nav2和整包导航状态的生成。
+                sys_stats = self.sys.read()
+                await self.send_all(json.dumps({'t':'system', 'sys':sys_stats, **n.robot_feedback.view()}), key='system')
             try:
                 await self.send_all(json.dumps(n.pose()), key='pose')
                 if k % 2 == 0 and n.scan_ver != scan_ver:  # scan 最多 10 Hz
@@ -6249,7 +6293,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                         items.append(n.events.popleft())
                     await self.send_all(json.dumps({'t': 'logs', 'items': items}))
                 if k % 10 == 0:  # 状态 2 Hz
-                    st = n.state(self.sys.read(), self.procs_status, self.transitions)
+                    st = n.state(sys_stats, self.procs_status, self.transitions)
                     # mapCurrent = 网页上显示的地图（导航没开时是文件地图）；mapLive = 它来自 map_server，可以定位 / 规划
                     st.update(mapCurrent=self.shown_map(), mapLive=n.map_file is None and n.map_current is not None)
                     st.update(estop=self.estop, busy=self.busy, mapBusy=self.map_busy, maps=self.maps, bags=self.bags, uploads=self.uploads, mapChoice=self.map_choice,
@@ -6344,8 +6388,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.to_thread(self.captures.close)
             await self.procs.close()
-            if self.ctrl is not None:
-                self.ctrl.close()
+            if self.robot_link is not None:
+                self.robot_link.close()
 
         async def close_clients(_a):
             # 停服时先主动关掉网页连接：aiohttp 优雅退出要等所有请求处理完（默认最多 60 s），

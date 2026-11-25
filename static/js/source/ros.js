@@ -28,8 +28,27 @@ export function createRosSource(store, bus){
   const t0 = performance.now(), now = () => (performance.now() - t0) / 1000;
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   let ws = null, lastMsg = 0, mapGrid = null, rateWarned = -Infinity, seq = 0, pingPausedUntil = 0, lastTask = null;
+  let healthRx = 0, ctrlRx = 0;
+  function clearHealth(){
+    store.sys = { cpu:null, mem:null, memTotal:null };
+    store.battery = store.motorTemp = store.motorInfo = null;
+    store.robotFeedback = { fresh:false, posture:'unknown' };
+    if (store.ctrl){ store.ctrl.ready = false; store.ctrl.feedback = store.robotFeedback; }
+  }
+  function readHealth(m){
+    healthRx = performance.now();
+    store.sys = m.sys || { cpu:null, mem:null, memTotal:null };
+    store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.motorInfo = m.motorInfo ?? null;
+    store.robotFeedback = m.robotFeedback || { fresh:false, posture:'unknown' };
+    if (store.ctrl){
+      store.ctrl.feedback = store.robotFeedback;
+      if (['FixStand','Velocity'].includes(store.ctrl.state) &&
+          (!store.robotFeedback.fresh || store.robotFeedback.valid === false || store.robotFeedback.posture === 'lying' ||
+           (store.robotFeedback.posture !== 'standing' && !store.ctrl.physicalReady))) store.ctrl.ready = false;
+    }
+  }
   let camWanted = false;                            // 摄像头标签页开着：断线重连后要重新申请
-  let motorFast = false;                            // 电机表开着「力矩」视图：后端每 0.5 s 读一次 lowstate，重连后要重新申请
+  let motorFast = false;                            // 兼容旧后端的「力矩」快采样请求；新版统一raw限频采样
   let layers = [], gcost = null, rawPlan = null;   // rawPlan：后端最近一次的 /plan（任务结束后不再显示）
   let teleCmd = null, teleTimer = null;             // 键盘遥控：按住时每 0.1 s 发一次，后端 0.3 s 收不到就停
   const watchers = new Map();                       // topic 查看器：topic → Set(回调)
@@ -57,6 +76,8 @@ export function createRosSource(store, bus){
       if (store.link.ok) log('WARN', 'go2w_web', 'connection lost, retrying');
       store.link = { ok: false, ms: null };
       store.robot.valid = false; store.odomOk = false; store.armed = null;
+      clearHealth(); healthRx = ctrlRx = 0;
+      if (store.ctrl){ store.ctrl.state = null; store.ctrl.op = null; }
       // 断线后清掉浏览器保存的遥控速度，重连必须重新操作；不能让旧的续发器在新连接上继续发速度。
       teleCmd = null; if (teleTimer){ clearInterval(teleTimer); teleTimer = null; }
       for (const [, res] of pending) res({ ok: false, uncertain: true, msg: '和后端的连接断开了' });
@@ -123,6 +144,7 @@ export function createRosSource(store, bus){
         if (!last || Math.hypot(last[0]-R.x, last[1]-R.y) > .08){ tr.push([R.x, R.y]); if (tr.length > 900) tr.shift(); }
         break;
       }
+      case 'system': readHealth(m); break;
       case 'state': {
         store.mapBusy = !!m.mapBusy;
         if (store.mapCurrent && m.mapCurrent && store.mapCurrent !== m.mapCurrent){
@@ -130,7 +152,8 @@ export function createRosSource(store, bus){
           store.routeDraft = { id: null, map: null, points: [], confirmed: false };
           store.routeCheck = null;
         }
-        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.motorInfo = m.motorInfo ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
+        store.odomOk = m.odomOk; store.armed = m.armed; store.nodes = m.nodes; store.estop = !!m.estop;
+        readHealth(m);
         Object.assign(store.params, m.params || {});
         for (const [k, st] of Object.entries(m.profiles)){   // stop / starting / run / stopping
           if (st === 'run' && store.profiles[k] !== 'run') store.since[k] = now();
@@ -161,6 +184,11 @@ export function createRosSource(store, bus){
         store.taughtNav = m.taughtNav || null;   // 「启用示教导航」开关：{ on, forced: '0'/'1'/null, installed }
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
+        ctrlRx = performance.now();
+        if (['FixStand','Velocity'].includes(store.ctrl.state))
+          store.ctrl.ready = !!store.ctrl.ready && !store.ctrl.op && store.robotFeedback.fresh &&
+            store.robotFeedback.valid !== false && store.robotFeedback.posture !== 'lying' &&
+            (store.robotFeedback.posture === 'standing' || !!store.ctrl.physicalReady);
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
         break;
       }
@@ -347,6 +375,11 @@ export function createRosSource(store, bus){
       if (!ids.includes('particles')) store.particles = new Float32Array(0); },
     get paused(){ return false; },
     tick(){
+      if (healthRx && performance.now()-healthRx > 2500){ clearHealth(); healthRx = 0; }
+      if (ctrlRx && performance.now()-ctrlRx > 2500){
+        if (store.ctrl){ store.ctrl.state = null; store.ctrl.ready = false; store.ctrl.op = null; }
+        ctrlRx = 0;
+      }
       if (store.link.ok && performance.now() - lastMsg > 2000){ store.link.ms = null; }
       const R = store.robot, T = store.task;
       // 导航栈停了之后不再有新数据：清掉最后一帧，别让旧的 scan、点云、代价地图留在画面上
