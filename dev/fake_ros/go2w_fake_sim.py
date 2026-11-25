@@ -58,6 +58,7 @@ MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
 THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
+GOAL_XY = float(os.environ.get('GO2W_FAKE_GOAL_XY', '0.25'))   # nav2.yaml goal checker xy_goal_tolerance
 
 
 def load_map(yaml_path):
@@ -829,6 +830,12 @@ class Sim:
             self.node.deliver('/plan', self.path_msg())
             self.rosout(20, 'controller_server', 'Received a goal, begin computing control effort.')
             g['mark'] = (now, self.x, self.y)
+            # 11-25 真机：控制器的 goal checker 只看整条路径的终点（xy 0.25 m）。多点目标的终点就在狗旁边时
+            # （环线回到起点），一开始就满足 → 同一拍 "Reached the goal!"，中间站一个都没走（bag go2w-01_1125_114120）
+            if g['through'] and math.hypot(g['x'] - self.x, g['y'] - self.y) <= GOAL_XY:
+                self.rosout(20, 'controller_server', 'Reached the goal!')
+                self.finish(SUCCEEDED)
+                return 0.0, 0.0
         if g['through']:
             while len(g['via']) > 1 and math.hypot(g['via'][0][0] - self.x, g['via'][0][1] - self.y) <= THROUGH_RADIUS:
                 g['via'].pop(0)

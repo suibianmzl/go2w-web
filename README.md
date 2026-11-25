@@ -214,6 +214,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - **站点停留**：每站可以填停留秒数（1–3600，`points[].dwell`，0 不存）。到站停稳、转到站点朝向后原地等够再走，任务卡片「停留中 · 还剩 N s」（`task.phase = dwell`、`dwellLeft`）。停留中取消，断点记在这一站，继续时回来重新停够。地图上停留站画成**橙色**并标「停 N s」，直接经过的站黄色，终点绿色。
 - 一站一站走时：拐角 ≤ 60°（`ROUTE_PASS_TURN`，原来 29°）的站不停车，提前切到下一站；配合导航参数 `angular_dist_threshold` 0.9（导航镜像 PR，没发版前狗上 `sudo bash ~/nav_tune/shim_turn.sh 0.9`），否则 RotationShim 还是会原地转。
 - **假到达**：Nav2 报到达，但狗离站点超过 0.5 m（`ROUTE_FAKE_ARRIVE`），或连续通过时中间还有站没经过 → 不算，从第一个没经过的站重新出发；连续 3 次判失败。起因：提前换站后 Nav2 有时 0.7 s 就报下一站到达，狗其实还差 ~0.9 m（11 站小圈 6 趟里 4 趟第 10 站被跳过）。
+- **终点就在出发位置**（v1.1.13）：控制器的 goal checker 只看路径终点，一段的终点离狗 ≤ 0.6 m（`ROUTE_THROUGH_NEAR_END`，环线回到起点）时 Nav2 会当场报到达、中间站一个没走。现在先只跑到它前一站，终点那站下一段单独发。
 - 假机器人：`dev/fake_ros` 支持 NavigateThroughPoses（经过半径 `GO2W_FAKE_THROUGH_RADIUS`）；`/tmp/go2w_fake_early_ok`（内容 = 次数）让接下来的导航目标 0.3 s 就报成功，测假到达。
 
 测试：`dev/test_route_through.mjs`、`dev/test_route_dwell.mjs`；`dev/test_routes.mjs` 测一站一站走（任务带 `through: false`）。

@@ -97,7 +97,8 @@ try {
   assert.ok(Math.hypot(c.pose.x - D.x, c.pose.y - D.y) < .3, '停在 D');
   console.log('PASS 连续通过：一次多点目标，中间站不停车经过，只在终点到达，进度按站更新');
 
-  // 2 C 设停留：分两段 A→C（停留）、C→D
+  // 2 C 设停留：A→C（停留）、C→D 两段。狗从 C 出发，A→C 这段的终点 C 就在脚下（Nav2 会当场判到达），
+  // 所以第一段先只跑 A→B，C 单独一段（11-25 修复），实际是 1–2 / 3（停留）/ 4
   const r2 = await save('分段停留', [four[0], four[1], { ...four[2], dwell:2 }, D]);
   await run(r2);
   await until(() => c.task?.name === r2.name && c.task.phase === 'dwell', 'C 停留', 60000);
@@ -106,8 +107,9 @@ try {
   await ended(r2.name);
   assert.equal(c.task.status, 'succeeded', c.task.message);
   const segs = c.logs.filter(m => /连续通过：/.test(m));
-  assert.deepEqual(segs.map(m => m.match(/第 ([\d–]+) 站/)[1]), ['1–3', '4'], `分段 ${segs}`);
-  assert.ok(/到了停留/.test(segs[0]));
+  assert.deepEqual(segs.map(m => m.match(/第 ([\d–]+) 站/)[1]), ['1–2', '3', '4'], `分段 ${segs}`);
+  assert.ok(/到了停留/.test(segs[1]));
+  assert.equal(c.logs.some(m => /报到达，但/.test(m)), false, '没有假到达');
   console.log('PASS 停留站把路线切成两段，停留站停稳停够再走下一段');
 
   // 3 中途取消：断点在下一站；继续 = 从这一站起新的一段
@@ -150,6 +152,20 @@ try {
   assert.ok(Math.hypot(c.pose.x - D.x, c.pose.y - D.y) < .3, '最后真的到了 D');
   console.log('PASS 连续通过：Nav2 整段假到达（中间站没经过）不算数，重新出发，每站都经过');
 
+  // 4c 终点就在狗脚下（11-25 真机 bug：环线任务的终点 = 出发位置，控制器 goal checker 只看终点，0 s 就报到达，
+  // 重发两次后「第 1 点失败」）。狗站在 C 上跑 A→B→C：先跑到 B（第 1–2 站一段），C 单独再发
+  const r5 = await save('终点在脚下', [four[0], four[1], four[2]]);
+  await run(r5);
+  await ended(r5.name);
+  assert.equal(c.task.status, 'succeeded', c.task.message);
+  assert.equal(c.logs.some(m => /报到达，但/.test(m)), false, `不该再有假到达：${c.logs.filter(m => /报到达/.test(m))}`);
+  assert.ok(c.logs.some(m => /终点.*离狗只有 [\d.]+ m.*先跑到第 2 站/.test(m)), `说明为什么拆段：${c.logs.filter(m => /终点/.test(m))}`);
+  const segs5 = c.logs.filter(m => /连续通过：/.test(m)).map(m => m.match(/第 ([\d–]+) 站/)[1]);
+  assert.deepEqual(segs5, ['1–2', '3'], `分段 ${segs5}`);
+  assert.ok(c.logs.some(m => /经过第 1 站/.test(m)), '经过第 1 站');
+  assert.ok(Math.hypot(c.pose.x - four[2].x, c.pose.y - four[2].y) < .3, '最后回到 C');
+  console.log('PASS 终点就在出发位置：先跑到倒数第二站，终点单独发，不再 0 s 假到达');
+
   // 5 关掉连续通过：一站一站走（没有「连续通过」日志，每站都有 Nav2 目标）
   const r4 = await save('一站一站', four, { loop:false, loops:1, vmax:.45, wmax:1.2, through:false });
   await run(r4);
@@ -158,6 +174,6 @@ try {
   assert.equal(c.task.through, false);
   assert.equal(c.logs.some(m => /连续通过：/.test(m)), false);
   console.log('PASS 关掉连续通过 = 原来的一站一站走');
-  for (const x of [r1, r2, r3, r4]) await c.cmd('route_delete', { route_id:x.id });
+  for (const x of [r1, r2, r3, r4, r5]) await c.cmd('route_delete', { route_id:x.id });
   console.log('ALL PASS');
 } finally { rmSync('/tmp/go2w_fake_early_ok', { force:true }); c.close(); }

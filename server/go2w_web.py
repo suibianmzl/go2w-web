@@ -251,7 +251,9 @@ ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
 # 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
 # 网页离下一站不到 ROUTE_THROUGH_PASS 就算经过（和行为树里的半径一样）；Nav2 先划掉了也算
 ROUTE_THROUGH_PASS = 0.5
-ROUTE_SEG_MAX = 30       # 一段最多几站（一直循环、没有停留站时也要分段）
+# 11-25：一段的终点离狗不到这么远（goal checker xy 0.25 + 定位余量）就不能当这段的终点发，见 run_through
+ROUTE_THROUGH_NEAR_END = 0.6
+ROUTE_SEG_MAX = 30      # 一段最多几站（一直循环、没有停留站时也要分段）
 THROUGH_BT = os.environ.get('GO2W_THROUGH_BT') or os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'bt', 'navigate_through_go2w.xml')
 ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
@@ -3419,6 +3421,18 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX:
                     break
                 s = nxt
+            # 这段的终点就在狗旁边（环线回到出发位置）：控制器的 goal checker 只看路径终点，一开始就满足，
+            # 同一拍报到达、中间站一个没走（11-25 bag go2w-01_1125_114120）。终点先拿掉，这段跑到它前一站，
+            # 拿掉的站下一段再单独发（那时狗已经走远了）
+            here = n.lookup(BASE_FRAME) if n.fixed == 'map' else None
+            if here and len(seg) > 1:
+                cut = seg[-1]
+                while len(seg) > 1 and math.hypot(here[0] - seg[-1][1]['x'], here[1] - seg[-1][1]['y']) <= ROUTE_THROUGH_NEAR_END:
+                    seg.pop()
+                if seg[-1] is not cut:
+                    d = math.hypot(here[0] - cut[1]['x'], here[1] - cut[1]['y'])
+                    n.event('INFO', f'这段的终点第 {cut[0][0] + 1} 站离狗只有 {d:.2f} m（Nav2 会当场判到达），'
+                                    f'先跑到第 {seg[-1][0][0] + 1} 站，后面的站再单独发')
             poses = []
             for k, (_, pt, dwell, nxt) in enumerate(seg):
                 last = k == len(seg) - 1
