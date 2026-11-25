@@ -622,6 +622,12 @@ export function createMockSource(store, bus){
   let a10 = 0, a5 = 0, a1 = 0, aLog = 0;
   return {
     name: 'mock', cmd, inspect,
+    async cpuStats(){
+      const cpu = Math.max(0, store.sys.cpu ?? 8);
+      return { ok:true, mock:true, cpu, sampledAt:Date.now()/1000, scope:'visible_processes',
+        items:['controller_server', 'fast_lio', 'go2w_ctrl', 'amcl', 'go2w_web.py'].map((name, i) =>
+          ({ name, pid:1000+i, cpu:Math.round(cpu*[.35,.24,.16,.1,.05][i]*10)/10 })) };
+    },
     can: () => true,
     now: () => S.t,
     steps: [['plan', '规划路径', 'Theta*'], ['align', '原地对准', 'RotationShim'], ['follow', '跟随路径', 'MPPI'], ['final', '终点朝向对准', 'goal yaw'], ['arrive', '到达', '停留 1 s']],

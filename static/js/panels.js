@@ -1,5 +1,6 @@
 import { setupRouteEditor } from './routes.js';
 import { setupBagVoice } from './bag-voice.js';
+import { setupCpuDetails } from './cpu-details.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
 import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount, mapTitle, mapOptText } from './util.js';
 import { LAYERS, L } from './layers.js';
@@ -9,6 +10,7 @@ import { MODES, MODE_PKG } from './actions.js';
 const setHTML = (sel, html) => { const el = $(sel); if (el._html !== html){ el._html = html; el.innerHTML = html; } };
 
 export function createPanels(store, src, actions, mapView, bus, setTool){
+  setupCpuDetails(src);
   const ros = src.name === 'ros';
   const run = id => store.profiles[id] === 'run';
   const now = () => src.now();

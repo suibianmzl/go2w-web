@@ -54,6 +54,17 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.sleep(.1)
                     else:
                         self.fail('后端启动超时')
+                    # CPU route wiring and real Linux /proc sampling, with no robot commands.
+                    async with session.get(url+'/api/system/cpu') as response:
+                        self.assertEqual(response.status,200)
+                        cpu=await response.json()
+                        self.assertTrue(cpu['ok'])
+                        self.assertEqual(cpu['scope'],'visible_processes')
+                        self.assertTrue(0 <= cpu['cpu'] <= 100)
+                        self.assertTrue(0 < len(cpu['items']) <= 5)
+                        self.assertEqual([row['cpu'] for row in cpu['items']],
+                                         sorted((row['cpu'] for row in cpu['items']),reverse=True))
+                        self.assertTrue(all(row['pid'] > 0 and row['name'] for row in cpu['items']))
                     for value in ('true', 'false'):
                         async with session.post(url+'/api/obstacles-critic/'+value) as response:
                             self.assertEqual(response.status, 200)

@@ -315,6 +315,15 @@ export function createRosSource(store, bus){
   connect();
   return {
     name: 'ros', cmd, now,
+    async cpuStats(signal){
+      const response = await fetch('/api/system/cpu', { cache:'no-store', signal });
+      if (response.status === 404) throw new Error('当前后端尚不支持 CPU 明细，请更新后端');
+      let data;
+      try { data = await response.json(); }
+      catch { throw new Error(`无法读取 CPU 统计（HTTP ${response.status}），请检查后端服务`); }
+      if (!response.ok || !data.ok) throw new Error(data.message || `读取失败（HTTP ${response.status}）`);
+      return data;
+    },
     can: op => OPS.has(op),
     // 任务卡片的步骤（真机上从 Nav2 行为树日志看得到的阶段）
     steps: [['plan', '规划路径', 'Theta*'], ['follow', '跟随路径', 'RotationShim · MPPI'], ['recover', '恢复行为', '需要时'], ['arrive', '到达', 'goal checker']],

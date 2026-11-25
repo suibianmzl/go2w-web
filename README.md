@@ -6,6 +6,7 @@
 server/go2w_web.py   后端：rclpy 节点（域 43）+ aiohttp，HTTP 和 WebSocket 同一端口
 server/procs.py      运行档位的进程管理（经运行容器 supervisor 的 socket 启停进程组）
 server/camera.py     前置摄像头 RTP 组播接收、拼帧
+server/cpu_stats.py  按需采集当前运行环境中占 CPU 最高的 5 个进程
 server/mapmeta.py    地图续建：<name>.meta.json 读写、血缘、续建前置检查
 server/mapcontinue.py 地图续建：起点位姿三级降级、图外检查、自检时的「还在起点吗」
 server/teaching.py   每图唯一示教的文件仓储、持久采集与断点恢复
@@ -29,6 +30,16 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - 存图、对齐地图由后端直接起子进程，脚本在 `/opt/go2w/console/tools/`（`save_map.sh`、`align_map.py`）。
 - 调整 Nav2 障碍物 critic：`POST /api/obstacles-critic/true` 会执行 `ros2 param set /controller_server FollowPath.ObstaclesCritic.enabled true`；`POST /api/obstacles-critic/false` 会将参数设为 `false`。成功返回 JSON（包括实际参数值）；执行失败、超时或 ROS 2 命令不可用时返回对应 HTTP 错误。两个接口要求部署进程的 PATH 可找到 `ros2`，并且当前 ROS 2 环境可访问 `/controller_server`。
 - 数据目录是容器里的 `/go2w/data`（扩展坞上 `/opt/go2w/data`），可以用 `GO2W_DATA` 改。地图、路线、录包都在那里，不进这个仓库。导航日志在 `data/logs/navigation.log`，遥控速度桥在 `data/logs/bridge.log`。
+
+## CPU 明细（v1.5.0）
+
+点击顶部 **CPU** 框，弹窗按占用率从高到低显示最多 5 个模块/进程的名称、PID 和 CPU 占用率。首次采样约需 0.5 秒，之后在上次请求完成 2 秒后自动刷新；关闭弹窗后停止请求。进程名优先使用 ROS 节点重命名，否则显示脚本名或可执行文件名，不返回完整命令行。没有可统计的进程、读取失败或超时会显示提示，失败时清除旧榜单，恢复后重新显示。`?mock` 页面明确标为模拟数据。
+
+占用率按整机所有 CPU 的总容量计算，同一进程的线程合计；例如 8 核机器上持续占满 1 核约为 12.5%。明细只覆盖网页后端所在 PID 命名空间可见的进程：正式运行容器中的导航、定位、运控、录包和网页进程可以统计，容器外进程不在列表中。同一进程中的 ROS 组件合并统计，前 5 项之和不代表整机总占用。排序使用未四舍五入的原始采样值，界面保留一位小数。
+
+只读接口 `GET /api/system/cpu` 返回 `{ok,cpu,items:[{pid,name,cpu}],sampledAt,window,scope:"visible_processes",skipped}`；读取不可用时返回 HTTP 503 和 `ok:false`。后端在工作线程读取 `/proc`，多个客户端共享采样和 1 秒缓存，不加入导航指令队列或高频状态推送。需要同时更新前端和后端，并重启网页后端；通过反向代理访问时，须将 `/api/system/cpu` 转发到同一网页后端。旧后端返回 404 时，弹窗会提示更新。
+
+本地验证（不连接机器狗）：`python -m unittest dev.test_cpu_stats -v` 检查多核口径、前 5 名、低占用排序、PID 重用/退出、缺失数据、HTTP 状态、并发缓存及取消。使用安装了 Playwright 的 Python 运行 `dev/test_cpu_details_browser.py`，验证点击、自动刷新、错误恢复、空数据/超时、关闭取消、快捷键隔离和保留 Space 急停、桌面及手机布局；`dev/test_route_force_crossing_integration.py` 另覆盖真实后端的 Linux CPU 采样和既有导航回归。
 
 ## 进度
 

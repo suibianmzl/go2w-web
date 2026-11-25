@@ -69,6 +69,7 @@ from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 from recording import RecordingAPI
+from cpu_stats import CpuStats
 from obstacles_critic import ObstaclesCriticAPI
 
 # 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
@@ -547,7 +548,7 @@ class SpeedCheck:
 
 
 class SysStats:
-    """宿主机 CPU / 内存（容器用 host 网络，/proc/stat 和 /proc/meminfo 反映的是整机）。"""
+    """整机 CPU / 内存总量；进程明细另按当前 PID 命名空间统计。"""
 
     def __init__(self):
         self.prev = None
@@ -1474,6 +1475,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         node.wants = self.wants   # 点云、粒子没人看就不算，省扩展坞的 CPU
         self.camera = C.Camera(pack, T_CAM, node.event)
         self.sys = SysStats()
+        self.cpu_details = CpuStats()
         rid, src = robot_id()
         node.get_logger().info(f'狗编号 {rid}（来自 {src}），录包名 = {rid}_MMDD_HHMMSS（异常自动保存）/ {rid}_trigger_MMDD_HHMMSS（手动录包、保存刚才 N 秒）')
         # P3：进程管理。本地调试（GO2W_FAKE_PROCS=1）换成假模拟器里的进程
@@ -6311,6 +6313,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         self.recording_api.routes(app)
+        self.cpu_details.routes(app)
         self.obstacles_critic.routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
