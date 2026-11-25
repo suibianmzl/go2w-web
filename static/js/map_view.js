@@ -340,7 +340,7 @@ export function createMapView(store, actions){
         store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
           : p.dwell > 0 ? DWELL_COL
           : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false,
-        p.dwell > 0 ? `停${p.dwell}s` : ''));
+        [p.dwell > 0 ? `停${p.dwell}s` : '', p.audio ? '♪' : ''].filter(Boolean).join(' ')));   // ♪ = 到站播报
     }
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();

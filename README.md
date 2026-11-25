@@ -219,6 +219,17 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 
 测试：`dev/test_route_through.mjs`、`dev/test_route_dwell.mjs`；`dev/test_routes.mjs` 测一站一站走（任务带 `through: false`）。
 
+## 播报、站点播报（v1.1.14–v1.1.15，11-25）
+
+用狗本体的喇叭放音频（`server/audio.py`）。扩展坞没有声卡，走域 0 的 `audiohub`「喊话」：进入 4001 → base64 WAV 分块 4003 → 退出 4002；音量走 `vui` 1003 / 1004。接口编号来自社区代码，没有官方文档。挂在 `CtrlLink` 的域 0 节点上，不发 Sport 请求。
+
+- **播报标签**（底部抽屉）：上传（浏览器里转成 16 kHz 单声道 16 bit WAV、统一峰值，最长 60 s）、播放、停止、音量 0–10、改名、删除。音频存 `data/audio/<id>.wav` + `index.json`，最多 100 段。新的播报打断旧的，播不出来只记日志，不影响导航。
+- 上传走 `POST /api/audio?name=`（要求头 `X-Go2w: 1`），其余是 `audio_play / audio_stop / audio_volume / audio_rename / audio_delete / audio_refresh` 指令，状态推 `{t:'audio'}`。
+- 来自 127.0.0.1（狗上的云端网关）的连接只能播放和停止；`GO2W_AUDIO_LOCAL_EDIT=1` 放开。
+- **站点播报**（v1.1.15）：站点 `points[].audio` = 音频 id，任务编辑里每站一个「播报」下拉框，地图上带 ♪。到站、不停车经过、出发时已在第 1 站附近、循环回到 1 号点都播；取消 / 失败 / 急停停掉任务自己播的那段（网页手动播的不动），正常跑完让最后一站播完。在用的音频不能删。`task.pointAudio` = 这站的音频名。用 `route_save` 改任务时要把 `audio` 带回来，不带就是清掉。
+
+测试（先 `dev/run.sh`）：`node dev/test_audio.mjs [http://…] [locked]`、`node dev/test_route_audio.mjs [ws://…]`。空闲 30 s 假狗会自动趴下，跑任务类测试前重启一次。
+
 ## 地图显示方向
 
 建图时地图的 x 轴取机器人开始建图那一刻的朝向，所以有的图是斜的、有的是竖的。这不影响定位和导航（Theta* 能走任意角度的直线），只是看着别扭。网页可以按地图单独保存一个**显示方向**：只转画面，不改地图坐标，所以路线、巡逻点、初始位姿都不用重做。

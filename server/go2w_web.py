@@ -1586,6 +1586,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.audio = AU.Audio(node.event, DATA, self.ctrl.ros if self.ctrl else None, self.push_audio, self.label_error,
                               os.environ.get('GO2W_AUDIO_LOCAL_EDIT', '1' if self.simulated else '0') == '1',
                               why='' if self.ctrl else '没连上域 0，喇叭不可用')
+        self.audio.used = self.audio_used
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
         self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
@@ -2490,6 +2491,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                     'name': label.strip(), 'note': note.strip(), 'manualHeading': manual}
             if round(dwell) > 0:
                 item['dwell'] = int(round(dwell))
+            clip = point.get('audio')       # 11-25：到这一站播哪段音频（audio.py 的 id），没有 = 不播
+            if clip not in (None, ''):
+                if isinstance(clip, str) and re.fullmatch('[0-9a-f]{12}', clip):
+                    item['audio'] = clip
+                elif strict:
+                    raise ValueError('站点播报音频无效')
             clean.append(item)
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
@@ -2532,6 +2539,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '找不到要更新的任务'
         route_id = route_id or uuid.uuid4().hex
         record = self.route_record(d, route_id)
+        for i, p in enumerate(record['points'], 1):
+            if p.get('audio') and p['audio'] not in self.audio.items:
+                return False, f'第 {i} 站选的播报音频已经不在了，重新选一段或改成不播报'
         self.write_routes({**self.routes, route_id: record})
         return True, f"已保存任务：{record['name']}", record
 
@@ -3035,6 +3045,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.incident('nav_fail', f"巡逻任务「{route['record']['name']}」{message}")   # 先记，任务信息还是执行中的
         route.update(status=status, message=message, ended=time.monotonic())
         route['stop'].set()
+        if status != 'succeeded':   # 取消 / 失败 / 急停：任务自己播的那段也停；正常跑完的让最后一站播完
+            self.background(self.audio.stop_tag(route, '任务停止'))
         try:
             self.resume_checkpoint(route, status, message)
         except Exception as e:   # 记断点出错不能影响停车
@@ -3391,6 +3403,33 @@ class Server(TaughtWeb, RT.RtabWeb):
         await asyncio.sleep(COSTMAP_REFILL)
         n.event('INFO', '出发前已清除代价地图里的旧障碍标记')
 
+    # ---------- 站点播报（11-25） ----------
+    def audio_used(self, clip):
+        return [f"任务「{r['name']}」第 {i} 站" for r in self.routes.values()
+                for i, p in enumerate(r['points'], 1) if p.get('audio') == clip]
+
+    def route_audio(self, route, i):
+        """到 / 经过第 i 站：这站选了音频就播。后台播，播不出来只记日志，不影响任务。
+        一口气补记好几站（Nav2 一次划掉几站）时只播最后一个配了音频的站。"""
+        if not route['record']['points'][i].get('audio'):
+            return
+        route['audio'] = i
+
+        async def go():
+            await asyncio.sleep(0)
+            if route['audio'] != i:
+                return
+            name = route['record']['points'][i].get('name') or f'第 {i + 1} 站'
+            try:
+                ok, msg = await self.audio.play(
+                    route['record']['points'][i]['audio'], f'任务 {name}', tag=route,
+                    valid=lambda: route['status'] in ('active', 'succeeded') and route['audio'] == i)
+            except Exception as e:
+                ok, msg = False, repr(e)
+            if not ok:
+                self.node.event('WARN', f'{name}播报没播：{msg}')
+        self.background(go())
+
     def through_passed(self, ws, route, seg, k):
         """连续通过：seg 里第 k 站经过了。记进度、写断点，下一站成为当前目标。"""
         n, points = self.node, route['record']['points']
@@ -3403,6 +3442,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         reason = self.route_blocker(ws, route['record'])
         if reason:
             raise RuntimeError(reason)
+        self.route_audio(route, i)
 
     async def run_through(self, ws, route, state):
         """连续通过（v1.1.11）：从 state 起一段一段跑。返回 None = 全部跑完；'stop' = 被取消（已处理）；
@@ -3550,6 +3590,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             while k < len(seg) - 1:   # Nav2 到了终点：中间没来得及记的站都算经过
                 self.through_passed(ws, route, seg, k)
                 k += 1
+            self.route_audio(route, last_state[0])
             if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
                 return 'stop'
             route['done'] += 1
@@ -3592,6 +3633,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             first = route['resume'] or (0, 1, False)
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
             if route['resume'] is None and near < ROUTE_NEAR_START:
+                self.route_audio(route, 0)
                 if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
                     route.update(index=0, target=points[0])
                     if not await self.route_dwell(ws, route, 0, points[0]['dwell']):
@@ -3713,6 +3755,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     if off is None or off > ROUTE_ARRIVE_TOL:
                         raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
                     n.event('WARN', f'第 {i + 1} 站未精确到达（偏差 {off:.2f} m），视为已到，继续下一站')
+                self.route_audio(route, i)
                 if dwell and not await self.route_dwell(ws, route, i, dwell):
                     return
                 route['done'] += 1
@@ -3764,6 +3807,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 # 停留中：还剩几秒（11-24）；不在停留就是 null
                 'dwellLeft': max(0.0, route['dwell_until'] - time.monotonic()) if route.get('dwell_until') else None,
                 'pointDwell': record['points'][i].get('dwell', 0),
+                'pointAudio': (self.audio.items.get(record['points'][i].get('audio')) or {}).get('name'),   # 这站的播报音频名，没有 = null
                 'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------

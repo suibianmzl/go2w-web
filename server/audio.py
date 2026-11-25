@@ -12,6 +12,7 @@
   上传：POST /api/audio?name=显示名，头 X-Go2w: 1，body 是 16 kHz 单声道 16 bit WAV（网页先转好）
   本机来的连接（127.0.0.1 = 云端网关，公网入口没有鉴权）只能播 / 停，不能改音频和音量；GO2W_AUDIO_LOCAL_EDIT=1 放开
 新的播报打断旧的。播报和导航、运控互不影响：播不出来只记日志。
+站点播报（v1.1.15）：任务站点的 audio = 音频 id，go2w_web.py 的 route_audio 到站时带 tag 调 play，任务取消 / 失败时 stop_tag。
 """
 import asyncio
 import base64
@@ -119,6 +120,8 @@ class Audio:
         self.index = os.path.join(self.dir, 'index.json')
         self.items, self.cur, self.last, self.vol = {}, None, None, None
         self.job, self.lock, self.task = None, asyncio.Lock(), None
+        self.tag, self.closed = None, False     # tag：正在播的这段是谁发起的（任务对象）；网页手动播 = None
+        self.used = lambda clip: []             # 哪些任务站点在用这段音频（go2w_web.py 填），在用的不能删
         self.avail, self.why, self.vol_tries = False, why, 0
         self.link = None
         if ros is not None:
@@ -184,10 +187,12 @@ class Audio:
             await self.notify()
 
     async def close(self):
+        self.closed = True
         if self.task is not None:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
-        await self.halt()
+        async with self.lock:
+            await self.halt()
 
     # ---------- 播放 ----------
     async def halt(self):
@@ -198,15 +203,21 @@ class Audio:
         await asyncio.gather(j, return_exceptions=True)
         return True
 
-    async def play(self, clip, who):
+    async def play(self, clip, who, tag=None, valid=None):
+        """valid：拿到锁之后再问一次还要不要播（任务可能刚好被取消了）。"""
         x = self.items.get(clip) if isinstance(clip, str) else None
         if x is None:
             return False, '没有这段音频'
         if not self.avail:
             return False, self.why
         async with self.lock:
+            if valid is not None and not valid():
+                return True, '任务已停，不播'
             if await self.halt():
                 await asyncio.sleep(0.2)   # 让狗先退出上一次喊话
+            if self.closed or (valid is not None and not valid()):
+                return True, '任务已停，不播'
+            self.tag = tag
             self.job = asyncio.create_task(self.run_clip(dict(x), who))
         return True, f'开始播报「{x["name"]}」'
 
@@ -216,6 +227,12 @@ class Audio:
                 return True, '没有在播报'
         self.event('INFO', f'停止播报（{who}）')
         return True, '已停止播报'
+
+    async def stop_tag(self, tag, why):
+        """只停 tag 自己发起的那段；别人（网页手动）播的不动。"""
+        async with self.lock:
+            if self.tag is tag and await self.halt():
+                self.event('INFO', f'停止播报（{why}）')
 
     async def run_clip(self, x, who):
         self.cur = {'clip': x['id'], 'name': x['name'], 'dur': x['dur'], 'phase': 'send', 'who': who, 't': time.monotonic()}
@@ -341,6 +358,9 @@ class Audio:
             return False, '没有这段音频'
         if self.cur and self.cur['clip'] == clip:
             return False, '正在播这段，先停止'
+        used = self.used(clip)
+        if used:
+            return False, f'站点在用，先换掉：{"；".join(used[:3])}{" 等" if len(used) > 3 else ""}'
         self.save({k: v for k, v in self.items.items() if k != clip})
         try:
             os.unlink(self.path(clip))

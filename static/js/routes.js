@@ -9,7 +9,7 @@ export function setupRouteEditor(store, actions, setTool){
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
   const rtV = $('#rtV'), rtW = $('#rtW');
-  let lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false;
+  let lastAudio = '', lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false;
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
@@ -216,6 +216,9 @@ export function setupRouteEditor(store, actions, setTool){
     }
     if (store.routeReplace != null && !(store.routeReplace < draft.points.length)) store.routeReplace = null;
     if (store.routeInsert != null && !(store.routeInsert >= 1 && store.routeInsert < draft.points.length)) store.routeInsert = null;
+    // 音频列表变了（上传 / 改名 / 删除）也要重画站点里的下拉框；播放状态变化不算
+    const audioKey = store.audio ? JSON.stringify(store.audio.items.map(x => [x.id, x.name, x.dur])) : '';
+    if (audioKey !== lastAudio){ lastAudio = audioKey; lastDraft = null; }
     if (draft !== lastDraft || store.routeReplace !== lastReplace || store.routeInsert !== lastInsert){
       lastDraft = draft; lastReplace = store.routeReplace; lastInsert = store.routeInsert;
       list.replaceChildren(...draft.points.map((p, i) => {
@@ -274,10 +277,45 @@ export function setupRouteEditor(store, actions, setTool){
           store.routeDraft = edited;
           if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
           if (lastDraft === current) lastDraft = edited;
+          showTip();
           render();
         };
         dwell.onchange = () => { const v = Math.round(+dwell.value); dwell.value = v > 0 ? String(Math.min(3600, v)) : ''; };
         dwellRow.append('停留', dwell, '秒');
+        // 播报（11-25）：到这一站在狗的喇叭上播哪段音频，列表来自底部「播报」标签里上传的
+        const clips = store.audio?.items || [], audioRow = document.createElement('label');
+        audioRow.className = 'route-point-audio';
+        audioRow.hidden = !store.audio && !p.audio;       // 后端还没有播报功能
+        const clip = document.createElement('select'), tip = document.createElement('span');
+        clip.setAttribute('aria-label', `第 ${i + 1} 站播报音频`);
+        clip.append(new Option(clips.length ? '不播报' : '不播报（先在底部「播报」里上传音频）', ''),
+          ...clips.map(x => new Option(`${x.name}（${x.dur < 10 ? x.dur.toFixed(1) : Math.round(x.dur)} s）`, x.id)));
+        if (p.audio && !clips.some(x => x.id === p.audio)) clip.append(new Option('音频已删除，请重选', p.audio));
+        clip.value = p.audio || '';
+        tip.className = 'route-audio-tip';
+        const showTip = () => {
+          const q = store.routeDraft.points[i], x = clips.find(c => c.id === q?.audio);
+          tip.textContent = !q?.audio ? '' : !x ? '出发后这站不会播' : end && !round.checked ? '到终点停下后播'
+            : !(q.dwell > 0) ? '经过时播，边走边播' : q.dwell < x.dur ? `比停留长（${x.dur.toFixed(0)} s），走开后接着播完` : '停下后播';
+        };
+        clip.onchange = () => {
+          const current = store.routeDraft;
+          const points = current.points.map((point, j) => {
+            if (j !== i) return point;
+            const { audio: _, ...rest } = point;
+            return clip.value ? { ...rest, audio: clip.value } : rest;
+          });
+          const edited = { ...current, points };
+          store.routeDraft = edited;
+          if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+          if (lastDraft === current) lastDraft = edited;
+          showTip(); mark();
+          render();
+        };
+        const mark = () => { audioRow.classList.toggle('on', !!store.routeDraft.points[i]?.audio); };
+        audioRow.classList.toggle('on', !!p.audio);
+        audioRow.append('播报', clip, tip);
+        showTip();
         const button = (text, title, action, disabled = false) => {
           const b = document.createElement('button');
           b.className = 'btn sm'; b.textContent = text; b.title = title;
@@ -342,7 +380,7 @@ export function setupRouteEditor(store, actions, setTool){
         const head = document.createElement('div');
         head.className = 'route-head';
         head.append(grip, order, label);
-        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, dwellRow, pointNote);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, dwellRow, audioRow, pointNote);
         return li;
       }));
     }
