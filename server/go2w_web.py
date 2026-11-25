@@ -80,6 +80,7 @@ except ImportError:  # pragma: no cover
     SerializePoseGraph = None
 from geometry_msgs.msg import Pose2D
 
+import audio as AU
 import camera as C
 import incidents as INC
 import keepout as KO
@@ -1581,6 +1582,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.ctrl = R.CtrlLink(node, node.event, fake=self.simulated)
             except Exception as e:
                 node.event('ERROR', f'无法连接运控状态（域 0）：{e!r}；站起 / 趴下不可用')
+        # 播报（audio.py）：本体喇叭，挂在运控那个域 0 节点上
+        self.audio = AU.Audio(node.event, DATA, self.ctrl.ros if self.ctrl else None, self.push_audio, self.label_error,
+                              os.environ.get('GO2W_AUDIO_LOCAL_EDIT', '1' if self.simulated else '0') == '1',
+                              why='' if self.ctrl else '没连上域 0，喇叭不可用')
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
         self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
@@ -1682,6 +1687,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return await self.handle_taught(ws, d)
             except (TeachingError, ValueError) as e:
                 return False, str(e)
+        if isinstance(op, str) and op.startswith('audio_'):   # 播报：不算运动操作，不抢控制权
+            return await self.audio.handle(d, self.remote(ws))
         if self._taught_job is not None and (op in ('goal', 'route_start', 'set_mode', 'load_map', 'autoloc_move')
                                             or (op == 'arm' and d.get('on'))):
             return False, '示教正在加载地图或定位自检，请保持静止并等待结果'
@@ -5605,6 +5612,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.tx_put(ws, self.labels_message(), 'labels')
             self.tx_put(ws, self.keepout_message(), 'keepout')
             self.tx_put(ws, self.incidents_message(), 'incidents')
+            self.tx_put(ws, self.audio.message(), 'audio')
             taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
             if taught_map:
                 c['taught_map'] = taught_map
@@ -5849,6 +5857,29 @@ class Server(TaughtWeb, RT.RtabWeb):
             except Exception as e:  # 别让一次异常停掉推送
                 n.get_logger().warn(f'broadcast: {e!r}')
 
+    async def push_audio(self, text):
+        await self.send_all(text, key='audio')
+
+    async def api_audio(self, req):
+        """上传一段音频（网页已转成 16 kHz 单声道 WAV）。要求自定义头：别的网站的表单 / 跨域请求带不上。"""
+        def bad(msg, status=400):
+            return web.json_response({'ok': False, 'msg': msg}, status=status)
+        remote = client_ip(req)
+        if req.headers.get('X-Go2w') != '1' or not self.audio.editable(remote):
+            return bad('这个入口不能上传音频', 403)
+        raw = bytearray()
+        async for chunk in req.content.iter_chunked(65536):
+            raw += chunk
+            if len(raw) > AU.BODY_MAX:
+                return bad(f'音频太长：最多 {AU.DUR_MAX:.0f} s', 413)
+        try:
+            x = await self.audio.add(req.query.get('name', ''), bytes(raw), remote)
+        except AU.AudioError as e:
+            return bad(str(e))
+        except OSError as e:
+            return bad(f'保存音频失败：{e.strerror or e}', 500)
+        return web.json_response({'ok': True, 'msg': f'已上传「{x["name"]}」', 'item': x})
+
     def app(self):
         @web.middleware
         async def no_cache(req, handler):  # 开发期改完前端直接刷新就生效
@@ -5862,6 +5893,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/ws', self.ws)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
+        app.router.add_post('/api/audio', self.api_audio)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):
                 app.router.add_static(f'/{sub}/', os.path.join(self.static_dir, sub))
@@ -5872,8 +5904,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             a['tasks'] = [asyncio.create_task(self.broadcast()), asyncio.create_task(self.safety()),
                           asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor()),
                           asyncio.create_task(self.taught_loop())]
+            await self.audio.start()
 
         async def stop(a):
+            await self.audio.close()      # 正在播就退出喊话；要在 ctrl.close() 之前
             if self.taught_recording():
                 await self.disarm_and_cancel('网页服务关闭，示教草稿已保留')
             if self.route_running():

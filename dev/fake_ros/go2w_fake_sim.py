@@ -292,7 +292,46 @@ class Sim:
     def subscribers(self, topic):
         if topic == '/patrol_pose':
             return 1 if self.pat and time.monotonic() >= self.pat['ready_at'] else 0
+        if topic in ('/api/audiohub/request', '/api/vui/request'):
+            return 0 if os.path.exists('/tmp/go2w_fake_audio_off') else 1
         return 0
+
+    def audio_req(self, service, msg):
+        """假喇叭：喊话 4001 / 4003 / 4002 和音量。每次退出喊话把拼回来的 WAV 写到 /tmp/go2w_fake_audio.wav，api 顺序写到 .log。
+        /tmp/go2w_fake_audio_fail 存在：里面写的 api_id 回错误码 7。"""
+        import base64
+        import json
+        from unitree_api.msg import Response
+        if not hasattr(self, 'hub'):
+            self.hub = {'vol': 5, 'blocks': [], 'log': []}
+            if os.path.exists('/tmp/go2w_fake_audio.log'):   # 上一个进程留下的
+                os.unlink('/tmp/go2w_fake_audio.log')
+        h = self.hub
+        api, r = msg.header.identity.api_id, Response()
+        r.header.identity.id, r.header.identity.api_id = msg.header.identity.id, api
+        try:
+            with open('/tmp/go2w_fake_audio_fail') as f:
+                fail = int(f.read())
+        except (OSError, ValueError):
+            fail = None
+        if api == fail:
+            r.header.status.code = 7
+        elif service == 'vui' and api == 1003:
+            h['vol'] = json.loads(msg.parameter)['volume']
+        elif service == 'vui' and api == 1004:
+            r.data = json.dumps({'volume': h['vol']})
+        elif service == 'audiohub' and api == 4001:
+            h['blocks'] = []
+        elif service == 'audiohub' and api == 4003:
+            h['blocks'].append(json.loads(msg.parameter)['block_content'])
+        if service == 'audiohub':
+            h['log'].append(api)
+            with open('/tmp/go2w_fake_audio.log', 'w') as f:
+                json.dump(h['log'], f)
+            if api == 4002:
+                with open('/tmp/go2w_fake_audio.wav', 'wb') as f:
+                    f.write(base64.b64decode(''.join(h['blocks'])))
+        self.node.deliver(f'/api/{service}/response', r)
 
     def start_mode(self, mode, map_yaml=None, *, taught_route=False):
         self.mode_environment = {'GO2W_NAVIGATION_MODE': mode}
@@ -602,6 +641,8 @@ class Sim:
             yaw = 2 * math.atan2(p.orientation.z, p.orientation.w)
             self.pat['points'].append((p.position.x, p.position.y, yaw))
             self.plog(20, '%s 点：(%.2f, %.2f)，朝向 %.0f°' % ('AB'[len(self.pat['points']) - 1], p.position.x, p.position.y, math.degrees(yaw)))
+        elif topic in ('/api/audiohub/request', '/api/vui/request'):
+            self.audio_req(topic.split('/')[2], msg)
         elif topic == '/api/sport/request':
             if msg.header.identity.api_id == 2101:
                 if self.dual is not None:

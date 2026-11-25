@@ -396,6 +396,23 @@ export function createMockSource(store, bus){
         store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } }; }, 600);
       return { ok:true, msg:`开始上传 ${name} → 166:~/go2w_bags（模拟）` };
     },
+    audioUpload(name, wav, dur){
+      const A = store.audio ||= { avail:true, why:'', items:[], cur:null, vol:5, last:null, limit:60, rx:performance.now() };
+      store.audio = { ...A, items:[...A.items, { id:String(Date.now()), name, dur, size:wav.size, ts:Date.now() }] };
+      return { ok:true, msg:`已上传「${name}」（模拟）` };
+    },
+    audioRefresh(){ store.audio ||= { avail:true, why:'', items:[{ id:'demo', name:'请注意避让', dur:4.2, size:134444, ts:Date.now() }], cur:null, vol:5, last:null, limit:60, rx:performance.now() }; },
+    audioPlay(id){
+      const x = store.audio.items.find(i => i.id === id);
+      clearTimeout(this._audioT);
+      store.audio = { ...store.audio, rx:performance.now(), cur:{ clip:id, name:x.name, dur:x.dur, phase:'play', elapsed:0, who:'模拟' } };
+      this._audioT = setTimeout(() => { store.audio = { ...store.audio, cur:null, last:{ clip:id, name:x.name, ok:true, msg:'播完' } }; }, x.dur * 1000);
+      return { ok:true, msg:`开始播报「${x.name}」（模拟，不出声）` };
+    },
+    audioStop(){ clearTimeout(this._audioT); store.audio = { ...store.audio, cur:null }; return { ok:true, msg:'已停止播报（模拟）' }; },
+    audioVolume(v){ store.audio = { ...store.audio, vol:v }; return { ok:true, msg:`音量 ${v}（模拟）` }; },
+    audioRename(id, name){ store.audio = { ...store.audio, items:store.audio.items.map(i => i.id === id ? { ...i, name } : i) }; return { ok:true, msg:`已改名为「${name}」（模拟）` }; },
+    audioDelete(id){ store.audio = { ...store.audio, items:store.audio.items.filter(i => i.id !== id) }; return { ok:true, msg:'已删除（模拟）' }; },
     setMapLabel(name, label){
       label = String(label || '').split(/\s+/).filter(Boolean).join(' ');
       if (label === name) label = '';

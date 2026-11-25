@@ -307,6 +307,12 @@ body.has-photo .robot-ico{width:104px;height:78px;background:var(--panel)}
 .mrow:hover{background:var(--panel)}
 .mrow .mn{font-family:var(--f-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mrow .mm{font-family:var(--f-mono);font-size:11px;color:var(--muted)}
+.mrow.au{grid-template-columns:1fr auto auto auto auto;gap:6px}
+.mrow.au.on{background:var(--accent-soft)}
+.au-now{font-size:12.5px;color:var(--fg-2);padding:2px 0 10px;overflow-wrap:anywhere}
+.au-now[data-s=run]{color:var(--accent)}
+.au-now[data-s=warn]{color:var(--warn)}
+.au-vol{display:grid;grid-template-columns:auto 1fr 24px;gap:10px;align-items:center;font-size:12px;color:var(--fg-2);margin-bottom:8px}
 .mrow.bag{grid-template-columns:1fr auto auto auto auto auto}
 .bag-up{width:26px;height:26px;color:var(--muted)}
 .bag-up svg{width:15px;height:15px}
