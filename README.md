@@ -27,6 +27,7 @@ prototype/           最早的单文件原型和右栏原型，留作对照
 - 11-12 起扩展坞跑的是统一运行容器 `go2w_runtime`（镜像 `go2w-runtime:<release>`，由 systemd 的 `go2w-runtime.service` 启动），不再有 `go2w_humble` / `go2w_web` 两个容器。网页打包在镜像里：后端 `/opt/go2w/console/server`，前端 `/opt/go2w/console/static`。
 - 导航、巡逻、录包、回溯、速度桥都是容器里 supervisor 管的进程组，后端经 `/run/go2w/supervisor.sock`（环境变量 `GO2W_SUPERVISOR_SOCKET`）请求启停；运控 control 组和 DDS 录制不归网页管。
 - 存图、对齐地图由后端直接起子进程，脚本在 `/opt/go2w/console/tools/`（`save_map.sh`、`align_map.py`）。
+- 调整 Nav2 障碍物 critic：`POST /api/obstacles-critic/true` 会执行 `ros2 param set /controller_server FollowPath.ObstaclesCritic.enabled true`；`POST /api/obstacles-critic/false` 会将参数设为 `false`。成功返回 JSON（包括实际参数值）；执行失败、超时或 ROS 2 命令不可用时返回对应 HTTP 错误。两个接口要求部署进程的 PATH 可找到 `ros2`，并且当前 ROS 2 环境可访问 `/controller_server`。
 - 数据目录是容器里的 `/go2w/data`（扩展坞上 `/opt/go2w/data`），可以用 `GO2W_DATA` 改。地图、路线、录包都在那里，不进这个仓库。导航日志在 `data/logs/navigation.log`，遥控速度桥在 `data/logs/bridge.log`。
 
 ## 进度

@@ -69,6 +69,7 @@ from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 from recording import RecordingAPI
+from obstacles_critic import ObstaclesCriticAPI
 
 # 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
 # 和续建无关，所以缺失时只把续建这条路标成不可用
@@ -6231,6 +6232,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         self.recording_api.routes(app)
+        ObstaclesCriticAPI().routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
         app.router.add_post('/api/audio', self.api_audio)
