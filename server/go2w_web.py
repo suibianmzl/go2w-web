@@ -1503,7 +1503,8 @@ class Server(TaughtWeb, RT.RtabWeb):
         except (OSError, ValueError, AttributeError):
             pass
         self.uploads_file = os.path.join(DATA, 'bag_uploads.json')
-        self.uploads = {}             # 包名 → {state: run/done/fail, pct, msg}；done 的存进 bag_uploads.json
+        self.uploads = {}             # 包名 → {state: queued/run/done/fail, pct, msg}；done 的存进 bag_uploads.json
+        self.bag_upload_slots = asyncio.Semaphore(2)
         self.restore_upload_receipts()
         self.recording_api = RecordingAPI(os.path.join(DATA, 'bags'), self.static_dir,
                                           uploads=self.uploads, on_change=self.bag_content_changed)
@@ -1521,6 +1522,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             node.event('ERROR', f'无法读取导航任务 {self.routes_file}：{e}')
         self.route = None
         self.route_job = None
+        self.route_starting = False
         self.goal_pending = False
         self.resume_file = os.path.join(DATA, 'route_resume.json')
         self.resumes = {}
@@ -1703,7 +1705,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '正在检查路线，请稍等'
         if self.climb is not None and op in ('goal', 'route_start', 'auto_localize', 'autoloc_move', 'taught_start'):
             return False, '爬台模式开着：先关掉爬台模式（切回 rough）再导航'
-        if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
+        if (self.route_running() or getattr(self, 'route_starting', False)) and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
         # 先让准备凭据失效，再进入可能await的停车分支；同一页面取消也必须中断站起。
@@ -1833,6 +1835,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 key = d.get('key')
                 if key not in PARAMS:
                     return False, f'不支持的参数：{key}'
+                if key == 'vmax' and (self.route_running() or getattr(self, 'route_starting', False)):
+                    return False, '任务执行中，最大 vx 由任务和站点限速共同约束，请先取消任务再调整'
                 if not n.pset_cli.service_is_ready():
                     return False, 'cmd_bridge 没有运行'
                 r = await self.aw(n.set_param(key, d['value']), 2.0)
@@ -1844,8 +1848,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return False, f'参数没有生效：{res.reason}'
             if op == 'set_mode':
                 return self.set_mode(d.get('mode'), d.get('map'))
-            if op in ('route_save', 'route_delete'):
-                result = self.save_route(d) if op == 'route_save' else self.delete_route(d.get('route_id'))
+            if op in ('route_save', 'route_delete', 'route_terminate'):
+                result = (self.save_route(d) if op == 'route_save' else
+                          self.delete_route(d.get('route_id')) if op == 'route_delete' else
+                          self.terminate_route(d.get('route_id')))
                 if result[0]:
                     await self.send_all(self.routes_message(), key='routes')
                 return result
@@ -2503,6 +2509,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                     'name': label.strip(), 'note': note.strip(), 'manualHeading': manual}
             if round(dwell) > 0:
                 item['dwell'] = int(round(dwell))
+            if 'vmax' in point:
+                speed = point['vmax']
+                if type(speed) not in (int, float) or not math.isfinite(speed) or not 0.1 <= speed <= 1.2:
+                    raise ValueError('站点限速需要在 0.1–1.2 m/s 之间')
+                item['vmax'] = float(speed)
             clip = point.get('audio')       # 11-25：到这一站播哪段音频（audio.py 的 id），没有 = 不播
             if clip not in (None, ''):
                 if isinstance(clip, str) and re.fullmatch('[0-9a-f]{12}', clip):
@@ -2528,9 +2539,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         checks = {'loop': lambda v: type(v) is bool, 'through': lambda v: type(v) is bool,
                   'loops': lambda v: type(v) is int and 0 <= v <= 1000,
                   'vmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.1 <= v <= 1.2,
-                  'wmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.2 <= v <= 1.5}
+                  'wmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.2 <= v <= 2.0}
         msgs = {'loop': '循环开关无效', 'through': '连续通过开关无效', 'loops': '圈数需要 0–1000 的整数', 'vmax': '最大 vx 需要在 0.1–1.2 m/s 之间',
-                'wmax': '最大 wz 需要在 0.2–1.5 rad/s 之间'}
+                'wmax': '最大 wz 需要在 0.2–2 rad/s 之间'}
         for k, ok in checks.items():
             if k not in o:
                 continue
@@ -2810,8 +2821,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 tmp = f.name
                 json.dump(self.resumes, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.resume_file)
+            return True
         except OSError as e:
             self.node.event('WARN', f'任务断点没能写盘：{e}')
+            return False
         finally:
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
@@ -2820,6 +2833,22 @@ class Server(TaughtWeb, RT.RtabWeb):
         msg = self.routes_message()
         for ws in list(self.clients):
             self.tx_put(ws, msg, 'routes')
+
+    def terminate_route(self, route_id):
+        """终止已停止任务的接续进度，保留路线和其他任务。"""
+        record = self.routes.get(route_id)
+        if record is None:
+            return False, '找不到这个导航任务'
+        if self.route_running() and self.route and self.route['record']['id'] == route_id:
+            return False, '任务正在执行，请先取消导航再终止接续'
+        checkpoint = self.resumes.pop(route_id, None)
+        if checkpoint is None:
+            return False, '这个任务没有待继续的进度'
+        if not self.write_resumes():
+            self.resumes[route_id] = checkpoint
+            return False, '任务进度未能清除，请检查后端日志后重试'
+        self.node.event('INFO', f"已终止任务「{record['name']}」的接续，已保存的路线保留")
+        return True, '任务已终止，已保存的路线保留'
 
     def resume_view(self, record):
         """推给网页 / 云端的断点。running 的任务（status = active）不给：只有停下来的才能接续。"""
@@ -2948,7 +2977,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.checking_route = False
 
-    def start_route(self, ws, route_id, round_trip=False, loops=1, resume=None):
+    def start_route(self, ws, route_id, round_trip=False, loops=1, resume=None, *, vmax=None):
         """resume：None = 从头出发；'continue' = 从断点那一站接着跑；'skip' = 跳过断点那一站，从下一站接着跑。
         接续时圈数、已完成站数都用断点里的，round_trip / loops 参数不看。"""
         route = self.routes.get(route_id)
@@ -2984,7 +3013,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                       # 循环：loops 为 None 表示单程；done = 已到达的站数，用来算进度。一圈到 n 站（含回到起点）
                       'loops': loops if round_trip else None, 'loop': 1, 'back': False, 'done': 0,
                       'total': n if not round_trip else None if loops == 0 else 1 + loops * n,
-                      'target': route['points'][0], 'resume': None}
+                      'target': route['points'][0], 'resume': None,
+                      'vmax': self.route_opts(route.get('opts'))['vmax'] if vmax is None else vmax}
         how = '' if not round_trip else '，一直循环' if loops == 0 else f'，循环 {loops} 圈'
         if cp:
             i, loop, back = state
@@ -3004,10 +3034,24 @@ class Server(TaughtWeb, RT.RtabWeb):
         return True, f"开始任务：{route['name']}{how}"
 
     async def start_route_armed(self, ws, d):
+        if getattr(self, 'route_starting', False):
+            return False, '导航任务正在启动，请勿重复出发'
+        self.route_starting = True
+        try:
+            return await self._start_route_armed(ws, d)
+        finally:
+            self.route_starting = False
+
+    async def _start_route_armed(self, ws, d):
         """网页「出发」：先把这次的速度上限（vmax / wmax，导航没开时在网页上选好的）设给 cmd_bridge，
         arm=true 时再解锁出发；出发失败就把刚解的锁再上回去。"""
         n, armed_here = self.node, False
         record = self.routes.get(d.get('route_id'))
+        if record is None:
+            return False, '找不到这个导航任务'
+        if (self.route_running() or self.goal_pending or n.nav_active()
+                or self.prof('patrol') != 'stop' or self.teleop is not None):
+            return False, '请先结束当前导航、巡逻或遥控'
         ok, message = await self.check_ordinary_taught_binding(record['map'] if record else n.map_current)
         if not ok:
             return False, message
@@ -3015,10 +3059,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             why = self.keepout_blocker(record['map'], record['points'])
             if why:
                 return False, why
-        for key, top in (('vmax', 1.2), ('wmax', 1.5)):
-            v = d.get(key)
-            if v is None:
-                continue
+        opts = self.route_opts(record.get('opts'))
+        for key, top in (('vmax', 1.2), ('wmax', 2.0)):
+            v = d.get(key, opts[key])
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
                 return False, f'速度上限 {key} 需要在 0–{top} 之间'
             if n.params.get(key) is not None and abs(n.params[key] - v) < 1e-6:
@@ -3042,7 +3085,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not r.success:
                 return False, f'解锁失败：{r.message}'
             n.armed, n.armed_t, armed_here = True, time.monotonic(), True
-        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1), d.get('resume'))
+        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1), d.get('resume'),
+                                  vmax=float(d.get('vmax', opts['vmax'])))
         if armed_here and not result[0]:
             try:
                 r = await self.aw(n.call_arm(False), 2.0)
@@ -3456,6 +3500,30 @@ class Server(TaughtWeb, RT.RtabWeb):
             raise RuntimeError(reason)
         self.route_audio(route, i)
 
+    @staticmethod
+    def route_leg_vmax(route, state):
+        points = route['record']['points']
+        ceiling = route.get('vmax', Server.route_opts(route['record'].get('opts'))['vmax'])
+        i, _, back = state
+        endpoints = [points[i]]
+        if i > 0:
+            endpoints.append(points[i - 1])
+        elif back:
+            endpoints.append(points[-1])
+        return min(ceiling, *(p.get('vmax', ceiling) for p in endpoints))
+
+    async def apply_route_vmax(self, speed):
+        n = self.node
+        if n.params.get('vmax') is not None and abs(n.params['vmax'] - speed) < 1e-6:
+            return
+        if not n.pset_cli.service_is_ready():
+            raise RuntimeError('cmd_bridge 不可用，站间限速未生效')
+        result = await self.aw(n.set_param('vmax', speed), 2.0)
+        if not result.results[0].successful:
+            raise RuntimeError(f'站间限速未生效：{result.results[0].reason}')
+        n.params['vmax'] = float(speed)
+        n.event('INFO', f'导航站间限速 = {speed:.2f} m/s')
+
     async def run_through(self, ws, route, state):
         """连续通过（v1.1.11）：从 state 起一段一段跑。返回 None = 全部跑完；'stop' = 被取消（已处理）；
         状态元组 = 多点导航用不了，从这一站起退回一站一站走。"""
@@ -3472,7 +3540,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return 'stop'
             # 这一段：从 state 起，到停留站 / 终点 / ROUTE_SEG_MAX 站为止
             seg, s = [], state
+            speed = self.route_leg_vmax(route, state)
             while s:
+                if seg and abs(self.route_leg_vmax(route, s) - speed) > 1e-6:
+                    break  # 不同限速的站间段分别下发，低速段不等导航反馈才生效。
                 i, loop, back = s
                 nxt = self.route_next(total, loops, s)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0
@@ -3504,6 +3575,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             i, loop, back = state
             route.update(index=i, loop=loop, back=back, target=seg[0][1], goal=None)
             self.resume_checkpoint(route)
+            reason = self.route_blocker(ws, record)
+            if reason:
+                raise RuntimeError(reason)
+            await self.apply_route_vmax(speed)
+            if route['stop'].is_set():
+                return 'stop'
             reason = self.route_blocker(ws, record)
             if reason:
                 raise RuntimeError(reason)
@@ -3675,13 +3752,25 @@ class Server(TaughtWeb, RT.RtabWeb):
                 route.update(index=i, loop=loop, back=back, target=point, goal=None)
                 self.resume_checkpoint(route)   # 每站出发前写盘：网页服务突然停了也知道跑到哪了
                 reason = self.route_blocker(ws, record)
+                if not reason:
+                    try:
+                        await self.apply_route_vmax(self.route_leg_vmax(route, state))
+                    except Exception:
+                        if prev is not None:
+                            await self.aw(prev.cancel_goal_async(), 2.0)
+                        raise
+                    if route['stop'].is_set():
+                        return
+                    reason = self.route_blocker(ws, record)
                 if reason:
                     if prev is not None:
                         await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError(reason)
                 nxt = self.route_next(len(points), loops, state)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0   # 终点停不停留都一样
-                passing = nxt is not None and not dwell   # 后面还有站：不停车经过，朝向面向下一站；要停留的站照常停稳
+                passing = (nxt is not None and not dwell and
+                           abs(self.route_leg_vmax(route, state) - self.route_leg_vmax(route, nxt)) < 1e-6)
+                # 限速变化处先到站，避免提前经过时解除上一段的低速约束。
                 if passing:
                     q = self.route_pose(points, nxt[0], nxt[2])
                     pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
@@ -3778,6 +3867,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.finish_route(route, 'aborted', f'第 {route["index"] + 1} 点失败：{e}')
             else:
                 n.event('ERROR', f'多点任务停止时出错：{e}')
+        finally:
+            if route['status'] == 'succeeded':
+                try:
+                    await self.apply_route_vmax(route.get('vmax', self.route_opts(record.get('opts'))['vmax']))
+                except Exception as e:
+                    n.event('WARN', f'任务结束后恢复最大 vx 失败：{e}')
 
     def task(self):
         goal, route = self.node.task(), self.route
@@ -3983,8 +4078,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             # 正在录的那个不能删：网页启动的记得名字；后端重启过或者不是网页启动的，保险起见最新的一个也不让删
             if name in self.recording_names():
                 return False, f'{name} 正在录制，先停止录包再删'
-        if self.uploads.get(name, {}).get('state') == 'run':
-            return False, f'{name} 正在上传，等上传完再删'
+        if self.uploads.get(name, {}).get('state') in ('queued', 'run'):
+            return False, f'{name} 已排队或正在上传，等上传完再删'
         path = os.path.join(bags_dir, name)
         if os.path.realpath(os.path.dirname(path)) != os.path.realpath(bags_dir):
             return False, '包名不对'
@@ -4431,7 +4526,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.save_upload_receipts()
 
     async def bag_upload(self, name, who):
-        """rsync 把 data/bags/<name> 传到 166:~/go2w_bags/<name>。同一时间只传一个；进度和结果进网页日志。"""
+        """整包排队上传，最多同时执行两个；各包独立保留进度与结果。"""
         if not name or not P.SAFE_NAME.match(name):
             return False, '包名不对'
         bags_dir = os.path.join(DATA, 'bags')
@@ -4442,15 +4537,19 @@ class Server(TaughtWeb, RT.RtabWeb):
         if self.prof('bag') != 'stop' or self.transitions.get('bag'):
             if name in self.recording_names():
                 return False, f'{name} 正在录制，先停止录包再上传'
-        busy = next((k for k, u in self.uploads.items() if u['state'] == 'run'), None)
-        if busy:
-            return False, f'正在上传 {busy}，等它传完'
+        if self.uploads.get(name, {}).get('state') in ('queued', 'run'):
+            return False, f'{name} 已排队或正在上传，请勿重复提交'
         key = os.path.join(DATA, 'ssh', 'id_ed25519')
         if not os.path.exists(key) or not shutil.which('rsync') or not shutil.which('ssh'):
             return False, '扩展坞上缺上传工具：需要 data/ssh 密钥，以及镜像里的 rsync / ssh（重建 go2w-humble 镜像）'
-        self.uploads[name] = {'state': 'run', 'phase': 'waiting', 'pct': 0, 'msg': '等待语音备注后一起上传'}
-        asyncio.create_task(self.bag_upload_run(name, bag['size'], key, who))
-        return True, f'开始上传 {name} → {UPLOAD_LABEL}'
+        self.uploads[name] = {'state': 'queued', 'pct': 0, 'msg': '等待上传空位'}
+        asyncio.create_task(self.bag_upload_queued(name, bag['size'], key, who))
+        return True, f'已提交上传 {name} → {UPLOAD_LABEL}'
+
+    async def bag_upload_queued(self, name, size, key, who):
+        async with self.bag_upload_slots:
+            self.uploads[name] = {'state': 'run', 'phase': 'waiting', 'pct': 0, 'msg': '等待语音备注后一起上传'}
+            await self.bag_upload_run(name, size, key, who)
 
     async def bag_upload_run(self, name, size, key, who):
         n, t0 = self.node, time.monotonic()
@@ -5699,7 +5798,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             refuse = '示教正在定位自检，请保持静止'
         elif self.taught_open() and self.taught_owner is not None and self.taught_owner is not ws:
             refuse = '另一个网页正在进行示教采集'
-        elif self.route_running() or self.checking_route:
+        elif self.route_running() or getattr(self, 'route_starting', False) or self.checking_route:
             refuse = '多点任务或路线检查进行中，请先结束'
         else:
             refuse = '急停中' if self.estop else '底盘锁定中，先解锁' if not n.is_armed() else None

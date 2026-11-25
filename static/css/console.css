@@ -761,6 +761,16 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-resume-stops li[data-s="next"]{border-color:var(--warn);color:var(--warn);font-weight:600}
 
 /* 站点停留秒数（11-24） */
+.route-point-speed{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;font-size:11px;color:var(--muted)}
+.route-point-speed input{width:112px;min-width:0;height:26px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 6px;font:11px var(--f-mono)}
+.route-point-speed input[aria-invalid="true"]{border-color:var(--crit)}
+.route-points .route-point-speed-error{flex-basis:100%;white-space:normal;color:var(--crit)}
+.route-point-speed-error:empty{display:none}
+.route-resume .btn-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.route-resume .btn{white-space:nowrap}
+#routeResumeSkip{grid-column:1/-1;grid-row:2}
+.route-opts .sl{grid-template-columns:46px minmax(0,1fr) 76px;gap:8px}
+.route-opts .sl output{white-space:nowrap}
 .route-point-dwell{grid-column:1/-1;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
 .route-point-dwell input{width:64px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 6px;font:11px var(--f-mono)}
 .route-point-dwell input:disabled{opacity:.4}

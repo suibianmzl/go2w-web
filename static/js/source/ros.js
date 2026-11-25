@@ -7,7 +7,7 @@ import { storeTaughtDocument } from '../taught_geometry.js';
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'terminateRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
   'audioPlay', 'audioStop', 'audioVolume', 'audioRename', 'audioDelete', 'audioRefresh', 'audioUpload',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
   'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
@@ -260,6 +260,7 @@ export function createRosSource(store, bus){
       .then(r => r.json().catch(() => ({ ok: false, msg: `上传失败（HTTP ${r.status}）` })))
       .catch(() => ({ ok: false, msg: '上传失败：连不上后端' })),
     deleteRoute: route_id => send('route_delete', { route_id }),
+    terminateRoute: route_id => send('route_terminate', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
     deleteMaps: names => send('map_delete', { names }, 60000),
     setMapLabel: (name, label) => send('map_label', { name, label }),

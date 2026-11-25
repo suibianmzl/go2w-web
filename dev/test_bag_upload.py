@@ -195,5 +195,106 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         capture=json.loads((self.bag/'capture.json').read_text())
         self.assertEqual(capture['voice']['state'],'pending')
 
+    def prepare_queue(self, names):
+        self.server.uploads.clear()
+        self.server.prof=lambda _: 'stop'
+        self.server.transitions={}
+        self.server.bag_upload_slots=asyncio.Semaphore(2)
+        (self.root/'ssh').mkdir()
+        (self.root/'ssh/id_ed25519').write_text('local test placeholder')
+        for name in names:
+            bag=self.root/'bags'/name
+            bag.mkdir(exist_ok=True)
+            (bag/'metadata.yaml').write_text('duration:\n  nanoseconds: 30000000000\n')
+            (bag/f'{name}_0.mcap').write_bytes(name.encode())
+            (bag/'capture.json').unlink(missing_ok=True)
+
+    async def wait_upload_state(self, name, state):
+        async def wait():
+            while self.server.uploads.get(name,{}).get('state')!=state:
+                await asyncio.sleep(.01)
+        await asyncio.wait_for(wait(),5)
+
+    async def test_two_transfers_run_while_extra_bags_queue_and_reject_duplicate_or_delete(self):
+        self.prepare_queue(['test-bag','second-bag','third-bag'])
+        release=asyncio.Event();started=[]
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            started.append(Path(args[-2]).name)
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['test-bag','second-bag','third-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(started,['test-bag','second-bag'])
+                self.assertEqual(self.server.uploads['third-bag']['state'],'queued')
+                self.assertFalse((await self.server.bag_upload('third-bag','duplicate'))[0])
+                self.assertFalse((await self.server.bag_upload('test-bag','duplicate'))[0])
+                self.assertFalse((await self.server.bag_delete('third-bag','local-test'))[0])
+                self.assertTrue((self.root/'bags/third-bag').is_dir())
+            finally:
+                release.set()
+            for name in ['test-bag','second-bag','third-bag']:
+                await self.wait_upload_state(name,'done')
+                self.assertEqual((self.remote/name/f'{name}_0.mcap').read_bytes(),name.encode())
+            self.assertEqual(started,['test-bag','second-bag','third-bag'])
+
+    async def test_failed_queued_bundle_does_not_block_following_uploads(self):
+        self.prepare_queue(['test-bag','second-bag','broken-bag','last-bag'])
+        (self.root/'bags/broken-bag/metadata.yaml').write_text(
+            'rosbag2_bagfile_information:\n  relative_file_paths:\n    - missing.mcap\n')
+        release=asyncio.Event();started=[]
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            started.append(Path(args[-2]).name)
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['test-bag','second-bag','broken-bag','last-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(started,['test-bag','second-bag'])
+            finally:
+                release.set()
+            await self.wait_upload_state('broken-bag','fail')
+            await self.wait_upload_state('last-bag','done')
+            await self.wait_upload_state('test-bag','done')
+            await self.wait_upload_state('second-bag','done')
+        self.assertFalse((self.remote/'broken-bag').exists())
+        receipt=json.loads(Path(self.server.uploads_file).read_text())
+        self.assertEqual(set(receipt),{'test-bag','second-bag','last-bag'})
+
+    async def test_queued_bag_accepts_its_voice_then_uploads_the_complete_bundle(self):
+        self.prepare_queue(['first-bag','second-bag','test-bag'])
+        (self.bag/'capture.json').write_text(json.dumps({'request_id':'request-one','name':'test-bag',
+            'before_s':20,'after_s':10,'voice':{'state':'pending','requested_s':20}}))
+        release=asyncio.Event()
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['first-bag','second-bag','test-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(self.server.uploads['test-bag']['state'],'queued')
+                self.assertEqual((await self.upload_voice()).status,201)
+            finally:
+                release.set()
+            for name in ['first-bag','second-bag','test-bag']:
+                await self.wait_upload_state(name,'done')
+        dest=self.remote/'test-bag'
+        self.assertEqual((dest/'voice-note.audio').read_bytes(),self.audio)
+        link=json.loads((dest/'recording-link.json').read_text())
+        self.assertEqual((link['bag']['name'],link['request_id']),('test-bag','request-one'))
+        self.assertEqual(link['audio']['sha256'],hashlib.sha256(self.audio).hexdigest())
+
 
 if __name__=='__main__':unittest.main()

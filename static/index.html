@@ -262,6 +262,11 @@
                 <div class="voice-recovery"><button class="btn sm" id="voiceRetry" hidden>重试保存语音</button><a id="voiceDownload" hidden>下载本地语音</a><button class="btn sm ghost" id="voiceDiscard" hidden>结束本次语音处理</button></div>
                 <details class="bag-disclosure bag-history" id="bagHistory">
                   <summary><span>已录制的包（<span id="bagCount">0</span>）</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></summary>
+                  <div class="bag-upload-actions">
+                    <label><input type="checkbox" id="bagUploadAll"> 全选</label>
+                    <button class="btn" id="bagUploadSelected" type="button" disabled>上传所选</button>
+                    <span class="meta" id="bagUploadSummary" role="status">可同时上传 2 个包，其余排队</span>
+                  </div>
                   <div id="bagList"></div>
                 </details>
                 <details class="bag-disclosure bag-settings" id="bagSettings">
@@ -323,9 +328,10 @@
                   <div class="patrol-opt route-loop"><label><input type="checkbox" id="routeRound" aria-describedby="routeLoopTip">循环</label><input id="routeLoops" type="number" min="0" max="1000" value="1" aria-label="循环圈数" disabled><span>圈</span></div>
                   <div class="route-hint route-loop-tip" id="routeLoopTip">到终点后直接回 1 号点算一圈，不原路返回 · 0 圈 = 一直循环</div>
                   <div class="patrol-opt route-loop"><label><input type="checkbox" id="routeThrough" aria-describedby="routeThroughTip" checked>连续通过</label></div>
-                  <div class="route-hint route-loop-tip" id="routeThroughTip">一次规划经过各站的连续路径，中间站不减速、不停车；设了停留的站和终点照常停稳。关掉 = 一站一站走</div>
+                  <div class="route-hint route-loop-tip" id="routeThroughTip">相同限速的连续站点一起规划，限速变化处会分段；设了停留的站和终点照常停稳。关掉 = 一站一站走</div>
                   <div class="sl"><label for="rtV">最大 vx</label><input type="range" id="rtV" min="0.1" max="1.2" step="0.05" value="0.45"><output id="oRtV">0.45 m/s</output></div>
-                  <div class="sl"><label for="rtW">最大 wz</label><input type="range" id="rtW" min="0.2" max="1.5" step="0.1" value="1.2"><output id="oRtW">1.2 rad/s</output></div>
+                  <div class="sl"><label for="rtW">最大 wz</label><input type="range" id="rtW" min="0.2" max="2" step="0.1" value="1.2"><output id="oRtW">1.2 rad/s</output></div>
+                  <div class="route-hint">站点最大 vx 留空时继承任务上限；每段按任务上限和两端站点限速中的较小值行驶。</div>
                 </div>
                 <div class="inrow route-controls" id="routeSaveRow" hidden>
                   <input id="routeName" placeholder="任务名称" aria-label="任务名称" maxlength="60">
@@ -342,7 +348,7 @@
                     <div class="route-resume-info" id="routeResumeInfo"></div>
                     <ol class="route-resume-stops" id="routeResumeStops" aria-label="各站完成情况"></ol>
                     <div class="route-resume-why" id="routeResumeWhy"></div>
-                    <div class="btn-row"><button class="btn pri" id="routeResumeGo">继续任务</button><button class="btn" id="routeResumeSkip">跳过这站继续</button></div>
+                    <div class="btn-row"><button class="btn pri" id="routeResumeGo">继续任务</button><button class="btn" id="routeResumeSkip">跳过这站继续</button><button class="btn danger" id="routeResumeTerminate">终止任务</button></div>
                     <div class="route-hint">继续：站起、启动导航、定位后，从没到的那一站接着跑完剩下的站，圈数接着算。点上面的「从头出发」是从第 1 站重新开始，断点作废。</div>
                   </div>
                   <ul class="prep-list" id="prepList" hidden>
@@ -378,7 +384,7 @@
           <div class="task-speed" id="taskSpeed">
             <div class="route-opts-h">临时调速<span>只对这次运行生效，不改保存的任务</span></div>
             <div class="sl"><label for="slV">最大 vx</label><input type="range" id="slV" min="0.1" max="1.2" step="0.05" value="0.45"><output id="oV">0.45 m/s</output></div>
-            <div class="sl"><label for="slW">最大 wz</label><input type="range" id="slW" min="0.2" max="1.5" step="0.1" value="1.2"><output id="oW">1.2 rad/s</output></div>
+            <div class="sl"><label for="slW">最大 wz</label><input type="range" id="slW" min="0.2" max="2" step="0.1" value="1.2"><output id="oW">1.2 rad/s</output></div>
           </div>
         </div>
         <div class="empty" id="taskEmpty" hidden>当前没有任务。在上方选择一个多站任务，或用地图工具栏的「导航点」新建。</div>

@@ -170,6 +170,13 @@ export function createActions(store, src){
           if (reply?.ok) onDeleted();
         } });
     },
+    terminateRoute(route_id){
+      if (!ready('terminateRoute')) return Promise.resolve({ ok:false });
+      if (!store.link.ok) return Promise.resolve({ ok:false, msg:'等待连接后端' });
+      if (store.task.status === 'active' && store.task.routeId === route_id)
+        return Promise.resolve((toast('请先结束正在执行的任务', 'err'), { ok:false }));
+      return exec(src.cmd.terminateRoute(route_id), '未完成任务已终止，已保存的路线仍保留');
+    },
     // 下发任务：出发流程（flow.js）站好、导航和定位都就绪后调用，自动解锁出发（后端 route_start 带 arm）。
     // opts.vmax / wmax：任务里保存的速度上限，后端出发前设给 cmd_bridge。
     // 只有激光和地图对不太上（匹配率 < 60%）时才多问一句
@@ -457,11 +464,16 @@ export function createActions(store, src){
       return rollbackCapture.save();
     },
     uploadBag(bag){
+      return A.uploadBags([bag]);
+    },
+    uploadBags(bags){
       if (!ready('uploadBag')) return;
-      const u = store.uploads[bag.name];
-      if (u?.state === 'done') return confirmBox({ title:'重新上传', body:`${bag.name} 已在 ${u.msg} 上传过。再传一次会补齐 166 上缺的部分，已有的文件不重复传。`, ok:'上传',
-        onOk: () => exec(src.cmd.uploadBag(bag.name), null) });
-      exec(src.cmd.uploadBag(bag.name), null);
+      const names = [...new Set(bags.map(b => b.name))].filter(name => !['queued', 'run'].includes(store.uploads[name]?.state));
+      if (!names.length) return;
+      const send = () => Promise.all(names.map(name => exec(src.cmd.uploadBag(name), null)));
+      const done = names.filter(name => store.uploads[name]?.state === 'done');
+      if (done.length) return confirmBox({ title:'重新上传', body:`所选 ${names.length} 个包中有 ${done.length} 个已上传。重新上传会补齐 166 上缺的部分，已有的文件不重复传。`, ok:'上传', onOk:send });
+      return send();
     },
     simulateDrop(){ if (ready('simulateDrop')) exec(src.cmd.simulateDrop(), null); },
   };

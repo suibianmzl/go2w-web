@@ -9,7 +9,7 @@ export function setupRouteEditor(store, actions, setTool){
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
   const rtV = $('#rtV'), rtW = $('#rtW');
-  let lastAudio = '', lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false;
+  let lastAudio = '', lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false, terminating = false;
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
@@ -42,7 +42,8 @@ export function setupRouteEditor(store, actions, setTool){
   round.onchange = () => { loops.disabled = !round.checked; lastDraft = null; render(); };
   loops.oninput = render;
   loops.onchange = () => { loops.value = readLoops(); render(); };
-  rtV.oninput = rtW.oninput = () => { showOpts(); render(); };
+  rtV.oninput = () => { showOpts(); lastDraft = null; render(); };
+  rtW.oninput = () => { showOpts(); render(); };
   through.onchange = render;
   revert.onclick = () => { setOpts(optsOf(selected())); render(); };
 
@@ -64,10 +65,20 @@ export function setupRouteEditor(store, actions, setTool){
     render();
   };
   // 任务接续（11-24）：后端在 routes 消息里给每个任务带 resume（断点，没有就是 null）
-  const resumeBox = $('#routeResume'), resumeGo = $('#routeResumeGo'), resumeSkip = $('#routeResumeSkip');
+  const resumeBox = $('#routeResume'), resumeGo = $('#routeResumeGo'), resumeSkip = $('#routeResumeSkip'), resumeTerminate = $('#routeResumeTerminate');
   const resumeStart = how => { if (!resumeGo.disabled) { store.startGo?.(selected(), how); render(); } };
   resumeGo.onclick = () => resumeStart('continue');
   resumeSkip.onclick = () => resumeStart('skip');
+  resumeTerminate.onclick = () => {
+    const route = selected();
+    if (!route?.resume || resumeTerminate.disabled) return;
+    confirmBox({ title:'终止任务', body:`终止「${route.name}」会清除这次未完成任务的断点，之后不能从这里继续。已保存的路线和运行参数会保留，仍可从头出发。`,
+      ok:'终止任务', danger:true, onOk: async () => {
+        terminating = true; render();
+        try { await actions.terminateRoute(route.id); }
+        finally { terminating = false; render(); }
+      } });
+  };
   const WHY = { aborted:'失败', canceled:'取消', interrupted:'中断' };
   function renderResume(route, show, blocked){
     const R = show ? route?.resume : null;
@@ -92,6 +103,9 @@ export function setupRouteEditor(store, actions, setTool){
     resumeGo.title = resumeSkip.title = blocked || '';
     resumeSkip.hidden = !R.canSkip;
     resumeSkip.textContent = R.canSkip ? `跳过，从第 ${R.skipPoint} 站继续` : '';
+    resumeTerminate.disabled = terminating || !store.link.ok;
+    resumeTerminate.title = !store.link.ok ? '等待连接后端' : '';
+    resumeTerminate.textContent = terminating ? '正在终止…' : '终止任务';
   }
   remove.onclick = () => {
     const route = selected();
@@ -227,8 +241,12 @@ export function setupRouteEditor(store, actions, setTool){
         const angle = `${Math.round(deg(p.th))}°`;
         const heading = p.manualHeading === false ? (draft.confirmed ? `自动 ${angle}` : '自动朝向') : angle;
         const stay = p.dwell > 0 && !(end && !round.checked) ? `停 ${p.dwell} s · ` : '';
-        label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${stay}${heading}`;
-        label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
+        const pointSummary = () => {
+          const point = store.routeDraft.points[i], speed = point.vmax ?? +rtV.value;
+          label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${stay}${heading} · vx≤${speed.toFixed(2)}${point.vmax == null ? '（继承）' : ''}`;
+          label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading} · 最大 vx ${speed.toFixed(2)} m/s${point.vmax == null ? '（继承任务上限）' : ''}`;
+        };
+        pointSummary();
         label.classList.toggle('route-end', end);
         label.classList.toggle('route-stay', !!stay);   // 设了停留：和地图上一样用橙色
         li.classList.toggle('route-replacing', store.routeReplace === i);
@@ -256,6 +274,36 @@ export function setupRouteEditor(store, actions, setTool){
           'name', 'route-point-name', 40, `第 ${i + 1} 站名称（可选）`);
         const pointNote = textField(Object.assign(document.createElement('textarea'), { rows:2 }),
           'note', 'route-point-note', 200, `第 ${i + 1} 站备注（可选）`);
+        const speedRow = document.createElement('label'), speedError = document.createElement('span');
+        speedRow.className = 'route-point-speed';
+        const speed = Object.assign(document.createElement('input'), { type:'number', min:0.1, max:1.2, step:'any', inputMode:'decimal',
+          value:p.vmax == null ? '' : String(p.vmax), placeholder:`继承 ${(+rtV.value).toFixed(2)}` });
+        speed.setAttribute('aria-label', `第 ${i + 1} 站最大 vx`);
+        speed.setAttribute('aria-describedby', `routePointSpeedError${i}`);
+        speed.title = '留空时继承任务最大 vx；本段使用任务和两端站点限速中的较小值';
+        speedError.id = `routePointSpeedError${i}`;
+        speedError.className = 'route-point-speed-error';
+        speedError.setAttribute('aria-live', 'polite');
+        speed.oninput = () => {
+          const valid = speed.validity.valid && (speed.value === '' || Number.isFinite(speed.valueAsNumber));
+          speed.setAttribute('aria-invalid', String(!valid));
+          speedError.textContent = valid ? '' : '请输入 0.1–1.2 m/s，或留空继承';
+          if (valid){
+            const current = store.routeDraft;
+            const points = current.points.map((point, j) => {
+              if (j !== i) return point;
+              const { vmax: _, ...rest } = point;
+              return speed.value === '' ? rest : { ...rest, vmax:speed.valueAsNumber };
+            });
+            const edited = { ...current, points };
+            store.routeDraft = edited;
+            if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+            if (lastDraft === current) lastDraft = edited;
+            pointSummary();
+          }
+          render();
+        };
+        speedRow.append('最大 vx', speed, 'm/s', speedError);
         // 停留（11-24）：到这一站停稳后原地等几秒再走；0 / 空 = 不停留，不停车经过（拐角小的话）。终点（单程）不需要
         const dwellRow = document.createElement('label');
         dwellRow.className = 'route-point-dwell';
@@ -380,7 +428,7 @@ export function setupRouteEditor(store, actions, setTool){
         const head = document.createElement('div');
         head.className = 'route-head';
         head.append(grip, order, label);
-        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, dwellRow, audioRow, pointNote);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, speedRow, dwellRow, audioRow, pointNote);
         return li;
       }));
     }
@@ -389,6 +437,7 @@ export function setupRouteEditor(store, actions, setTool){
     const matching = draft.map && draft.map === store.mapCurrent;
     const running = store.task.type !== 'idle' && store.task.status === 'active';
     const route = selected();
+    const invalidSpeed = [...list.querySelectorAll('.route-point-speed input')].some(input => !input.validity.valid);
     const pDirty = optsDirty(), saveNeeded = needSave();
     remove.hidden = !route;
     remove.disabled = saving || (running && store.task.routeId === route?.id);
@@ -396,7 +445,7 @@ export function setupRouteEditor(store, actions, setTool){
     confirm.disabled = !matching || draft.points.length < 2;
     saveRow.hidden = optsBox.hidden = !draft.confirmed;
     optsDirtyTag.hidden = revert.hidden = !pDirty;
-    save.disabled = saving || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
+    save.disabled = saving || invalidSpeed || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
     save.textContent = route && draft.id === route.id ? '保存修改' : '保存任务';
     // 出发按钮
     const going = store.prep?.();
@@ -407,7 +456,7 @@ export function setupRouteEditor(store, actions, setTool){
     else if (pointsDirty && draft.points.length) runMessage = draft.confirmed ? '路线改过了：先保存任务。' : '请先确认并保存当前路线。';
     else if (!runMessage && saveNeeded) runMessage = '参数改过还没保存：点「保存并出发」会先保存。';
     if (going && !going.fail) runMessage = '';
-    run.disabled = runningSelected || saving || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
+    run.disabled = runningSelected || saving || invalidSpeed || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
     const resumable = !!route?.resume && !runningSelected && !pointsDirty && !saving && !(going && !going.fail);
     renderResume(route, resumable, actions.routeGoBlocker(route) || (going && !going.fail ? '正在出发' : ''));
     const runText = runningSelected ? '导航任务执行中' : going && !going.fail ? `出发中 · ${going.name}…` : going?.fail ? '出发失败'
