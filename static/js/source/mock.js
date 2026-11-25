@@ -380,6 +380,8 @@ export function createMockSource(store, bus){
       return { ok:true };
     },
     saveRoute({ route_id, name, map, points, opts }){
+      if (points.some(p => 'forceCrossing' in p && typeof p.forceCrossing !== 'boolean')) return { ok:false, msg:'强制跨越开关需要是布尔值' };
+      if (points.filter(p => p.forceCrossing).length === 1) return { ok:false, msg:'强制跨越需要至少选择两个点，或者全部不选' };
       const id = route_id || globalThis.crypto?.randomUUID?.() || `mock-${Date.now()}-${Math.random()}`;
       const record = { id, name:name.trim(), map, points:points.map(p => ({ ...p, name:(p.name || '').trim(), note:(p.note || '').trim() })),
         opts:{ loop:false, loops:1, vmax:0.45, wmax:1.2, ...(opts || {}) } };

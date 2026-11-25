@@ -2,8 +2,9 @@
 import asyncio
 from pathlib import Path
 import sys
+from types import SimpleNamespace as NS
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -15,7 +16,9 @@ from obstacles_critic import ObstaclesCriticAPI
 class ObstaclesCriticAPITests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         app = web.Application()
-        ObstaclesCriticAPI().routes(app)
+        self.busy = False
+        self.api = ObstaclesCriticAPI(busy=lambda: self.busy)
+        self.api.routes(app)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
 
@@ -73,6 +76,74 @@ class ObstaclesCriticAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_get_is_not_allowed(self):
         response = await self.client.get('/api/obstacles-critic/true')
         self.assertEqual(response.status, 405)
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_manual_write_is_rejected_while_route_controls_parameter(self, create_process):
+        self.busy = True
+        response = await self.client.post('/api/obstacles-critic/false')
+        self.assertEqual(response.status, 409)
+        create_process.assert_not_awaited()
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_queued_manual_write_rechecks_route_after_lock(self, create_process):
+        process = Mock(returncode=0)
+        process.communicate = AsyncMock(return_value=(b'OK', b''))
+        create_process.return_value = process
+        await self.api.lock.acquire()
+        request = asyncio.create_task(self.api.set_enabled(NS(headers={}, host='localhost', path='/api/obstacles-critic/false'), False))
+        await asyncio.sleep(0)
+        self.busy = True
+        self.api.lock.release()
+        with self.assertRaises(web.HTTPConflict):
+            await request
+        create_process.assert_not_awaited()
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_missing_ros_command_returns_gateway_error(self, create_process):
+        create_process.side_effect = FileNotFoundError('ros2')
+        response = await self.client.post('/api/obstacles-critic/true')
+        self.assertEqual(response.status, 502)
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_timeout_kills_and_reaps_command(self, create_process):
+        process = Mock(returncode=None)
+        process.communicate = AsyncMock(side_effect=[asyncio.TimeoutError(), (b'', b'')])
+        create_process.return_value = process
+        response = await self.client.post('/api/obstacles-critic/true')
+        self.assertEqual(response.status, 504)
+        process.kill.assert_called_once()
+        self.assertEqual(process.communicate.await_count, 2)
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_canceled_internal_call_kills_command(self, create_process):
+        process = Mock(returncode=None)
+        process.communicate = AsyncMock(side_effect=[asyncio.CancelledError(), (b'', b'')])
+        create_process.return_value = process
+        with self.assertRaises(asyncio.CancelledError):
+            await ObstaclesCriticAPI().apply(True)
+        process.kill.assert_called_once()
+        self.assertEqual(process.communicate.await_count, 2)
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_parameter_writes_are_serialized(self, create_process):
+        entered, release = asyncio.Event(), asyncio.Event()
+        first, second = Mock(returncode=0), Mock(returncode=0)
+        async def pending():
+            entered.set()
+            await release.wait()
+            return b'OK', b''
+        first.communicate = AsyncMock(side_effect=pending)
+        second.communicate = AsyncMock(return_value=(b'OK', b''))
+        create_process.side_effect = [first, second]
+        api = ObstaclesCriticAPI()
+        one = asyncio.create_task(api.apply(True))
+        await entered.wait()
+        two = asyncio.create_task(api.apply(False))
+        await asyncio.sleep(0)
+        self.assertEqual(create_process.await_count, 1)
+        release.set()
+        self.assertEqual(await asyncio.gather(one, two), ['OK', 'OK'])
+        self.assertEqual([c.args[-1] for c in create_process.await_args_list], ['true', 'false'])
 
 
 if __name__ == '__main__':

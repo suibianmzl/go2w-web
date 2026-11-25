@@ -10,6 +10,10 @@ class ObstaclesCriticAPI:
     PARAMETER = 'FollowPath.ObstaclesCritic.enabled'
     TIMEOUT = 10.0
 
+    def __init__(self, busy=lambda: False):
+        self.lock = asyncio.Lock()
+        self.busy = busy
+
     def routes(self, app):
         app.router.add_post('/api/obstacles-critic/true', self.set_from_true)
         app.router.add_post('/api/obstacles-critic/false', self.set_from_false)
@@ -28,6 +32,19 @@ class ObstaclesCriticAPI:
     async def set_enabled(self, req, enabled):
         if not self.same_origin(req):
             raise web.HTTPForbidden(text='只接受当前网页发起的请求')
+        async with self.lock:
+            if self.busy():
+                raise web.HTTPConflict(text='导航任务正在控制强制跨越参数，请先结束任务')
+            output = await self._apply(enabled)
+        return web.json_response({'ok': True, 'requested': req.path.rsplit('/', 1)[-1],
+                                  'enabled': enabled, 'output': output})
+
+    async def apply(self, enabled):
+        """HTTP路由和后端任务共用设置入口，等待命令完成后才允许下一次设置。"""
+        async with self.lock:
+            return await self._apply(enabled)
+
+    async def _apply(self, enabled):
         value = 'true' if enabled else 'false'
         proc = None
         try:
@@ -35,15 +52,16 @@ class ObstaclesCriticAPI:
                 'ros2', 'param', 'set', self.NODE, self.PARAMETER, value,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
             if proc is not None and proc.returncode is None:
                 proc.kill()
                 await proc.communicate()
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise web.HTTPGatewayTimeout(text='设置 ROS 参数超时')
         except OSError as e:
             raise web.HTTPBadGateway(text=f'无法执行 ros2：{e.strerror or e}')
         output = (stdout or stderr).decode('utf-8', errors='replace').strip()
         if proc.returncode != 0:
             raise web.HTTPBadGateway(text=output or f'ros2 命令失败（退出码 {proc.returncode}）')
-        return web.json_response({'ok': True, 'requested': req.path.rsplit('/', 1)[-1],
-                                  'enabled': enabled, 'output': output})
+        return output

@@ -5,6 +5,7 @@ import { confirmBox } from './ui.js';
 export function setupRouteEditor(store, actions, setTool){
   const select = $('#routeSelect'), name = $('#routeName'), list = $('#routePoints');
   const save = $('#routeSave'), run = $('#routeRun'), hint = $('#routeHint'), remove = $('#routeDelete');
+  const crossingHint = $('#routeCrossingHint');
   const confirm = $('#routeConfirm'), saveRow = $('#routeSaveRow');
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
@@ -330,6 +331,25 @@ export function setupRouteEditor(store, actions, setTool){
         };
         dwell.onchange = () => { const v = Math.round(+dwell.value); dwell.value = v > 0 ? String(Math.min(3600, v)) : ''; };
         dwellRow.append('停留', dwell, '秒');
+        const crossingRow = document.createElement('label');
+        crossingRow.className = 'route-point-crossing';
+        const crossing = Object.assign(document.createElement('input'), { type:'checkbox', checked:p.forceCrossing === true });
+        crossing.setAttribute('aria-label', `第 ${i + 1} 站强制跨越`);
+        crossing.setAttribute('aria-describedby', 'routeCrossingHint');
+        crossing.onchange = () => {
+          const current = store.routeDraft;
+          const points = current.points.map((point, j) => {
+            if (j !== i) return point;
+            const { forceCrossing: _, ...rest } = point;
+            return crossing.checked ? { ...rest, forceCrossing:true } : rest;
+          });
+          const edited = { ...current, points };
+          store.routeDraft = edited;
+          if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+          render();
+          list.querySelectorAll('.route-point-crossing input')[i]?.focus({ preventScroll:true });
+        };
+        crossingRow.append(crossing, '强制跨越');
         // 播报（11-25）：到这一站在狗的喇叭上播哪段音频，列表来自底部「播报」标签里上传的
         const clips = store.audio?.items || [], audioRow = document.createElement('label');
         audioRow.className = 'route-point-audio';
@@ -428,11 +448,17 @@ export function setupRouteEditor(store, actions, setTool){
         const head = document.createElement('div');
         head.className = 'route-head';
         head.append(grip, order, label);
-        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, speedRow, dwellRow, audioRow, pointNote);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, speedRow, dwellRow, crossingRow, audioRow, pointNote);
         return li;
       }));
     }
     const preview = store.routeCheck?.draft === draft ? store.routeCheck : null;
+    const marked = draft.points.flatMap((p, i) => p.forceCrossing ? [i + 1] : []);
+    const crossingInvalid = marked.length === 1;
+    crossingHint.textContent = crossingInvalid ? '强制跨越需要至少选择两个点，或者全部不选。'
+      : marked.length ? `强制跨越：到达第 ${marked[0]} 站后开启，到达第 ${marked.at(-1)} 站后关闭，其间未选中的站点也在区间内。取消或失败时尝试关闭。`
+      : '强制跨越可不选；启用时至少选择两个点。';
+    crossingHint.classList.toggle('route-crossing-error', crossingInvalid);
     const pointsDirty = draft !== savedDraft;
     const matching = draft.map && draft.map === store.mapCurrent;
     const running = store.task.type !== 'idle' && store.task.status === 'active';
@@ -442,10 +468,10 @@ export function setupRouteEditor(store, actions, setTool){
     remove.hidden = !route;
     remove.disabled = saving || (running && store.task.routeId === route?.id);
     confirm.hidden = draft.confirmed;
-    confirm.disabled = !matching || draft.points.length < 2;
+    confirm.disabled = crossingInvalid || !matching || draft.points.length < 2;
     saveRow.hidden = optsBox.hidden = !draft.confirmed;
     optsDirtyTag.hidden = revert.hidden = !pDirty;
-    save.disabled = saving || invalidSpeed || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
+    save.disabled = crossingInvalid || saving || invalidSpeed || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
     save.textContent = route && draft.id === route.id ? '保存修改' : '保存任务';
     // 出发按钮
     const going = store.prep?.();
@@ -456,7 +482,7 @@ export function setupRouteEditor(store, actions, setTool){
     else if (pointsDirty && draft.points.length) runMessage = draft.confirmed ? '路线改过了：先保存任务。' : '请先确认并保存当前路线。';
     else if (!runMessage && saveNeeded) runMessage = '参数改过还没保存：点「保存并出发」会先保存。';
     if (going && !going.fail) runMessage = '';
-    run.disabled = runningSelected || saving || invalidSpeed || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
+    run.disabled = crossingInvalid || runningSelected || saving || invalidSpeed || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
     const resumable = !!route?.resume && !runningSelected && !pointsDirty && !saving && !(going && !going.fail);
     renderResume(route, resumable, actions.routeGoBlocker(route) || (going && !going.fail ? '正在出发' : ''));
     const runText = runningSelected ? '导航任务执行中' : going && !going.fail ? `出发中 · ${going.name}…` : going?.fail ? '出发失败'

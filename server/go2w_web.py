@@ -1560,6 +1560,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.route = None
         self.route_job = None
         self.route_starting = False
+        self.obstacles_critic = ObstaclesCriticAPI(busy=lambda: self.route_running() and (
+            self.crossing_dirty or (self.route and any(p.get('forceCrossing') for p in self.route['record']['points']))))
+        self.crossing_dirty = False
         self.goal_pending = False
         self.resume_file = os.path.join(DATA, 'route_resume.json')
         self.resumes = {}
@@ -2551,6 +2554,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if type(speed) not in (int, float) or not math.isfinite(speed) or not 0.1 <= speed <= 1.2:
                     raise ValueError('站点限速需要在 0.1–1.2 m/s 之间')
                 item['vmax'] = float(speed)
+            crossing = point.get('forceCrossing', False)
+            if type(crossing) is not bool:
+                raise ValueError('强制跨越开关需要是布尔值')
+            if crossing:
+                item['forceCrossing'] = True
             clip = point.get('audio')       # 11-25：到这一站播哪段音频（audio.py 的 id），没有 = 不播
             if clip not in (None, ''):
                 if isinstance(clip, str) and re.fullmatch('[0-9a-f]{12}', clip):
@@ -2558,6 +2566,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 elif strict:
                     raise ValueError('站点播报音频无效')
             clean.append(item)
+        if sum(p.get('forceCrossing', False) for p in clean) == 1:
+            raise ValueError('强制跨越需要至少选择两个点，或者全部不选')
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
 
@@ -2829,8 +2839,11 @@ class Server(TaughtWeb, RT.RtabWeb):
     # ---------- 任务接续（11-24） ----------
     @staticmethod
     def route_fp(record):
-        """站点指纹：只看坐标和朝向（站名、备注、速度改了不影响接续）。"""
+        """改变坐标、朝向或强制跨越区间后，旧断点不能继续使用。"""
         pts = [(round(p['x'], 3), round(p['y'], 3), round(p['th'], 3)) for p in record['points']]
+        crossing = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
+        if crossing:     # 无配置的旧路线保持原来的断点指纹
+            pts.append(crossing)
         return hashlib.sha1(json.dumps(pts).encode()).hexdigest()[:16]
 
     def resume_valid(self, rid, cp, now=None):
@@ -3523,6 +3536,30 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.node.event('WARN', f'{name}播报没播：{msg}')
         self.background(go())
 
+    async def route_crossing_set(self, route, enabled):
+        if enabled:
+            route['crossing_dirty'] = True  # 失败或超时仍可能已写入，退出时必须尝试关闭
+            self.crossing_dirty = True
+        try:
+            await self.obstacles_critic.apply(enabled)
+        except Exception as e:
+            detail = e.text if isinstance(e, web.HTTPException) else str(e)
+            raise RuntimeError(f'强制跨越{"开启" if enabled else "关闭"}失败：{detail}') from e
+        route['crossing_dirty'] = enabled
+        self.crossing_dirty = enabled
+        self.node.event('INFO', f'强制跨越：已设置 {str(enabled).lower()}（ROS 命令成功）')
+
+    async def route_crossing_arrived(self, route, state):
+        bounds = route.get('crossing')
+        if not bounds:
+            return
+        i, loop, back = state
+        if i == bounds[1]:
+            await self.route_crossing_set(route, False)
+        elif i == bounds[0] and self.route_next(len(route['record']['points']), route['loops'], state):
+            # 循环最后一次回到起点后任务结束，不再次开启。
+            await self.route_crossing_set(route, True)
+
     def through_passed(self, ws, route, seg, k):
         """连续通过：seg 里第 k 站经过了。记进度、写断点，下一站成为当前目标。"""
         n, points = self.node, route['record']['points']
@@ -3585,7 +3622,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 nxt = self.route_next(total, loops, s)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0
                 seg.append((s, self.route_pose(points, i, back), dwell, nxt))
-                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX:
+                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX or i in (route.get('crossing') or ()):
                     break
                 s = nxt
             # 这段的终点就在狗旁边（环线回到出发位置）：控制器的 goal checker 只看路径终点，一开始就满足，
@@ -3716,6 +3753,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             last_state, end_pt, dwell, nxt = seg[-1]
             here = n.lookup(BASE_FRAME)
             off = math.hypot(here[0] - end[0], here[1] - end[1]) if here and n.fixed == 'map' else None
+            if last_state[0] in (route.get('crossing') or ()) and off is None:
+                raise RuntimeError('无法确认强制跨越边界点的实际位置')
             # Nav2 报整段到了，但中间还有站狗没经过、Nav2 也没划掉（剩余点数还多于 1）：中间站不能白送，按假到达处理
             skipped = status == GoalStatus.STATUS_SUCCEEDED and k < len(seg) - 1 and not (left is not None and left <= 1)
             if status == GoalStatus.STATUS_SUCCEEDED and ((off is not None and off > ROUTE_FAKE_ARRIVE) or skipped):
@@ -3729,12 +3768,17 @@ class Server(TaughtWeb, RT.RtabWeb):
                 state = cur
                 continue
             if status != GoalStatus.STATUS_SUCCEEDED:
+                if last_state[0] in (route.get('crossing') or ()):
+                    raise RuntimeError('Nav2 未能到达强制跨越边界点')
                 if k < len(seg) - 1 or off is None or off > ROUTE_ARRIVE_TOL:
                     raise RuntimeError('Nav2 未能到达' + (f'（离第 {last_state[0] + 1} 站 {off:.2f} m）' if off is not None else ''))
                 n.event('WARN', f'第 {last_state[0] + 1} 站未精确到达（偏差 {off:.2f} m），视为已到')
             while k < len(seg) - 1:   # Nav2 到了终点：中间没来得及记的站都算经过
                 self.through_passed(ws, route, seg, k)
                 k += 1
+            await self.route_crossing_arrived(route, last_state)
+            if route['stop'].is_set():
+                return 'stop'
             self.route_audio(route, last_state[0])
             if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
                 return 'stop'
@@ -3766,7 +3810,12 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     async def run_route(self, ws, route):
         n, record = self.node, route['record']
+        selected = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
+        route['crossing'] = (selected[0], selected[-1]) if selected else None
         try:
+            if getattr(self, 'crossing_dirty', False):
+                route['crossing_dirty'] = True
+                await self.route_crossing_set(route, False)
             await self.clear_before_start()
             if route['stop'].is_set():
                 return
@@ -3776,8 +3825,15 @@ class Server(TaughtWeb, RT.RtabWeb):
             start = dict(zip(('x', 'y', 'th'), pos))
             points, loops = record['points'], route['loops']
             first = route['resume'] or (0, 1, False)
+            if route['resume'] and route['crossing'] and not first[2] and route['crossing'][0] < first[0] <= route['crossing'][1]:
+                await self.route_crossing_set(route, True)
+                if route['stop'].is_set():
+                    return
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
             if route['resume'] is None and near < ROUTE_NEAR_START:
+                await self.route_crossing_arrived(route, first)
+                if route['stop'].is_set():
+                    return
                 self.route_audio(route, 0)
                 if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
                     route.update(index=0, target=points[0])
@@ -3824,9 +3880,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                     raise RuntimeError(reason)
                 nxt = self.route_next(len(points), loops, state)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0   # 终点停不停留都一样
-                passing = (nxt is not None and not dwell and
+                passing = (nxt is not None and not dwell and i not in (route['crossing'] or ()) and
                            abs(self.route_leg_vmax(route, state) - self.route_leg_vmax(route, nxt)) < 1e-6)
-                # 限速变化处先到站，避免提前经过时解除上一段的低速约束。
+                # 跨越边界和限速变化处均先到站，避免提前解除上一段的约束。
                 if passing:
                     q = self.route_pose(points, nxt[0], nxt[2])
                     pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
@@ -3899,6 +3955,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if status == GoalStatus.STATUS_SUCCEEDED and not passed:
                     here = n.lookup(BASE_FRAME)
                     off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
+                    if i in (route['crossing'] or ()) and off is None:
+                        raise RuntimeError('无法确认强制跨越边界点的实际位置')
                     if off is not None and off > ROUTE_FAKE_ARRIVE:
                         fake = fake + 1 if fake_state == state else 1
                         fake_state = state
@@ -3907,11 +3965,16 @@ class Server(TaughtWeb, RT.RtabWeb):
                         n.event('WARN', f'第 {i + 1} 站 Nav2 报到达，但离站点还有 {off:.2f} m：不算到达，重新前往（第 {fake} 次）')
                         continue
                 if status != GoalStatus.STATUS_SUCCEEDED:
+                    if i in (route['crossing'] or ()):
+                        raise RuntimeError('Nav2 未能到达强制跨越边界点')
                     here = n.lookup(BASE_FRAME)
                     off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
                     if off is None or off > ROUTE_ARRIVE_TOL:
                         raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
                     n.event('WARN', f'第 {i + 1} 站未精确到达（偏差 {off:.2f} m），视为已到，继续下一站')
+                await self.route_crossing_arrived(route, state)
+                if route['stop'].is_set():
+                    return
                 self.route_audio(route, i)
                 if dwell and not await self.route_dwell(ws, route, i, dwell):
                     return
@@ -3924,6 +3987,13 @@ class Server(TaughtWeb, RT.RtabWeb):
             else:
                 n.event('ERROR', f'多点任务停止时出错：{e}')
         finally:
+            if route.get('crossing_dirty'):
+                try:
+                    await self.route_crossing_set(route, False)
+                except Exception as e:
+                    message = f'强制跨越恢复失败：{e}；请核对机器人参数后再出发'
+                    route['message'] = f'{route.get("message", "")}；{message}'
+                    n.event('ERROR', message)
             if route['status'] == 'succeeded':
                 try:
                     await self.apply_route_vmax(route.get('vmax', self.route_opts(record.get('opts'))['vmax']))
@@ -6232,7 +6302,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         self.recording_api.routes(app)
-        ObstaclesCriticAPI().routes(app)
+        self.obstacles_critic.routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
         app.router.add_post('/api/audio', self.api_audio)
