@@ -1,12 +1,14 @@
 // 用户操作：先按 store 做前置检查、必要时弹确认，再交给数据源执行。两种数据源共用这套规则。
 // 数据源的指令可以返回 { ok, msg }（或它的 Promise）：ROS 源以后端的回复为准，模拟源不返回就算成功
 import { toast, confirmBox, formBox } from './ui.js';
-import { deg } from './util.js';
+import { deg, isAutosave, mapTitle } from './util.js';
+import { createRollbackCapture } from './recording-capture.js';
 
 export const MODES = { mapping: '建图', localization: '定位', navigation: '导航' };
 export const MODE_PKG = { mapping: 'slam_toolbox', localization: 'map_server · AMCL', navigation: 'AMCL · Nav2 · cmd_bridge' };
 
 export function createActions(store, src){
+  const rollbackCapture = createRollbackCapture(store, src, toast);
   const run = id => store.profiles[id] === 'run';
   const curMode = () => Object.keys(MODES).find(m => store.profiles[m] !== 'stop') || null;
   const canMove = () => store.armed && !store.estop && run('navigation') && store.odomOk && store.link.ok;
@@ -47,6 +49,7 @@ export function createActions(store, src){
   });
 
   const A = {
+    rollbackCapture,
     canMove, canTeleop, curMode, routeStartBlocker, routeGoBlocker, walking,
     // 站起：趴着 → 站稳 → 策略接管（后端一步步等运控的状态）
     standUp(){
@@ -72,6 +75,18 @@ export function createActions(store, src){
         body: `从 ${C.policy || '（未知）'} 切到 ${name}。运控会重启几秒钟，期间机器狗保持趴着。不同策略站高不同：站起来后要重新定位，建图 / 续建请用同一个策略。重启扩展坞后会恢复为默认策略。`,
         onOk: () => exec(src.cmd.setPolicy(name), null).finally(() => onDone?.()),
         onCancel: () => onDone?.() });
+    },
+    // 爬台模式（融合策略）：开着时后端一直续约 2101；关掉、网页断开、急停、趴下、超时都会切回 rough
+    climb(on){
+      const C = store.ctrl;
+      if (!ready('climb')) return;
+      if (!on) return exec(src.cmd.climb(false), null);
+      if (store.estop) return toast('急停中：先解除急停', 'err');
+      if (!(C?.state === 'Velocity' && C.ready) || C.op) return toast('只能站着（策略运行中）开爬台模式', 'err');
+      const max = Math.round((C.dual && C.climb?.max) || 300);
+      confirmBox({ title: '开爬台模式', ok: '开启',
+        body: `运控切到 climb 策略（约 0.5 s 过渡）。速度要在 vx ≤ 0.5、vy ≤ 0.15、wz ≤ 0.15 以内才会切，超了先挂起、降下来自动切；建议先停稳再开。上台用遥控器或网页摇杆慢慢走。关掉、网页断开、急停、趴下或开满 ${Math.round(max / 60)} 分钟都会自动切回 rough。开着时不能发导航任务。`,
+        onOk: () => exec(src.cmd.climb(true), null) });
     },
     // fine = 重定位的微调：后端用小协方差，AMCL 不会把粒子撒开
     initialPose(p, fine = false){
@@ -103,8 +118,35 @@ export function createActions(store, src){
       const draft = store.routeDraft, map = store.mapCurrent;
       if (!map || !store.map) return toast('还没有地图：先在第 1 步选择地图', 'err');
       if (draft.map && draft.map !== map) return toast('路线属于另一张地图，请先新建路线', 'err');
-      if (draft.points.length >= 50) return toast('每条路线最多 50 个点', 'err');
+      const k = store.routeReplace;
+      const replacing = Number.isInteger(k) && k >= 0 && k < draft.points.length;
+      if (!replacing && draft.points.length >= 50) return toast('每条路线最多 50 个点', 'err');
       if (store.costAt && blocked(store.costAt(p.x, p.y))) return toast('该位置在障碍物或膨胀区内', 'err');
+      if (replacing){
+        // 只换这一站的位置和朝向，站名、备注、顺序不变；和前后站重合的不收
+        const near = [draft.points[k - 1], draft.points[k + 1]].some(q => q && Math.hypot(p.x - q.x, p.y - q.y) < .05);
+        if (near) return toast('和相邻的站重合了，换个位置', 'warn');
+        const points = draft.points.map((q, j) => j === k ? { ...q, x:p.x, y:p.y, th:p.th, manualHeading:p.manualHeading } : q);
+        store.routeDraft = { ...draft, map, points, confirmed: false };
+        store.routeReplace = null;
+        toast(`第 ${k + 1} 点已改到新位置，确认路线后保存`, 'ok');
+        store.onRouteEdit?.();
+        return true;
+      }
+      const at = store.routeInsert;
+      if (Number.isInteger(at) && at >= 0 && at < draft.points.length){
+        // 插入：新站放在下标 at（原来的第 at 站之后），后面的站顺延；插完继续在新站后面插，方便连着插几站
+        const near = [draft.points[at - 1], draft.points[at]].some(q => q && Math.hypot(p.x - q.x, p.y - q.y) < .05);
+        if (near) return toast('和相邻的站重合了，换个位置', 'warn');
+        const points = [...draft.points];
+        points.splice(at, 0, p);
+        store.routeDraft = { ...draft, map, points, confirmed: false };
+        store.routeInsert = at + 1;
+        toast(`已插入为第 ${at + 1} 站，可以接着点下一站，Esc 结束`, 'ok');
+        store.onRouteEdit?.();
+        return 'insert';
+      }
+      store.routeInsert = null;
       const last = draft.points.at(-1);
       if (last && Math.hypot(p.x - last.x, p.y - last.y) < .05) return toast('这一站已添加', 'warn');
       store.routeDraft = { ...draft, map, points: [...draft.points, p], confirmed: false };
@@ -134,7 +176,7 @@ export function createActions(store, src){
     startRoute(route, opts = {}){
       const reason = routeStartBlocker(route);
       if (reason) return toast(reason, 'err');
-      const go = () => exec(src.cmd.startRoute(route.id, { ...opts, arm: true }), '底盘已解锁，任务已出发');
+      const go = () => exec(src.cmd.startRoute(route.id, { ...opts, arm: true }), opts.resume ? '底盘已解锁，任务已接续' : '底盘已解锁，任务已出发');
       const R = store.robot, m = store.loc.match;
       if (m == null || m >= 60) return go();
       return new Promise(resolve => formBox({ title: '定位可能不准', ok: '仍然出发', danger: true,
@@ -308,6 +350,11 @@ export function createActions(store, src){
       store.mapSaving = true;
       return exec(src.cmd.editMap(p), null).finally(() => { store.mapSaving = false; });
     },
+    // 禁行区（v1.1.8）：存到这张图上（不生成新图）；导航正在用这张图时后端马上热加载
+    saveKeepout(map, shapes){
+      if (!ready('saveKeepout')) return Promise.resolve({ ok: false });
+      return exec(src.cmd.saveKeepout(map, shapes), null);
+    },
     loadMap(name, { confirmed = false } = {}){
       if (store.mapSaving || store.mapBusy) return toast('地图正在保存，请稍等', 'warn');
       if (!ready('loadMap')) return;
@@ -315,8 +362,35 @@ export function createActions(store, src){
       if (src.name === 'ros' && !live) return exec(src.cmd.loadMap(name), null);   // 没在跑：只是选好下次启动用的地图
       // 调用方已经把后果说清楚并让用户勾选过（地图编辑「保存后切换」）：不再弹第二个确认框
       if (confirmed) return exec(src.cmd.loadMap(name), src.name === 'mock' ? `已加载 ${name}（模拟模式仍显示示例地图）` : null);
-      confirmBox({ title: `切换到地图 ${name}`, body: 'map_server 会立即加载这张地图，正在执行的导航会取消。切换后要重新设置初始位姿。', ok: '切换',
+      confirmBox({ title: `切换到地图 ${mapTitle(store.mapLabels, name)}`, body: 'map_server 会立即加载这张地图，正在执行的导航会取消。切换后要重新设置初始位姿。', ok: '切换',
         onOk: () => exec(src.cmd.loadMap(name), src.name === 'mock' ? `已加载 ${name}（模拟模式仍显示示例地图）` : null) });
+    },
+    // 地图改名（11-23）：只改网页显示名，可以中文；data/maps 文件名、任务、云端都不受影响，所以正在用的图也能改
+    renameMap(name){
+      if (!name) return toast('先在下拉框里选一张地图', 'warn');
+      if (!ready('setMapLabel')) return;
+      const cur = store.mapLabels?.[name] || '';
+      formBox({ title: '地图改名', ok: '保存',
+        body: '只改网页上显示的名字，可以用中文。地图文件名不变，导航、任务、云端调度照常用文件名，正在导航用的图也可以改。',
+        rows: [['文件名', name]],
+        build: form => {
+          form.innerHTML = `<div class="modal-label">显示名</div>
+            <input class="modal-select" data-label maxlength="32" placeholder="例如：一楼实验室（留空 = 显示文件名）">
+            <div class="mapdel-sum" data-err></div>`;
+          const inp = form.querySelector('[data-label]');
+          inp.value = cur;
+          setTimeout(() => { inp.focus(); inp.select(); }, 0);
+          inp.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); form.closest('.modal').querySelector('[data-a=o]').click(); } });
+        },
+        valid: form => {
+          const v = form.querySelector('[data-label]').value.trim().replace(/\s+/g, ' ');
+          const bad = /[<>"'\\/]/.test(v) ? '不能有 < > " \' \\ / 这些符号'
+            : Object.entries(store.mapLabels || {}).some(([k, l]) => k !== name && l === v) ? '另一张地图已经叫这个名字了'
+            : v !== name && store.maps.some(m => m.name === v) ? '这是另一张地图的文件名' : '';
+          form.querySelector('[data-err]').textContent = bad;
+          return !bad && v !== cur && !(v === name && !cur);
+        },
+        onOk: form => exec(src.cmd.setMapLabel(name, form.querySelector('[data-label]').value), null) });
     },
     // 管理地图：勾选多张一起删（后端挪进 data/maps/.trash，14 天后清掉），绑在这些图上的任务一起删
     manageMaps(){
@@ -334,13 +408,14 @@ export function createActions(store, src){
       formBox({ title: `管理地图（${maps.length} 张）`, ok: '删除所选', danger: true,
         build: form => {
           form.closest('.modal').classList.add('modal-wide');
-          const auto = maps.filter(m => /^autosave_/.test(m.name) && !lock(m)).length;
-          form.innerHTML = `<div class="mapdel-bar"><input class="modal-select" data-q placeholder="筛选地图名…">
+          const auto = maps.filter(m => isAutosave(m.name) && !lock(m)).length;
+          form.innerHTML = `<div class="mapdel-bar"><input class="modal-select" data-q placeholder="筛选地图名 / 显示名…">
               <button type="button" class="btn sm ghost" data-auto ${auto ? '' : 'disabled'}>选中自动保存（${auto}）</button>
               <button type="button" class="btn sm ghost" data-none>全不选</button></div>
             <div class="mapdel-list">${maps.map((m, i) => { const l = lock(m), r = nRoutes(m.name);
-              return `<label class="mapdel-it${l ? ' locked' : ''}" data-n="${esc(m.name)}"><input type="checkbox" data-i="${i}" ${l ? 'disabled' : ''}>
-                <span class="n">${esc(m.name)}</span>${l ? `<em class="tag">${l}</em>` : m.cur || m.name === store.mapCurrent ? '<em class="tag dim">当前显示</em>' : ''}
+              const lb = store.mapLabels?.[m.name];
+              return `<label class="mapdel-it${l ? ' locked' : ''}" data-n="${esc(m.name + ' ' + (lb || ''))}"><input type="checkbox" data-i="${i}" ${l ? 'disabled' : ''}>
+                <span class="n">${lb ? `<span class="lb">${esc(lb)}</span> ` : ''}${esc(m.name)}</span>${l ? `<em class="tag">${l}</em>` : m.cur || m.name === store.mapCurrent ? '<em class="tag dim">当前显示</em>' : ''}
                 <span class="m">${mb(m.size)}${m.mtime ? ' · ' + when(m.mtime) : ''}${r ? ` · <b>${r} 个任务</b>` : ''}</span></label>`; }).join('')}</div>
             <div class="mapdel-sum" data-sum>勾选要删除的地图</div>`;
           const boxes = [...form.querySelectorAll('input[data-i]')];
@@ -352,7 +427,7 @@ export function createActions(store, src){
           const fire = () => form.dispatchEvent(new Event('change'));
           form.querySelector('[data-q]').oninput = e => { const q = e.target.value.trim().toLowerCase();
             form.querySelectorAll('.mapdel-it').forEach(el => el.hidden = !!q && !el.dataset.n.toLowerCase().includes(q)); };
-          form.querySelector('[data-auto]').onclick = () => { boxes.forEach(b => { if (!b.disabled && /^autosave_/.test(maps[+b.dataset.i].name)) b.checked = true; }); fire(); };
+          form.querySelector('[data-auto]').onclick = () => { boxes.forEach(b => { if (!b.disabled && isAutosave(maps[+b.dataset.i].name)) b.checked = true; }); fire(); };
           form.querySelector('[data-none]').onclick = () => { boxes.forEach(b => b.checked = false); fire(); };
           form.addEventListener('change', sum);
         },
@@ -368,6 +443,10 @@ export function createActions(store, src){
       confirmBox({ title:'删除录包', body:`确定删除 data/bags/${bag.name}（${size}）？删除后无法恢复。`, ok:'删除', danger:true,
         onOk: () => exec(src.cmd.deleteBag(bag.name), `已删除录包 ${bag.name}`) });
     },
+    setTaughtNav(on){
+      if (!ready('setTaughtNav')) return;
+      return exec(src.cmd.setTaughtNav(on), null);
+    },
     setRollback(on){
       if (!ready('setRollback')) return;
       store.rollback = { ...store.rollback, on };
@@ -375,7 +454,7 @@ export function createActions(store, src){
     },
     saveRollback(){
       if (!ready('saveRollback')) return;
-      exec(src.cmd.saveRollback(), null);
+      return rollbackCapture.save();
     },
     uploadBag(bag){
       if (!ready('uploadBag')) return;

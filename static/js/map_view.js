@@ -4,6 +4,8 @@ import { on } from './layers.js';
 import { toast } from './ui.js';
 import { rotatePoint, wallAngle, screenToWorld } from './map_alignment.js';
 import { createMapEditor } from './map_edit.js';
+import * as KO from './keepout.js';
+import { continuousRuns } from './taught_geometry.js';
 
 export function createMapView(store, actions){
   const cv = $('#map'), ctx = cv.getContext('2d'), stage = $('#stage');
@@ -13,7 +15,7 @@ export function createMapView(store, actions){
   const alignment = () => store.alignment;
   // 地图显示方向：每张地图一个角度，存在后端（store.mapViews）。建图时还没有地图名，用 MAPPING_VIEW 暂存
   const MAPPING_VIEW = '_mapping', SNAP = 3 * Math.PI / 180, QUARTER = Math.PI / 2;
-  let viewKey = null, savedAngle = null;
+  let viewKey = null, savedAngle = null, fitKey = null;   // fitKey：上次按哪张图复位过视角（连接断开等短暂 null 不算换图）
   const currentKey = () => store.mapCurrent || (actions.curMode() === 'mapping' ? MAPPING_VIEW : null);
   const wrapPi = a => Math.atan2(Math.sin(a), Math.cos(a));
   const flash = () => { alignment().flashUntil = performance.now() + 2500; };
@@ -32,8 +34,9 @@ export function createMapView(store, actions){
   const POSE_TOOLS = { init: '初始位姿' };
   const hint = $('#aimHint');
   // 地图编辑（v1.0.2）：编辑模式下地图图层换成编辑中的那份，指针交给编辑器
-  const editor = createMapEditor(store, actions, { exit: () => setTool('pan') });
+  const editor = createMapEditor(store, actions, { exit: () => setTool('pan'), onHint: () => showHint() });
   function showHint(){
+    if (V.tool === 'taught'){ hint.hidden = false; hint.textContent = '沿已保存的琥珀轨迹，点选区间起点和终点 · 序号也可在右栏填写'; return; }
     if (V.tool === 'edit'){ hint.hidden = !editor.hint; hint.textContent = editor.hint; return; }
     if (V.tool === 'align'){
       hint.hidden = false;
@@ -42,7 +45,10 @@ export function createMapView(store, actions){
     }
     if (V.tool === 'route'){
       hint.hidden = false;
-      hint.textContent = '点击添加一站 · 按住拖拽指定到站朝向';
+      const k = store.routeReplace, at = store.routeInsert;
+      hint.textContent = Number.isInteger(k) ? `给第 ${k + 1} 点重新选位置：点击地图 · 按住拖拽指定朝向 · Esc 取消`
+        : Number.isInteger(at) ? `在第 ${at} 站和第 ${at + 1} 站之间插入新站：点击地图 · 按住拖拽指定朝向 · 可连续插入 · Esc 结束`
+        : '点击添加一站 · 按住拖拽指定到站朝向';
       return;
     }
     const name = POSE_TOOLS[V.tool];
@@ -97,7 +103,8 @@ export function createMapView(store, actions){
       if (key === null) return;           // 暂时不知道是哪张图（连接断开、档位切换中）：保持当前方向
       clearWall();
       alignment().angle = saved; syncCompass();
-      fit();
+      // 真换了图才复位视角（之前的缩放 / 平移作废，新图来了照样自动适配）；断线重连回到同一张图保持用户的缩放
+      if (key !== fitKey || !touched){ fitKey = key; touched = false; fit(); }
     } else if (key !== null && saved !== savedAngle){
       savedAngle = saved;
       if (V.drag?.tool !== 'rot'){ alignment().angle = saved; flash(); syncCompass(); }
@@ -111,7 +118,29 @@ export function createMapView(store, actions){
   }
 
   function polyline(arr, step = 2){ ctx.beginPath(); for (let i=0;i<arr.length;i+=step){ const x = sx(arr[i]), y = sy(arr[i+1]); i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); } }
-  function drawPin(p, label, col, showHeading = true){
+  function drawTaught(){
+    if (!on('taught')) return;
+    const d = store.taughtByMap[store.mapCurrent] || (store.taught?.map === store.mapCurrent ? store.taught : null);
+    if (!d) return;
+    const line = (points,col,dash,width) => {
+      ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.lineCap = ctx.lineJoin = 'round';
+      // continuous_id 是实际采样连续段；断线/暂停产生的断口必须 moveTo，不能凭视觉把两端连成实测线。
+      for (const run of continuousRuns(points)){
+        ctx.beginPath(); run.forEach((p,i)=>i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y))); ctx.stroke();
+        if (run.length === 1){ ctx.beginPath(); ctx.arc(sx(run[0].x),sy(run[0].y),2.5,0,Math.PI*2); ctx.fill(); }
+      }
+      ctx.restore();
+    };
+    line(d.points,'#f3b13f',[7,5],2.5);
+    const range = store.taughtRange;
+    if (range?.map === d.map && Number.isInteger(range.start) && Number.isInteger(range.end) && range.start < range.end){
+      line(d.points.slice(range.start,range.end+1),'#ffe4a6',[],4);
+      for (const i of [range.start,range.end]){ const p = d.points[i]; if (p) drawPin({...p,th:p.yaw},String(i+1),'#ffe4a6',false); }
+    }
+    if (d.capture?.map === store.mapCurrent && !['finished','abandoned'].includes(d.capture.state)) line(d.capture.points,'#38e1dc',[],3.5);
+  }
+  // badge：编号框右边的小标签（11-24 站点停留「停 N s」）
+  function drawPin(p, label, col, showHeading = true, badge = ''){
     const x = sx(p.x), y = sy(p.y);
     ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
     ctx.globalAlpha = .25; ctx.beginPath(); ctx.arc(x, y, 10, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
@@ -119,8 +148,16 @@ export function createMapView(store, actions){
     if (showHeading){ ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(-p.th)*20, y + Math.sin(-p.th)*20); ctx.stroke(); }
     ctx.fillStyle = '#04070c'; ctx.beginPath(); ctx.roundRect(x-9, y-32, 18, 18, 4); ctx.fill(); ctx.stroke();
     ctx.fillStyle = col; ctx.font = '600 11px "Chakra Petch",sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, x, y-23);
-    ctx.beginPath(); ctx.moveTo(x, y-14); ctx.lineTo(x, y-4); ctx.stroke(); ctx.restore();
+    ctx.beginPath(); ctx.moveTo(x, y-14); ctx.lineTo(x, y-4); ctx.stroke();
+    if (badge){
+      ctx.font = '600 10px "JetBrains Mono",monospace'; ctx.textAlign = 'left';
+      const w = ctx.measureText(badge).width + 8;
+      ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(x+11, y-31, w, 16, 4); ctx.fill();
+      ctx.fillStyle = '#04070c'; ctx.fillText(badge, x+15, y-23);
+    }
+    ctx.restore();
   }
+  const DWELL_COL = '#ff9f5a';
   function drawArrow(x0, y0, x1, y1, col){
     ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.5;
     ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
@@ -261,7 +298,10 @@ export function createMapView(store, actions){
         for (let i=0, k=0; i<pts.length; i+=2, k++) if (ok[k] === want) ctx.fillRect(sx(pts[i])-1.6, sy(pts[i+1])-1.6, 3.2, 3.2); }
     } else if (on('scan')){ const sc = store.scan; ctx.fillStyle = '#fff'; for (let i=0;i<sc.length;i+=2) ctx.fillRect(sx(sc[i])-1.2, sy(sc[i+1])-1.2, 2.4, 2.4); }
     // 小车画在路线下面：路径、局部轨迹、站点、目标点都压在车上，导航时路线更显眼
+    // 禁行区（v1.1.8）：编辑中由编辑器画工作副本，平时画这张图已保存的
+    if (!editor.active && on('keepout')) KO.draw(ctx, sx, sy, (store.keepouts || {})[store.mapCurrent], view.s);
     if (R.valid) drawRobot();
+    drawTaught();
     const P = store.plan;
     if (P && on('plan')){
       const pts = P.pts, k = Math.min(store.planIdx, pts.length-1);
@@ -288,8 +328,19 @@ export function createMapView(store, actions){
         }
         ctx.restore();
       }
+      const at = store.routeInsert;
+      if (Number.isInteger(at) && V.tool === 'route' && draft.points[at - 1] && draft.points[at]){
+        // 插入模式：把新站要插进去的那一段标成蓝色虚线
+        const a = draft.points[at - 1], b = draft.points[at];
+        ctx.save(); ctx.strokeStyle = '#6fb6ff'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
+        ctx.beginPath(); ctx.moveTo(sx(a.x), sy(a.y)); ctx.lineTo(sx(b.x), sy(b.y)); ctx.stroke(); ctx.restore();
+      }
+      // 颜色：蓝 = 正在改位置，橙 = 设了停留（11-24），绿 = 终点，黄 = 直接经过
       draft.points.forEach((p, i) => drawPin(p, String(i + 1),
-        draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false));
+        store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
+          : p.dwell > 0 ? DWELL_COL
+          : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false,
+        p.dwell > 0 ? `停${p.dwell}s` : ''));
     }
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();
@@ -342,6 +393,7 @@ export function createMapView(store, actions){
       Object.assign(alignment(), { points:[], target:null, source:null });
     }
     if (tool==='teleop' && V.tool!=='teleop' && onTeleop && !onTeleop()) return;
+    if (tool !== 'route') store.routeReplace = store.routeInsert = null;   // 离开「导航点」= 取消重选位置 / 插入
     V.tool = tool; $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool===tool));
     $('#teleHint').hidden = tool!=='teleop'; if (tool!=='measure') V.measure = [];
     V.aim = null; showHint();
@@ -377,6 +429,14 @@ export function createMapView(store, actions){
     if (V.tool === 'edit' && e.button === 0){ const p = world(px, py); if (editor.down(p.x, p.y)){ V.drag = { tool: 'edit' }; return; } }
     if (V.tool==='pan' || V.tool==='teleop' || V.tool==='edit' || e.button===1){ V.drag = { tool:'pan', px, py, cx:view.cx, cy:view.cy }; cv.style.cursor = 'grabbing'; stopFollow(); return; }
     const {x,y} = world(px,py);
+    if (V.tool === 'taught'){
+      const d = store.taughtByMap[store.mapCurrent] || store.taught;
+      if (d?.map !== store.mapCurrent) return;
+      let best = -1, distance = 16/view.s;
+      (d.points || []).forEach((p,i)=>{ const r = Math.hypot(p.x-x,p.y-y); if (r < distance){ distance = r; best = i; } });
+      if (best >= 0) store.onTaughtPoint?.(best); else toast('请点在已保存轨迹的端点附近，也可在右栏输入序号','warn');
+      return;
+    }
     if (V.tool === 'align'){
       if (!inMap(x,y)) return toast('请在地图范围内选墙', 'warn');
       const points = alignment().points;
@@ -433,7 +493,10 @@ export function createMapView(store, actions){
     if (d.tool === 'route'){
       if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
       const th = d.moved ? Math.atan2(d.y1 - d.y0, d.x1 - d.x0) : 0;
-      return actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved });
+      const r = actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved });
+      if (r === true) setTool('pan');   // 改完一站就退出，免得下一下误加新站
+      else showHint();                  // 插入后提示条跟着换成下一段
+      return;
     }
     if (d.moved) return commit(d.tool, d.x0, d.y0, d.x1, d.y1);           // 按住拖动
     if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
@@ -463,5 +526,15 @@ export function createMapView(store, actions){
   // 屏幕方向（像素，y 向下）→ 地图里的单位向量：地图可能转了显示角度
   const screenDir = (dx, dy) => rotatePoint({ x: dx, y: -dy }, -alignment().angle);
   cv.addEventListener('pointerleave', () => editor.leave());
-  return { draw, fit, resize, setTool, resetAlignment, alignWall, screenDir, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
+  function leaveEdit(next){
+    if (V.tool !== 'edit') return true;
+    if (!editor.close(() => { setTool('pan'); next(); })) return false;
+    setTool('pan'); return true;
+  }
+  // 收到新的 /map：用户没动过视角才自动适配。建图时 slam_toolbox 每 ~2 s 发一次，
+  // 以前无条件 fit()，放大了几秒就被拉回全图
+  function onMap(){ if (!touched) fit(); }
+  // 右栏「禁行区」按钮：打开地图编辑并直接进禁行区页
+  function openKeepout(){ if (V.tool !== 'edit') setTool('edit'); return editor.openKeep(); }
+  return { draw, fit, onMap, resize, setTool, resetAlignment, alignWall, screenDir, leaveEdit, openKeepout, TOOLS, view, editKey: e => editor.key(e), get tool(){ return V.tool; } };
 }

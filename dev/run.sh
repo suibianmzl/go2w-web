@@ -11,15 +11,22 @@
 # 存图、录包写进数据副本 ~/.cache/go2w_web_data（第一次运行从 GO2W_MAPS_SRC，默认 ../data/maps 复制），不碰仓库里的 data/。
 # 想从头再来：rm -rf ~/.cache/go2w_web_data
 #
-# 环境变量：GO2W_MAPS_SRC（地图来源目录），PORT（默认 8080）、GO2W_FAKE_STAMP_RATE（/odom 时间戳走速倍数，默认 1.0）
+# 环境变量：GO2W_MAPS_SRC（地图来源目录），GO2W_NAV_SOURCE（共享示教包源码目录），
+# PORT（默认 8080）、GO2W_FAKE_STAMP_RATE（/odom 时间戳走速倍数，默认 1.0）
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VENV=${GO2W_WEB_VENV:-$HOME/.cache/go2w_web_venv}
-if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c 'import aiohttp, numpy' 2>/dev/null; then
-  echo "第一次运行：在 $VENV 建 Python 环境（aiohttp、numpy）……"
+if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c 'import aiohttp, numpy, scipy, yaml' 2>/dev/null; then
+  echo "准备 $VENV Python 环境（aiohttp、numpy、scipy、PyYAML）……"
   python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q aiohttp numpy
+  "$VENV/bin/pip" install -q aiohttp numpy scipy PyYAML
+fi
+
+NAV_SOURCE=${GO2W_NAV_SOURCE:-$PWD/../go2w/src/navigation/go2w_taught_route}
+if [ ! -d "$NAV_SOURCE/go2w_taught_route" ]; then
+  echo "找不到共享示教包：$NAV_SOURCE。用 GO2W_NAV_SOURCE 指定 go2w_taught_route 源码包目录" >&2
+  exit 1
 fi
 
 DATA=${GO2W_DATA:-$HOME/.cache/go2w_web_data}
@@ -44,6 +51,6 @@ echo "按 Ctrl+C 停止"
 CAM_PORT=$((PORT + 9100))
 GO2W_FAKE_CAM_PORT=$CAM_PORT "$VENV/bin/python" dev/fake_camera.py & CAM_PID=$!
 trap 'kill $CAM_PID 2>/dev/null' EXIT
-env PYTHONPATH="$PWD/dev/fake_ros" GO2W_FAKE_MAP="$MAP" GO2W_DATA="$DATA" GO2W_FAKE_PROCS=1 \
+env PYTHONPATH="$PWD/dev/fake_ros:$NAV_SOURCE${PYTHONPATH:+:$PYTHONPATH}" GO2W_FAKE_MAP="$MAP" GO2W_DATA="$DATA" GO2W_FAKE_PROCS=1 \
   GO2W_CAM_ADDR="127.0.0.1:$CAM_PORT" \
   "$VENV/bin/python" server/go2w_web.py --port "$PORT"

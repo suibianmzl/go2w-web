@@ -2,12 +2,15 @@
 // P0：地图、位姿、scan、健康状态；P1：初始位姿、导航目标、取消、解锁 / 上锁、急停、调参、心跳
 // P2：代价地图、全局路径、局部轨迹（按 /cmd_vel 外推）、点云、AMCL 粒子、/rosout 日志
 import { gridToCanvas, costToCanvas, wallMask, CLOUD } from '../util.js';
+import { storeTaughtDocument } from '../taught_geometry.js';
 
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback',
-  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume']);
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
+  'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
+  'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
+  'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
 const NOT_YET = {
   pause: '真机暂不支持暂停：可以取消任务，或者锁定底盘',
 };
@@ -59,7 +62,9 @@ export function createRosSource(store, bus){
       store.link = { ok: false, ms: null };
       store.robotOnline = false;
       store.robot.valid = false; store.odomOk = false; store.armed = null;
-      for (const [, res] of pending) res({ ok: false, msg: '和后端的连接断开了' });
+      // 断线后清掉浏览器保存的遥控速度，重连必须重新操作；不能让旧的续发器在新连接上继续发速度。
+      teleCmd = null; if (teleTimer){ clearInterval(teleTimer); teleTimer = null; }
+      for (const [, res] of pending) res({ ok: false, uncertain: true, msg: '和后端的连接断开了' });
       pending.clear();
       if (camWanted) bus.emit('cam', { state: 'disconnected' });
       setTimeout(connect, 1000);
@@ -72,7 +77,7 @@ export function createRosSource(store, bus){
       const id = ++seq;
       pending.set(id, resolve);
       ws.send(JSON.stringify({ t: 'cmd', id, op, ...args }));
-      setTimeout(() => { if (pending.delete(id)) resolve({ ok: false, msg: '后端没有回复（超时）' }); }, timeout);
+      setTimeout(() => { if (pending.delete(id)) resolve({ ok: false, uncertain: true, msg: '后端没有回复（超时）' }); }, timeout);
     });
   }
 
@@ -120,14 +125,17 @@ export function createRosSource(store, bus){
         break;
       }
       case 'cam': bus.emit('cam', m); break;
-      case 'ack': { const res = pending.get(m.id); if (res){ pending.delete(m.id); res({ ok: m.ok, msg: m.msg, data: m.data }); } break; }
+      case 'ack': { const res = pending.get(m.id); if (res){ pending.delete(m.id); res({ ok: m.ok, msg: m.msg, data: m.data, ...(m.data?.uncertain ? { uncertain: true } : {}) }); } break; }
       case 'log': log(m.level, m.node, m.msg); break;
       case 'logs': for (const [lv, node, msg] of m.items) log(lv, node, msg); break;
       case 'plan': rawPlan = m.pts.length > 1 ? m.pts : null; break;
       case 'toast': bus.emit('toast', m.msg, m.level || 'warn'); break;
       case 'msg': for (const cb of watchers.get(m.topic) || []) cb(m); break;
       case 'routes': store.routes = m.items; break;
+      case 'taught': storeTaughtDocument(store, m); break;
       case 'map_views': store.mapViews = m.items || {}; break;
+      case 'map_labels': store.mapLabels = m.items || {}; break;
+      case 'keepout': store.keepouts = m.items || {}; break;
       case 'task': onTask(m.task); break;
       case 'pose': {
         const R = store.robot;
@@ -175,7 +183,13 @@ export function createRosSource(store, bus){
         store.contPaused = !!m.contPaused;
         store.contBusy = !!m.contBusy;
         store.autosave = m.autosave || null;
+        store.lidar = m.lidar || null;   // 后端判定的雷达无数据：{ since, msg（含网络诊断） }
+        store.rtab = m.rtab || null;     // RTAB 影子库：{ avail, auto, cur, last, pending, map, mapDb }
         store.webVersion = m.webVersion || null;
+        store.keepoutState = m.keepout || null;
+        store.taughtAvailable = typeof m.taughtAvailable === 'boolean' ? m.taughtAvailable : null;
+        store.taughtNavigation = typeof m.taughtNavigation === 'boolean' ? m.taughtNavigation : null;
+        store.taughtNav = m.taughtNav || null;   // 「启用示教导航」开关：{ on, forced: '0'/'1'/null, installed }
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
@@ -233,6 +247,16 @@ export function createRosSource(store, bus){
   }
 
   const real = {
+    taughtGet: map => send('taught_get', { map }),
+    taughtSave: p => send('taught_save', p, 125000),
+    taughtPrepare: map => send('taught_prepare', { map }, 15000),
+    taughtCheck: map => send('taught_check', { map }, 35000),
+    taughtStart: p => send('taught_start', p, 35000),
+    taughtPause: session_id => send('taught_pause', { session_id }),
+    taughtResume: session_id => send('taught_resume', { session_id }, 35000),
+    taughtFinish: session_id => send('taught_finish', { session_id }, 125000),
+    taughtAbandon: session_id => send('taught_abandon', { session_id }),
+    taughtStatus: map => send('taught_status', map ? { map } : {}),
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
     autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
     autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）
@@ -254,15 +278,21 @@ export function createRosSource(store, bus){
     lieDown: () => send('lie_down', {}, 15000),
     standHold: on => send('stand_hold', { on }),
     setPolicy: name => send('set_policy', { name }, 60000),   // 停运控 + 重启 + 等状态，失败还要退回
+    climb: on => send('climb', { on }),
     prepHold: () => send('prep_hold'),
     deleteRoute: route_id => send('route_delete', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
     deleteMaps: names => send('map_delete', { names }, 60000),
+    setMapLabel: (name, label) => send('map_label', { name, label }),
+    saveKeepout: (map, shapes) => send('keepout_save', { map, shapes }, 20000),
     uploadBag: name => send('bag_upload', { name }),
     setRollback: on => send('rollback_set', { on }),
-    saveRollback: () => send('rollback_save', {}, 25000),
+    setTaughtNav: on => send('set_taught_nav', { on }),
+    saveRollback: (request_id, voice_seconds) => send('rollback_save', { request_id, voice_seconds }, 40000),
     // vmax / wmax：这次的速度上限（导航没开时在网页上选的），后端出发前设给 cmd_bridge
+    // resume：'continue' 从断点那站接着跑 / 'skip' 跳过断点那站（11-24）；接续时后端用断点里的圈数，不看 round_trip / loops
     startRoute: (route_id, o = {}) => send('route_start', { route_id, round_trip: !!o.roundTrip, loops: o.loops ?? 1, arm: !!o.arm,
+      ...(o.resume ? { resume: o.resume } : {}),
       ...(o.vmax != null ? { vmax: o.vmax } : {}), ...(o.wmax != null ? { wmax: o.wmax } : {}) }),
     saveMap: name => send('save_map', { name }, 45000),
     alignMap: (source, name, angle) => send('align_map', { source, name, angle }, 125000),
@@ -277,6 +307,13 @@ export function createRosSource(store, bus){
     contFinish: reason => send('cont_finish', { reason }, 45000),
     contAbort: () => send('cont_abort', {}),
     contParking: (base, clear) => send('cont_parking', clear ? { base, clear: true } : { base }),
+    // RTAB 影子库：建图同步录 / 局部重扫（停止要等 rtabmap 存完库，最多 120 s）
+    rtabStart: () => send('rtab_start', {}, 15000),
+    rtabContinue: (map, force) => send('rtab_continue', { map, ...(force ? { force: true } : {}) }, 30000),
+    rtabPause: () => send('rtab_pause', {}, 35000),
+    rtabResume: () => send('rtab_resume', {}, 35000),
+    rtabStop: () => send('rtab_stop', {}, 130000),
+    rtabAuto: on => send('rtab_auto', { on }),
     // 键盘遥控：按住时每 0.1 s 发一次（后端 0.3 s 收不到就发零速）；松手立即发零
     teleop: k => {
       teleCmd = k;
@@ -285,11 +322,11 @@ export function createRosSource(store, bus){
       if (k && !teleTimer) teleTimer = setInterval(tx, 100);
       if (!k && teleTimer){ clearInterval(teleTimer); teleTimer = null; }
     },
-    // 真实测试：停发心跳 3 s，后端应在超时后取消导航并上锁
+    // 真实测试：停发心跳 7 s，后端应在超时（5 s）后取消导航并上锁
     simulateDrop: () => {
-      pingPausedUntil = performance.now() + 3000;
-      log('WARN', 'go2w_web', '安全测试：停止发送心跳 3 s');
-      return Promise.resolve({ ok: true, msg: '已停止发心跳 3 s：如果底盘解锁着，应在约 1 s 后自动上锁' });
+      pingPausedUntil = performance.now() + 7000;
+      log('WARN', 'go2w_web', '安全测试：停止发送心跳 7 s');
+      return Promise.resolve({ ok: true, msg: '已停止发心跳 7 s：如果底盘解锁着，应在约 5 s 后自动上锁' });
     },
     notice: op => bus.emit('toast', NOT_YET[op] || LATER, 'warn'),
   };

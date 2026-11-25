@@ -10,6 +10,11 @@ go2w_ctrl 的接口（运行容器中唯一的 control 进程组）：
       1002 BalanceStand  FixStand → Velocity（相当于遥控器 Start；FixStand 没站稳时也会接受，所以必须先等 ready）
       1005 StandDown     FixStand / Velocity → Passive（kp 0 + 阻尼，直接塌下去，不是慢慢坐下）
     回复 code 0 只表示收到；当前状态不接受的请求 0.2 s 后作废。切没切成以状态 topic 为准。
+  - 融合策略（rough + climb 两个策略同时加载，Tink-YG/go2w 48a2214）：
+      状态多 3 项 {"policy":"rough|climb","switching":false,"climb_req":true}，单策略时没有
+        policy 当前在跑的（过渡中是目标那个）；switching 在 0.5 s 动作混合里；
+        climb_req 有爬台请求（遥控器按住 RB 或外部 2101 续约有效）；climb_req ≠ policy = 指令超速门限，挂起中
+      爬台请求 2101 {"climb":true|false}，1 s 续约：要一直发（这里 5 Hz），停发 1 s 后运控自动回 rough。和 RB 取或
 
 网页后端本身在域 43，这里像 go2w_cmd_bridge 一样另开一个域 0 的 context。
 本地假 ROS（GO2W_FAKE_PROCS=1）没有多域，直接挂在主节点上，由假模拟器模拟运控。
@@ -21,6 +26,7 @@ import time
 API_BALANCESTAND = 1002
 API_STANDUP = 1004
 API_STANDDOWN = 1005
+API_CLIMB = 2101
 STATES = ('Passive', 'FixStand', 'Velocity')
 
 
@@ -32,6 +38,7 @@ class CtrlLink:
         self.Request, self.event = Request, event
         self.snap = (None, False, -1, 0.0)    # (state, ready, seq, 收到时间 monotonic)；整体替换，跨线程读不用锁
         self.steady_t = None                  # 进入当前 (state, ready=true) 的时间；没 ready 时 None
+        self.dual = None                      # 融合策略：(policy, switching, climb_req)；单策略 / 没收到时 None
         self.n = 0
         self.executor = self.thread = None
         if fake:
@@ -75,8 +82,12 @@ class CtrlLink:
         try:
             d = json.loads(m.data)
             state, ready, seq = d['state'], bool(d['ready']), int(d['seq'])
+            dual = (str(d['policy']), bool(d.get('switching')), bool(d.get('climb_req'))) if 'policy' in d else None
         except (ValueError, KeyError, TypeError):
             return
+        od, self.dual = self.dual, dual
+        if dual and od and dual[0] != od[0]:
+            self.event('INFO', f'运控策略：{od[0]} → {dual[0]}' + ('（有爬台请求：网页 / 遥控器 RB）' if dual[2] else ''))
         old = self.snap
         now = time.monotonic()
         if not ready or state != old[0] or seq != old[2] or not old[1]:
@@ -101,11 +112,21 @@ class CtrlLink:
         """当前状态 ready 起的时间（monotonic）；没 ready 时 None。"""
         return self.steady_t
 
-    def send(self, api_id):
+    def get_dual(self, stale):
+        """融合策略的 (policy, switching, climb_req)；单策略或状态超过 stale 秒没收到时 None。"""
+        if self.snap[0] is None or time.monotonic() - self.snap[3] > stale:
+            return None
+        return self.dual
+
+    def send(self, api_id, parameter=''):
         self.n += 1
         r = self.Request()
         r.header.identity.id = int(time.time() * 1e6) * 100 + self.n % 100
         r.header.identity.api_id = api_id
         r.header.policy.noreply = True    # 回复只表示「收到」，没用；以状态 topic 为准
-        r.parameter = ''
+        r.parameter = parameter
         self.pub.publish(r)
+
+    def climb(self, on):
+        """爬台请求 2101：on 要 5 Hz 一直发（1 s 续约）；off 立即撤销。"""
+        self.send(API_CLIMB, '{"climb":true}' if on else '{"climb":false}')

@@ -1,0 +1,17 @@
+# 续录第一阶段：只定位不加节点，对上旧节点后再切回建图
+# MaxOdomCacheSize=0：第一次定位成功就采纳（默认 10 会等第二次，狗站着不动时永远等不到）
+# NeighborLinkRefining=false：定位模式下上一帧原始数据已丢弃，精修只会报 "missing raw data"
+# ProximityAngle=180：默认只拿朝向差 ≤45° 的旧节点比（给相机用的），360° 雷达不需要；
+#   11-19 .30 五次续录里四次都因为朝向差 75–165° 把身边的节点排除了
+# Icp/MaxCorrespondenceDistance 0.3：起点常差 10–20 cm，0.1 m 的对应距离配不上
+# Icp/CorrespondenceRatio 0.1（= 0.23.14 默认）：基础配置里调到了 0.2，场地有变化时定位容易被拒
+rtab:
+  rtabmap:
+    ros__parameters:
+      Mem/IncrementalMemory: "false"
+      Mem/InitWMWithAllNodes: "true"
+      RGBD/MaxOdomCacheSize: "0"
+      RGBD/NeighborLinkRefining: "false"
+      RGBD/ProximityAngle: "180"
+      Icp/MaxCorrespondenceDistance: "0.3"
+      Icp/CorrespondenceRatio: "0.1"

@@ -1,5 +1,6 @@
 // 模拟数据源：示例实验室地图 + 机器人仿真。用于不连机器人时调界面（地址后加 ?mock）
 import { clamp, wrap, deg, gauss, mulberry32, gridToCanvas, wallMask, CLOUD } from '../util.js';
+import { createMockTaught } from './mock_taught.js';
 
 /* ---------- 示例地图 24 × 16 m @ 0.05 ---------- */
 const RES = 0.05, MW = 24, MH = 16, GW = Math.round(MW/RES), GH = Math.round(MH/RES);
@@ -69,6 +70,10 @@ export function createMockSource(store, bus){
   store.mapCurrent = store.map.name;
   const viewsKey = 'go2w.mock.mapViews';
   try { store.mapViews = JSON.parse(localStorage.getItem(viewsKey) || '{}') || {}; } catch { store.mapViews = {}; }
+  const labelsKey = 'go2w.mock.mapLabels';
+  try { store.mapLabels = JSON.parse(localStorage.getItem(labelsKey) || '{}') || {}; } catch { store.mapLabels = {}; }
+  const keepKey = 'go2w.mock.keepouts';
+  try { store.keepouts = JSON.parse(localStorage.getItem(keepKey) || '{}') || {}; } catch { store.keepouts = {}; }
   const routesKey = 'go2w.mock.routes';
   try {
     const saved = JSON.parse(localStorage.getItem(routesKey) || '[]');
@@ -80,11 +85,17 @@ export function createMockSource(store, bus){
   store.bags = [{ name:'s7_nav4_162403', dur:1840, size:8120 }, { name:'s7_nav1_114954', dur:612, size:2790 }];
   Object.assign(store.robot, { valid: true, x: 5.6, y: 4.6, th: 0 });
   store.profiles = { mapping: 'stop', localization: 'stop', navigation: 'run', patrol: 'stop', bag: 'stop' };
+  store.taughtAvailable = true; store.taughtNavigation = true; // 纯前端模拟显式支持示教，避免把未知节点当作需无限等待。
   store.rollback = { on: true, run: true, saving: false, seconds: 20 };
   store.since = { navigation: -2405 };
   store.loc = { running: true, std: .035, yaw: 1.5, match: 91 };
 
   const R = store.robot, S = { t: 0, paused: false, keys: null, link: true, bagT0: 0 };
+  const teaching = createMockTaught(store,{
+    prepare(map){cancelTask('模拟示教准备');S.keys=null;lock('模拟示教准备');store.mapCurrent=map;
+      store.profiles.mapping='stop';store.profiles.localization='stop';store.profiles.navigation='run';},
+    halt(){S.keys=null;lock('模拟示教暂停');},
+  });
   const run = id => store.profiles[id] === 'run';
   const anyMode = () => run('mapping') || run('localization') || run('navigation');
   const odomOk = () => anyMode() && S.link;
@@ -313,6 +324,7 @@ export function createMockSource(store, bus){
   ];
   const alive = src => src==='robot' ? S.link : src==='odom' ? odomOk() : src==='loc' ? locRun() : run(src);
   function syncGraph(){
+    store.taughtNavigation = run('navigation');
     store.nodes = NODES.map(([id, name, src]) => ({ id, name, up: alive(src) }));
     store.topics = TOPICS.map(([name, type, hz, src, d0]) => ({ name, type, d0: !!d0, alive: alive(src),
       hz: !alive(src) ? null : hz===0 ? 0 : +(hz*(1+gauss()*.02)).toFixed(hz>=100?0:1) }));
@@ -328,6 +340,7 @@ export function createMockSource(store, bus){
 
   /* ---------- 指令（界面已经做过前置检查和确认） ---------- */
   const cmd = {
+    ...teaching.cmd,
     standUp: () => ({ ok: true, msg: '纯前端模拟：没有运控' }),
     lieDown: () => ({ ok: false, msg: '纯前端模拟：没有运控' }),
     standHold: () => ({ ok: true }),
@@ -361,15 +374,23 @@ export function createMockSource(store, bus){
       store.routes = routes;
       return { ok:true, data:record };
     },
+    setTaughtNav(on){
+      store.taughtNav = { on, forced: null, installed: true };
+      return { ok:true, msg:`示教导航已${on ? '打开' : '关闭'}（模拟）` };
+    },
     setRollback(on){
       store.rollback = { ...store.rollback, on, run:on };
       return { ok:true, msg:`回溯录制已${on ? '打开' : '关闭'}（模拟）` };
     },
-    saveRollback(){
+    async saveRollback(){
       if (!store.rollback.run) return { ok:false, msg:'回溯录制没在运行' };
+      if (store.rollback.saving) return { ok:false, msg:'正在保存上一段' };
+      store.rollback.saving = true;
+      await new Promise(resolve => setTimeout(resolve, 10000));
       const name = `go2w-01_${new Date().toTimeString().slice(0,8).replace(/:/g,'')}`;
-      store.bags = [{ name, dur:store.rollback.seconds, size:86 }, ...store.bags];
-      return { ok:true, msg:`已保存回溯 ${name}（模拟）` };
+      store.bags = [{ name, dur:store.rollback.seconds+10, size:86 }, ...store.bags];
+      store.rollback.saving = false;
+      return { ok:true, msg:`已保存回溯 ${name}（模拟）`, data:{name} };
     },
     uploadBag(name){
       if (Object.values(store.uploads).some(u => u.state === 'run')) return { ok:false, msg:'正在上传别的包，等它传完' };
@@ -378,6 +399,25 @@ export function createMockSource(store, bus){
         const pct = Math.min(100, u.pct + 20);
         store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } }; }, 600);
       return { ok:true, msg:`开始上传 ${name} → 166:~/go2w_bags（模拟）` };
+    },
+    setMapLabel(name, label){
+      label = String(label || '').split(/\s+/).filter(Boolean).join(' ');
+      if (label === name) label = '';
+      if (label.length > 32) return { ok:false, msg:'显示名最多 32 个字' };
+      const dup = Object.keys(store.mapLabels).find(k => k !== name && store.mapLabels[k] === label);
+      if (label && dup) return { ok:false, msg:`「${label}」已经是 ${dup} 的显示名了，换一个` };
+      const labels = { ...store.mapLabels };
+      if (label) labels[name] = label; else delete labels[name];
+      store.mapLabels = labels;
+      try { localStorage.setItem(labelsKey, JSON.stringify(labels)); } catch {}
+      return { ok:true, msg: label ? `已改名为「${label}」（模拟）` : `已恢复显示文件名 ${name}（模拟）` };
+    },
+    saveKeepout(map, shapes){
+      const all = { ...store.keepouts };
+      if (shapes.length) all[map] = shapes; else delete all[map];
+      store.keepouts = all;
+      try { localStorage.setItem(keepKey, JSON.stringify(all)); } catch {}
+      return { ok:true, msg: shapes.length ? `禁行区已保存（${shapes.length} 个，模拟：只存在这个浏览器里）` : '禁行区已清空（模拟）' };
     },
     deleteMaps(names){
       const busy = names.filter(n => n === store.mapCurrent);
@@ -435,6 +475,7 @@ export function createMockSource(store, bus){
     setParam(k, v){ store.params[k] = v; log('INFO','param',`ros2 param set /go2w_cmd_bridge ${{ vmax:'max_vx', wmax:'max_wz', tmo:'cmd_timeout' }[k]} ${v.toFixed(2)}`); },
     // mode = mapping | localization | navigation | null（全部停止）
     setMode(mode, map){
+      teaching.interrupt();
       if (map && map !== store.mapCurrent && store.maps.some(m => m.name === map)){ store.mapCurrent = map; store.maps.forEach(m => m.cur = m.name === map); }
       const cur = ['mapping','localization','navigation'].filter(m => store.profiles[m]!=='stop');
       const down = cur.filter(m => m!==mode);
@@ -460,7 +501,7 @@ export function createMockSource(store, bus){
       store.maps.unshift({ name, meta:`${GW}×${GH} · 0.05 m` });
       return { ok: true, msg: `模拟保存 ${name}（${runs.length} 段修改），实际文件请在本地后端模式中验证` };
     },
-    loadMap(name){ store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
+    loadMap(name){ teaching.interrupt(); store.mapCurrent = name; store.maps.forEach(m => m.cur = m.name===name); cancelTask('Goal canceled: map changed'); log('INFO','map_server',`Loading yaml file: data/maps/${name}.yaml`); },
     // 续建：模拟模式只走流程，不碰真文件（基准检查、起点位姿、自检的门限在 test_mapmeta / test_mapcontinue 里测）
     contPreflight(base){
       const has = store.maps.some(m => m.name === base);
@@ -492,7 +533,7 @@ export function createMockSource(store, bus){
       return { ok: true, msg: `已保存 ${c.name}（模拟）` };
     },
     contAbort(){ store.cont = null; store.contPaused = true; return { ok: true, msg: '已放弃（模拟）' }; },
-    simulateDrop(){ if (!S.link) return; S.link = false; log('WARN','go2w_web','client heartbeat lost (> 1.0 s)');
+    simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 5.0 s)');
       setTimeout(() => {
         if (routeActive()) cancelTask('网页断开，已取消路线任务');
         lock('web heartbeat lost');
@@ -534,7 +575,7 @@ export function createMockSource(store, bus){
     steps: [['plan', '规划路径', 'Theta*'], ['align', '原地对准', 'RotationShim'], ['follow', '跟随路径', 'MPPI'], ['final', '终点朝向对准', 'goal yaw'], ['arrive', '到达', '停留 1 s']],
     get paused(){ return S.paused; },
     tick(dt){
-      step(dt); a10 += dt; a5 += dt; a1 += dt; aLog += dt;
+      step(dt); teaching.tick(dt); a10 += dt; a5 += dt; a1 += dt; aLog += dt;
       if (a10 >= .1){ a10 = 0; sense(); controllerViz(); }
       if (a5 >= .2){ a5 = 0; amclViz(); }
       if (a1 >= 1){ a1 = 0; syncGraph(); }

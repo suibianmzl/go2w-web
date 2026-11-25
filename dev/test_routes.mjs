@@ -65,8 +65,11 @@ try {
     assert.equal(result.ok, true, result.msg);
     return result.data;
   }
+  // 这套测试测的是「一站一站走」（每站一个 Nav2 目标）的逐站行为；连续通过（v1.1.11 默认）见 test_route_through.mjs。
+  // 站距只有 0.7 m，连续通过时「去第 2 站」一闪而过，逐站断言没法做
+  const LEGACY = { loop:false, loops:1, vmax:0.45, wmax:1.2, through:false };
   async function save(name, pts){
-    return command('route_save', { map, name, points: pts });
+    return command('route_save', { map, name, points: pts, opts: LEGACY });
   }
   const checked = await command('route_check', { map, points });
   assert.equal(checked.simulated, true);
@@ -74,20 +77,20 @@ try {
   assert.deepEqual(checked.paths[0].points[0], [points[0].x, points[0].y]);
   assert.deepEqual(checked.paths[1].points.at(-1), [points[2].x, points[2].y]);
   assert.equal(c.state.armed, false, '检查无需解锁');
-  const route = await save('三点测试', points);
+  const route = await command('route_save', { map, name:'三点测试', points });   // 不带 opts：测默认值
   assert.equal((await c.cmd('route_save', { map, name:'非法', points:[first] })).ok, false);
   assert.equal((await c.cmd('route_save', { map:'错误地图', name:'非法', points })).ok, false);
   assert.equal((await c.cmd('route_start', { route_id:route.id })).ok, false, '上锁时拒绝执行');
-  assert.deepEqual(route.opts, { loop:false, loops:1, vmax:0.45, wmax:1.2 }, '没给运行参数时用默认值');
+  assert.deepEqual(route.opts, { loop:false, loops:1, vmax:0.45, wmax:1.2, through:true }, '没给运行参数时用默认值');
   const withOpts = await command('route_save', { route_id:route.id, map, name:'三点测试', points, opts:{ loop:true, loops:3, vmax:0.6, wmax:1 } });
-  assert.deepEqual(withOpts.opts, { loop:true, loops:3, vmax:0.6, wmax:1 }, '运行参数跟任务保存');
-  for (const bad of [{ vmax:2 }, { wmax:0 }, { loops:-1 }, { loops:1.5 }, { loop:'yes' }])
+  assert.deepEqual(withOpts.opts, { loop:true, loops:3, vmax:0.6, wmax:1, through:true }, '运行参数跟任务保存');
+  for (const bad of [{ vmax:2 }, { wmax:0 }, { loops:-1 }, { loops:1.5 }, { loop:'yes' }, { through:1 }])
     assert.equal((await c.cmd('route_save', { route_id:route.id, map, name:'三点测试', points, opts:bad })).ok, false, `拒绝参数 ${JSON.stringify(bad)}`);
   await until(() => observer.routes?.some(r => r.id === route.id && r.opts?.loops === 3), '另一客户端收到参数');
   console.log('PASS 运行参数跟任务保存、修改后覆盖原任务、非法参数被拒绝');
   const edited = await command('route_save', { route_id:route.id, map, name:'三点任务', points });
   assert.equal(edited.id, route.id);
-  assert.deepEqual(edited.opts, { loop:false, loops:1, vmax:0.45, wmax:1.2 }, '不带 opts 保存 = 默认参数');
+  assert.deepEqual(edited.opts, { loop:false, loops:1, vmax:0.45, wmax:1.2, through:true }, '不带 opts 保存 = 默认参数');
   // 备注（11-18）：去掉首尾空格；没填的点是空字符串
   assert.deepEqual(edited.points, points.map(p => ({ ...p, note:(p.note || '').trim() })), '保存并更新后仍保留站名、备注和朝向');
   assert.equal(edited.points[1].note, '经过门禁，等门打开');
@@ -100,6 +103,7 @@ try {
     map, name:'非法站名', points:[{ ...first, name:'长'.repeat(41) }, points[1]],
   })).ok, false);
   await until(() => observer.routes?.some(r => r.id === route.id && r.name === '三点任务'), '另一客户端收到更新');
+  await command('route_save', { route_id:route.id, map, name:'三点任务', points, opts: LEGACY });
   await command('initial_pose', { ...points[2], th:Math.PI / 2 });   // 离第 1 站 1.37 m（超过 0.5 m），按 1 → 2 → 3 走
   await command('arm', { on:true });
   await command('route_start', { route_id:route.id });
@@ -180,7 +184,7 @@ try {
     assert.equal((await observer.cmd('goal', first)).ok, false, '执行中拒绝其他网页抢发目标');
     assert.equal((await observer.cmd('route_delete', { route_id:r.id })).ok, false, '运行中拒绝删除当前任务');
     await stop();
-    await until(() => observer.task?.name === r.name && observer.task.status === 'canceled', `${name}后取消任务`);
+    await until(() => observer.task?.name === r.name && observer.task.status === 'canceled', `${name}后取消任务`, 9000);   // 心跳超时本身 5 s
     if (expectLock) await until(() => observer.state.armed === false, `${name}后上锁`);
     await sleep(500);
     assert.equal(observer.task.point, 1);

@@ -4,6 +4,7 @@ import { ACC, TRAJ } from './util.js';
 // heavy：数据量大，只有打开时后端才计算和发送（见 go2w_web.py 的 HEAVY）
 export const LAYERS = [
   { id:'map', name:'栅格地图', topic:'/map', c:'#5acdd6', on:true, ros:'/map' },
+  { id:'keepout', name:'禁行区', topic:'<地图>.keepout.json', c:'#ff4b5c', on:true, ros:'KeepoutFilter · 地图编辑里画' },
   { id:'gcost', name:'全局代价地图', topic:'/global_costmap/costmap', c:'#ff4fa3', on:false, ros:'/global_costmap/costmap', heavy:true },
   { id:'lcost', name:'局部代价地图', topic:'/local_costmap · 6×6 m', c:'#c964d6', on:true, ros:'/local_costmap · 6×6 m', heavy:true },
   { id:'cloud', name:'点云（俯视投影）', topic:'/cloud_registered_body', c:'grad', on:true, ros:'/cloud_registered_body · 0.3–1.6 m', heavy:true },
@@ -14,6 +15,7 @@ export const LAYERS = [
     note:'真机上没有：nav2.yaml 里 MPPI 的 visualize 是 false（打开会明显多占扩展坞 CPU 和带宽）' },
   { id:'particles', name:'AMCL 粒子', topic:'/particle_cloud', c:'#ffe08a', on:false, ros:'/particle_cloud · 最多 300', heavy:true },
   { id:'trail', name:'里程轨迹', topic:'base_footprint', c:'#8aa0b8', on:true, ros:'base_footprint' },
+  { id:'taught', name:'示教轨迹', topic:'每张地图一条参考', c:'#f3b13f', on:true, ros:'地图文件中的唯一参考' },
   { id:'rings', name:'测距环', topic:'1 / 2 / 4 m', c:'rgba(255,255,255,.4)', on:true, ros:'1 / 2 / 4 m' },
   { id:'tf', name:'TF 坐标轴', topic:'map · base_link', c:'#ff6b6b', on:false, ros:'map · base_link' },
 ];

@@ -35,6 +35,12 @@ except ImportError:  # 容器里没有 scipy：限定最大距离，用平移取
 # 最优分数下限（平均似然，0..1）。GO2W_AUTOLOC_MIN_SCORE 只给本地测试用（假 scan 分数总是很高，调高才能测失败流程）
 MIN_SCORE = float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75'))
 MAX_RATIO = 0.80   # 次优 / 最优 上限：越接近 1 越有歧义
+# 搜索方式：bbs（默认，多级分支定界，大图也快）/ old（11-10 的两层粗搜 + 细搜，回退用）
+IMPL = os.environ.get('GO2W_GLOBLOC_IMPL', 'bbs')
+BBS_LEVELS = 7      # 金字塔层数：最粗一层的块是 2^7 = 128 格（0.05 m 时 6.4 m）
+BBS_KEEP = 0.70     # 留下上界 ≥ BBS_KEEP × 当前最好分数 的块。比 MAX_RATIO 低一档，次优分数在 0.70 以上时能如实报出来
+BBS_CHUNK = 8192    # 每批算多少个块（控制内存：块数 × 点数 × 4 B）
+BBS_BATCH = 4096    # 最优先展开时每轮挑多少个上界最高的块一起拆（numpy 批量算，减少 Python 开销）
 
 
 def distance_field(occ, max_cells):
@@ -136,6 +142,163 @@ class GlobalLocalizer:
                 best = (float(s[j]), int(gy[j]), int(gx[j]), float(a))
         return best
 
+    # ---------- 多级分支定界（BBS，Hess et al. 2016 / Cartographer 的同一思路） ----------
+    # P[h][y+O, x+O] = max(fine[y:y+2^h, x:x+2^h])，地图外算 0。四周补 O 格零（O ≥ 激光最远距离 + 2^L），
+    # 这样任何激光点的下标都落在数组里，不用逐点判断越界。把激光点按某个朝向放在块的左上角 (y, x)，
+    # 用 P[h] 打出的平均分 ≥ 块内任何一个位置用 fine 打出的真实分数，所以上界低于门槛的块整块不用看。
+    # h ≥ 1 存 uint8 并向上取整，仍然是上界。下标用一维：idx = (y+O)·Wp + (x+O) + 点偏移（每个朝向预先算好）。
+    def _bbs_prepare(self, levels, reach):
+        pad = int(reach) + (1 << levels) + 2
+        if getattr(self, '_bbs', None) and self._bbs['L'] == levels and self._bbs['pad'] >= pad:
+            return self._bbs
+        cur = np.pad(self.fine, pad, mode='constant')
+        P, W = [cur.ravel()], [self.walkable]
+        wk = self.walkable
+        for h in range(1, levels + 1):
+            s = 1 << (h - 1)
+            nxt = cur.copy()
+            np.maximum(nxt[:-s, :], cur[s:, :], out=nxt[:-s, :])
+            tmp = nxt.copy()
+            np.maximum(nxt[:, :-s], tmp[:, s:], out=nxt[:, :-s])
+            cur = nxt
+            P.append(np.ceil(cur * 255.0).astype(np.uint8).ravel())
+            w2 = wk.copy()
+            w2[:-s, :] |= wk[s:, :]
+            w3 = w2.copy()
+            w3[:, :-s] |= w2[:, s:]
+            wk = w3
+            W.append(wk)
+        self._bbs = {'L': levels, 'pad': pad, 'Wp': cur.shape[1], 'P': P, 'W': W}
+        return self._bbs
+
+    def _bbs_bound(self, h, ny, nx, ni, OFF):
+        """块 (ny, nx) 左上角、朝向 ni 的上界（h = 0 时就是真实分数）。按批算，控制内存。"""
+        b = self._bbs
+        P, pad, Wp = b['P'][h], b['pad'], b['Wp']
+        base = (ny + pad) * Wp + (nx + pad)
+        out = np.empty(len(ny), np.float32)
+        npts = OFF.shape[1]
+        for i in range(0, len(ny), BBS_CHUNK):
+            j = slice(i, i + BBS_CHUNK)
+            v = np.take(P, base[j, None] + OFF[ni[j]])
+            if h == 0:
+                out[j] = v.sum(1) / npts
+            else:
+                out[j] = v.sum(1, dtype=np.int32) / (255.0 * npts)
+        return out
+
+    def _bbs_children(self, h, ny, nx, ni):
+        """h 层的块拆成 h-1 层的 4 个子块，去掉出界的和里面没有能站的格子的。"""
+        s = 1 << (h - 1)
+        cy = np.concatenate([ny, ny + s, ny, ny + s])
+        cx = np.concatenate([nx, nx, nx + s, nx + s])
+        ci = np.concatenate([ni, ni, ni, ni])
+        ok = (cy < self.h) & (cx < self.w)
+        cy, cx, ci = cy[ok], cx[ok], ci[ok]
+        ok = self._bbs['W'][h - 1][cy, cx]
+        return cy[ok], cx[ok], ci[ok]
+
+    def localize_bbs(self, pts, yaw_step_deg=1.5, levels=BBS_LEVELS):
+        t0 = time.time()
+        yaws = np.deg2rad(np.arange(-180, 180, yaw_step_deg))
+        DY, DX = self._offsets(pts, yaws)
+        reach = int(max(np.abs(DY).max(), np.abs(DX).max()))
+        b = self._bbs_prepare(levels, reach)
+        OFF = (DY.astype(np.int64) * b['Wp'] + DX).astype(np.int64)
+        prep = time.time() - t0
+        L, step = levels, 1 << levels
+        ys, xs = np.nonzero(b['W'][L][::step, ::step])
+        if not len(ys):
+            return {'error': '基准图没有可用的空地候选'}
+        ny = np.repeat(ys * step, len(yaws)).astype(np.int64)
+        nx = np.repeat(xs * step, len(yaws)).astype(np.int64)
+        ni = np.tile(np.arange(len(yaws)), len(ys)).astype(np.int64)
+        pv = self._bbs_bound(L, ny, nx, ni, OFF)
+        ph = np.full(len(pv), L, np.int8)
+        py, px, pi = ny, nx, ni
+        evals = len(pv)
+        # 最优先展开：每次从待查的块里挑上界最高的一批往下拆（Cartographer 的做法，这里用 numpy 数组代替堆）。
+        # 很快就落到最好的位置附近拿到真实高分，门槛 BBS_KEEP × 最好 随之抬高，剩下的块大多直接剪掉；
+        # 待查的块全都低于门槛时，别处不可能更好，结束。
+        best, rounds = -1.0, 0
+        lv, ly, lx, li = [], [], [], []
+        while len(pv):
+            thr = BBS_KEEP * best - 1e-6
+            keep = pv >= thr
+            if not keep.all():
+                pv, ph, py, px, pi = pv[keep], ph[keep], py[keep], px[keep], pi[keep]
+            if not len(pv):
+                break
+            rounds += 1
+            if len(pv) > BBS_BATCH:
+                sel = np.argpartition(-pv, BBS_BATCH)[:BBS_BATCH]
+                rest = np.ones(len(pv), bool)
+                rest[sel] = False
+            else:
+                sel, rest = np.arange(len(pv)), np.zeros(len(pv), bool)
+            bv, bh, by, bx, bi = pv[sel], ph[sel], py[sel], px[sel], pi[sel]
+            pv, ph, py, px, pi = pv[rest], ph[rest], py[rest], px[rest], pi[rest]
+            leaf = bh == 0
+            if leaf.any():
+                lv.append(bv[leaf]); ly.append(by[leaf]); lx.append(bx[leaf]); li.append(bi[leaf])
+                best = max(best, float(bv[leaf].max()))
+            add = []
+            for h in np.unique(bh[~leaf])[::-1]:
+                m = bh == h
+                cy, cx, ci = self._bbs_children(int(h), by[m], bx[m], bi[m])
+                if not len(cy):
+                    continue
+                v = self._bbs_bound(int(h) - 1, cy, cx, ci, OFF)
+                evals += len(v)
+                if h == 1:
+                    best = max(best, float(v.max()))
+                add.append((v, np.full(len(v), h - 1, np.int8), cy, cx, ci))
+            if add:
+                pv = np.concatenate([pv] + [a[0] for a in add])
+                ph = np.concatenate([ph] + [a[1] for a in add])
+                py = np.concatenate([py] + [a[2] for a in add])
+                px = np.concatenate([px] + [a[3] for a in add])
+                pi = np.concatenate([pi] + [a[4] for a in add])
+        dive_best = best
+        alive = [rounds]
+        B = np.concatenate(lv) if lv else np.zeros(0, np.float32)
+        ny = np.concatenate(ly) if ly else np.zeros(0, np.int64)
+        nx = np.concatenate(lx) if lx else np.zeros(0, np.int64)
+        ni = np.concatenate(li) if li else np.zeros(0, np.int64)
+        if not len(B):
+            return {'error': '没有找到候选位置'}
+        best = max(best, float(B.max()))
+        keep = B >= BBS_KEEP * best - 1e-6
+        ny, nx, ni, B = ny[keep], nx[keep], ni[keep], B[keep]
+        search_s = time.time() - t0 - prep
+        # 最好的 + 离它 > 1 m 或 > 30° 的最好的（次优）；都再做一次局部细搜到 0.1°
+        k0 = int(np.argmax(B))
+        d = np.hypot((ny - ny[k0]) * self.res, (nx - nx[k0]) * self.res)
+        dang = np.abs(np.remainder(yaws[ni] - yaws[ni[k0]] + math.pi, 2 * math.pi) - math.pi)
+        far = (d > 1.0) | (dang > math.radians(30))
+        step_r = math.radians(yaw_step_deg)
+
+        def fine(k):
+            r = self.refine(pts, int(ny[k]), int(nx[k]), float(yaws[ni[k]]), 1, step_r, math.radians(0.5))
+            return self.refine(pts, r[1], r[2], r[3], 1, math.radians(0.5), math.radians(0.1))
+        s0, y0, x0, a0 = fine(k0)
+        bx, by = self.to_world(y0, x0)
+        if far.any():
+            k1 = int(np.flatnonzero(far)[np.argmax(B[far])])
+            s1, y1, x1, a1 = fine(k1)
+            wx, wy = self.to_world(y1, x1)
+            second, second_pose, exact = s1, [round(wx, 3), round(wy, 3), round((a1 + math.pi) % (2 * math.pi) - math.pi, 4)], True
+        else:
+            # 别处没有上界够得着 0.70 × 最好 的：真实次优比这还低，按 0.70 报（偏保守，判定照样正确）
+            second, second_pose, exact = BBS_KEEP * s0, None, False
+        ratio = min(second / s0, 1.0) if s0 > 0 else 1.0
+        return {'x': round(bx, 4), 'y': round(by, 4), 'th': round((a0 + math.pi) % (2 * math.pi) - math.pi, 4),
+                'score': round(s0, 4), 'second': round(second, 4), 'ratio': round(ratio, 4), 'second_pose': second_pose,
+                'ratio_exact': exact, 'ok': bool(s0 >= MIN_SCORE and ratio <= MAX_RATIO),
+                'n_pts': int(len(pts)), 'impl': 'bbs', 'evals': int(evals), 'dive_best': round(dive_best, 4), 'alive': alive, 'leaves': int(len(B)),
+                'prep_s': round(self.prep_s + prep, 2), 'coarse_s': round(search_s, 2),
+                'total_s': round(self.prep_s + time.time() - t0, 2)}
+
     def localize(self, pts, top_k=40, yaw_step_deg=1.5):
         t0 = time.time()
         yaws = np.deg2rad(np.arange(-180, 180, yaw_step_deg))
@@ -200,7 +363,7 @@ def main(path):
     if len(pts) < 30:
         print(json.dumps({'error': f'有效激光点太少（{len(pts)}）'}))
         return
-    print(json.dumps(L.localize(pts)))
+    print(json.dumps(L.localize_bbs(pts) if IMPL == 'bbs' else L.localize(pts)))
 
 
 if __name__ == '__main__':

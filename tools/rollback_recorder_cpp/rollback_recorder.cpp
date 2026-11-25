@@ -109,23 +109,24 @@ public:
   size_t bytes() const {return bytes_;}
 
   // 按时间排序；seconds < 0 表示整个缓存
-  std::vector<Item> snapshot(double seconds) const
+  std::vector<Item> snapshot(double seconds, int64_t end_ns = 0) const
   {
     std::vector<Item> out;
     if (items_.empty()) {return out;}
+    const int64_t end = end_ns ? end_ns : items_.back().t;
     auto first = items_.begin();
     if (seconds >= 0) {
-      const int64_t cut = items_.back().t - static_cast<int64_t>(seconds * 1e9);
+      const int64_t cut = end - static_cast<int64_t>(seconds * 1e9);
       while (first != items_.end() && first->t < cut) {++first;}
     }
-    if (first == items_.end()) {return out;}
+    if (first == items_.end() || first->t > end) {return out;}
     const int64_t start = first->t;
     for (const auto & [topic, kept] : latched_) {
       for (const auto & [t, m] : kept) {
         if (t < start) {out.push_back({start, topic, m});}
       }
     }
-    out.insert(out.end(), first, items_.end());
+    for (auto it = first; it != items_.end() && it->t <= end; ++it) {out.push_back(*it);}
     return out;
   }
 
@@ -411,6 +412,7 @@ private:
     // 请求内容：「包名」或「包名 秒数」；不写秒数就存整个缓存
     const std::string name = parts.empty() ? "" : parts[0];
     double seconds = -1;
+    int64_t end_ns = 0;
     if (parts.size() > 1) {
       char * end = nullptr;
       const double v = std::strtod(parts[1].c_str(), &end);
@@ -420,13 +422,18 @@ private:
       RCLCPP_ERROR(log(), "包名不对：'%s'", name.c_str());
       return;
     }
+    if (parts.size() > 2) {
+      char * end = nullptr;
+      const auto v = std::strtoll(parts[2].c_str(), &end, 10);
+      if (end != parts[2].c_str() && !*end && v > 0) {end_ns = v;}
+    }
     if (seconds >= 0 && seconds > ring_.span() + 1) {
       RCLCPP_WARN(log(), "%s：要 %.0f 秒，缓存里只有 %.1f 秒", name.c_str(), seconds, ring_.span());
     }
     join();   // 上一次的线程已经结束（saving_ 已清），回收掉
     saving_.store(true);
     // snapshot 在收消息的线程里做，不用加锁；写文件放到别的线程，缓存继续收
-    auto records = std::make_shared<std::vector<Item>>(ring_.snapshot(seconds));
+    auto records = std::make_shared<std::vector<Item>>(ring_.snapshot(seconds, end_ns));
     auto names = names_;
     auto types = types_;
     const fs::path bags = args_.bags;

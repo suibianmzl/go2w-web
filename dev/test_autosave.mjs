@@ -14,7 +14,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // 3 份更早的自动保存：第一次自动保存后应删掉最早那份（只留最近 3 次，含这一次）
 const OLD = ['autosave_0101_000000', 'autosave_0101_000001', 'autosave_0101_000002'];
-for (const n of OLD){
+// 11-19 .21 事故：从自动保存续建出来、用户手动保存的 autosave_…_c1 被清理当成自动保存直接删了。
+// 这些名字以 autosave_ 开头但不是网页起的自动保存名，必须原样留着（而且比 OLD[0] 还「早」）
+const NOT_AUTO = ['autosave_0101_000000_c1', 'autosave_0101_000000_prev_c1', 'autosave_lab'];
+for (const n of [...OLD, ...NOT_AUTO]){
   writeFileSync(join(MAPS, `${n}.yaml`), `image: ${n}.pgm\nmode: trinary\nresolution: 0.05\norigin: [0, 0, 0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n`);
   writeFileSync(join(MAPS, `${n}.pgm`), Buffer.concat([Buffer.from('P5\n2 2\n255\n'), Buffer.from([254, 254, 0, 205])]));
 }
@@ -51,11 +54,18 @@ try {
   // 2. 只留最近 3 次：最早的那份被删掉，另外两份留着
   ok('只留最近 3 次：删掉最早的', !existsSync(join(MAPS, `${OLD[0]}.yaml`)) && !existsSync(join(MAPS, `${OLD[0]}.pgm`)));
   ok('只留最近 3 次：较新的留着', existsSync(join(MAPS, `${OLD[1]}.yaml`)) && existsSync(join(MAPS, `${OLD[2]}.yaml`)));
+  const trashed = existsSync(join(MAPS, '.trash')) ? readdirSync(join(MAPS, '.trash')).filter(d => d.endsWith('_' + OLD[0])) : [];
+  ok('清理的自动保存挪进回收站（不是直接删）', trashed.length === 1
+     && ['.yaml', '.pgm', 'deleted.json'].every(f => existsSync(join(MAPS, '.trash', trashed[0] ?? '', f === 'deleted.json' ? f : OLD[0] + f))), trashed.join(','));
+  ok('续建结果 autosave_…_c1 等不是自动保存的图不清理', NOT_AUTO.every(n => existsSync(join(MAPS, `${n}.yaml`)) && existsSync(join(MAPS, `${n}.pgm`))));
+  ok('日志说明挪进回收站', logHas(new RegExp(`较早的建图自动保存 ${OLD[0]} 挪进回收站`)));
+  const bad = await cmd('save_map', { name: 'autosave_0101_123456' });
+  ok('手动保存不许用自动保存的名字', bad.ok === false && /留给建图自动保存/.test(bad.msg || ''), bad.msg);
 
   // 3. 定时覆盖同一份（假地图一直在长）
   const c1 = state.autosave.count;
   await until(() => state.autosave.count >= c1 + 2, 20000, '定时再存两次');
-  ok('定时保存：覆盖同一个名字', state.autosave.name === name && readdirSync(MAPS).filter(f => f.startsWith('autosave_') && f.endsWith('.yaml') && !f.includes('_prev')).length === 3,
+  ok('定时保存：覆盖同一个名字', state.autosave.name === name && readdirSync(MAPS).filter(f => /^autosave_\d{4}_\d{6}\.yaml$/.test(f)).length === 3,
      `第 ${state.autosave.count} 次`);
   // 11-19：覆盖前把上一份挪成 <名字>_prev（yaml 的 image 跟着改），坏图写进来时还能退一步
   const prevYaml = join(MAPS, `${name}_prev.yaml`);

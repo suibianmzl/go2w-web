@@ -21,6 +21,7 @@ import os
 import struct
 import queue
 import random
+from collections import deque
 
 FAKE_CTRL_OFF = os.environ.get('GO2W_FAKE_CTRL_OFF', '/tmp/go2w_fake_ctrl_off')
 # 测试用：往这个文件写「x,y,朝向弧度」（真实坐标），假机器人瞬移过去，读完删掉（建图档没有导航可开）
@@ -33,10 +34,13 @@ FAKE_SLAM_POSE_OFF = os.environ.get('GO2W_FAKE_SLAM_POSE_OFF')
 FAKE_FALL = os.environ.get('GO2W_FAKE_FALL', '/tmp/go2w_fake_fall')
 # 这个文件存在期间假里程计发散：速度 -20 m/s、位置每帧跑 2 m（摔倒后 FAST-LIO 的样子）
 FAKE_ODOM_WILD = os.environ.get('GO2W_FAKE_ODOM_WILD', '/tmp/go2w_fake_odom_wild')
+# 禁行层（v1.1.8）：导航档位里有 /filter_mask_server/load_map；这个文件存在时没有，模拟还没更新的旧导航镜像
+FAKE_NO_KEEPOUT = os.environ.get('GO2W_FAKE_NO_KEEPOUT', '/tmp/go2w_fake_no_keepout')
 # GO2W_FAKE_MAP_GROW=1：建图时 /map 每 2 s 发一次且内容在变（真机 slam 也是一直在发），测自动保存
 FAKE_MAP_GROW = os.environ.get('GO2W_FAKE_MAP_GROW') == '1'
 # GO2W_FAKE_SERIALIZE_FAIL=1：serialize_map 返回写文件失败
 FAKE_SERIALIZE_FAIL = os.environ.get('GO2W_FAKE_SERIALIZE_FAIL') == '1'
+import threading
 import time
 import uuid
 from types import SimpleNamespace as N
@@ -53,6 +57,7 @@ START_DELAY = 3.0     # 档位启动到节点出现的时间（真机上 FAST-LI
 MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
+THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
 
 
 def load_map(yaml_path):
@@ -128,6 +133,7 @@ class Sim:
         self.stamp_rate = float(os.environ.get('GO2W_FAKE_STAMP_RATE', '1.0'))
         self.jobs = queue.Queue()   # 其他线程交给模拟器线程执行的回调（模拟异步回复）
         self.t0 = time.monotonic()
+        self.ros_epoch_ns = time.time_ns()
         self.load(os.environ.get('GO2W_FAKE_MAP') or os.path.join(DATA, 'maps', 'lab_20261021.yaml'))
 
         # 起点：离地图原点 (0, 0) 最近的空旷处（建图通常从这里开始）
@@ -157,6 +163,15 @@ class Sim:
         self.ctrl_sent = None  # 上次发出的 (state, ready, seq)
         self.policy = os.environ.get('GO2W_CONTROL_POLICY') or 'mjlab_go2w_dgv2_m22_scratch_w02_7999'
         self.ctrl_off_until = 0.0   # 假运控重启（切策略）期间不发状态
+        # 假融合策略（rough + climb）：GO2W_FAKE_DUAL=1 或策略名带 fused。2101 {"climb":true} 1 s 续约，和真的一样
+        self.dual = ({'policy': 'rough', 'sw_t': None, 'until': 0.0}
+                     if os.environ.get('GO2W_FAKE_DUAL') == '1' or 'fused' in self.policy else None)
+        self.taught_route_enabled = os.environ.get('GO2W_TAUGHT_ROUTE', '').lower() in ('1', 'true', 'yes', 'on')
+        self.taught_map_yaml = os.path.join(DATA, 'maps', self.map_name + '.yaml')
+        self.mode_environment = {'GO2W_NAVIGATION_MODE': 'navigation', 'GO2W_MAP': self.map_name + '.yaml'}
+        if self.taught_route_enabled:
+            self.mode_environment['GO2W_TAUGHT_ROUTE'] = 'true'
+        self.tf_history = deque(maxlen=200)   # 10 Hz 测量的约 20 s 精确位姿快照；不把最新位姿伪装成历史测量
 
     # ---------- 假运控 ----------
     CTRL_INTERP = 2.0   # FixStand 插值时间
@@ -167,7 +182,20 @@ class Sim:
         c = self.ctrl
         return c['state'] != 'FixStand' or now - c['t'] >= self.CTRL_INTERP
 
+    def dual_step(self, now):
+        d = self.dual
+        if d is None:
+            return
+        if d['sw_t'] is not None and now - d['sw_t'] >= 0.5:
+            d['sw_t'] = None
+            self.rosout(20, 'go2w_ctrl', f"切换完成: {d['policy']}")
+        target = 'climb' if now < d['until'] else 'rough'
+        if d['sw_t'] is None and target != d['policy'] and abs(self.v) <= 0.5 and abs(self.w_) <= 0.15:
+            d.update(policy=target, sw_t=now)
+            self.rosout(20, 'go2w_ctrl', f'切换策略 -> {target}（过渡 0.5s）')
+
     def ctrl_step(self, now):
+        self.dual_step(now)
         r, c = self.ctrl_req, self.ctrl
         if r and now - r[1] > 0.2:
             self.ctrl_req = r = None
@@ -182,11 +210,17 @@ class Sim:
     def ctrl_msg(self, now, force):
         from std_msgs.msg import String
         c = self.ctrl
-        cur = (c['state'], self.ctrl_ready(now), c['seq'])
+        d = self.dual
+        extra = None if d is None else (d['policy'], d['sw_t'] is not None, now < d['until'])
+        cur = (c['state'], self.ctrl_ready(now), c['seq'], extra)
         if not force and cur == self.ctrl_sent:
             return None
         self.ctrl_sent = cur
-        return String('{"state":"%s","ready":%s,"seq":%d}' % (cur[0], 'true' if cur[1] else 'false', cur[2]))
+        j = '{"state":"%s","ready":%s,"seq":%d' % (cur[0], 'true' if cur[1] else 'false', cur[2])
+        if extra:
+            b = lambda v: 'true' if v else 'false'
+            j += ',"policy":"%s","switching":%s,"climb_req":%s' % (extra[0], b(extra[1]), b(extra[2]))
+        return String(j + '}')
 
     def load(self, yaml_path):
         self.grid, self.res, self.ox, self.oy = load_map(yaml_path)
@@ -229,6 +263,8 @@ class Sim:
             names += ['slam_toolbox']
         if self.ready('navigation'):
             names += ['bt_navigator', 'controller_server', 'planner_server']
+            if self.taught_route_enabled:
+                names += ['taught_route']
         if self.bridge_up():
             names += ['go2w_cmd_bridge']
         if self.procs['patrol']:
@@ -257,11 +293,18 @@ class Sim:
             return 1 if self.pat and time.monotonic() >= self.pat['ready_at'] else 0
         return 0
 
-    def start_mode(self, mode, map_yaml):
+    def start_mode(self, mode, map_yaml=None, *, taught_route=False):
+        self.mode_environment = {'GO2W_NAVIGATION_MODE': mode}
+        if mode != 'mapping' and map_yaml:
+            self.mode_environment['GO2W_MAP'] = f'{map_yaml}.yaml'
+        self.taught_route_enabled = bool(taught_route) and mode == 'navigation'
+        if self.taught_route_enabled:
+            self.mode_environment['GO2W_TAUGHT_ROUTE'] = 'true'
         if map_yaml:
             self.load(os.path.join(DATA, 'maps', f'{map_yaml}.yaml'))
             self.yaml_param = map_yaml
             self.deliver_map()
+        self.taught_map_yaml = os.path.join(DATA, 'maps', self.map_name + '.yaml')
         self.procs[mode] = True
         if mode == 'mapping':
             self.slam_frame = None   # 新建图：map 坐标系和真实坐标重合
@@ -277,6 +320,7 @@ class Sim:
         for m in MODES:
             self.procs[m] = False
         self.procs['bridge'] = False   # 真机上同一个 pkill 模式会顺带杀掉遥控速度桥
+        self.taught_route_enabled = False
         self.armed = False
         self.v = self.w_ = 0.0
         self.rosout(20, 'launch', 'all processes have finished cleanly')
@@ -401,12 +445,16 @@ class Sim:
 
     # ---------- 假服务 ----------
     def has_service(self, name):
+        if name in ('/taught_route/get_parameters', '/taught_route/set_parameters'):
+            return self.ready('navigation') and self.taught_route_enabled
         if name.startswith('/go2w_cmd_bridge/'):
             return self.bridge_up()
-        if name == '/navigate_to_pose/_action/cancel_goal' or '/clear_except_' in name:
+        if name in ('/navigate_to_pose/_action/cancel_goal', '/navigate_through_poses/_action/cancel_goal') or '/clear_except_' in name:
             return self.ready('navigation')
         if name.startswith('/map_server/'):
             return self.loc_ready()
+        if name == '/filter_mask_server/load_map':
+            return self.ready('navigation') and not os.path.exists(FAKE_NO_KEEPOUT)
         # 续建：slam_toolbox 的三个服务只在建图档位里存在
         if name.startswith('/slam_toolbox/'):
             return self.ready('mapping')
@@ -421,16 +469,48 @@ class Sim:
         from rcl_interfaces.srv import GetParameters, SetParameters
         from slam_toolbox.srv import Pause as SlamPause
         from std_srvs.srv import SetBool
+        if name == '/taught_route/get_parameters':
+            return GetParameters.Response([
+                ParameterValue(ParameterType.PARAMETER_STRING, string_value=self.taught_map_yaml)
+                if n == 'map_yaml' else ParameterValue(ParameterType.PARAMETER_NOT_SET) for n in req.names])
+        if name == '/taught_route/set_parameters':
+            out = []
+            for p in req.parameters:
+                if p.name == 'map_yaml' and p.value.type == ParameterType.PARAMETER_STRING and isinstance(p.value.string_value, str):
+                    self.taught_map_yaml = p.value.string_value
+                    out.append(SetParametersResult(True))
+                else:
+                    out.append(SetParametersResult(False, 'fake taught_route 仅支持字符串参数 map_yaml'))
+            return SetParameters.Response(out)
         if '/clear_except_' in name:
             from nav2_msgs.srv import ClearCostmapExceptRegion
             self.costmap_clears = getattr(self, 'costmap_clears', 0) + 1
             return ClearCostmapExceptRegion.Response()
         if name == '/map_server/load_map':
-            path = req.map_url.replace('/go2w/data', DATA, 1)
-            if not os.path.exists(path):
+            path = req.map_url
+            # 只映射容器数据根；真实开发目录可能在 .../go2w/data/...，其中段必须原样保留。
+            if path == '/go2w/data' or path.startswith('/go2w/data/'):
+                path = DATA + path[len('/go2w/data'):]
+            if not os.path.isfile(path):
                 return LoadMap.Response(1)
             self.load(path)
             self.deliver_map()
+            return LoadMap.Response(0)
+        if name == '/filter_mask_server/load_map':
+            # 和真机一样：读不到 / 不是 raw 掩膜就失败。加载了哪个记在 mask_loaded，测试里看后端 state.keepout
+            path = req.map_url
+            if path == '/go2w/data' or path.startswith('/go2w/data/'):
+                path = DATA + path[len('/go2w/data'):]
+            try:
+                with open(path, encoding='utf-8') as f:
+                    ok = 'mode: raw' in f.read()
+            except OSError:
+                ok = False
+            if not ok:
+                self.plog(40, 'filter_mask_server: 掩膜加载失败 %s' % req.map_url)
+                return LoadMap.Response(1)
+            self.mask_loaded = path
+            self.plog(20, 'filter_mask_server: Loading yaml file: %s' % req.map_url)
             return LoadMap.Response(0)
         if name == '/map_server/get_parameters':
             # 真机的 map_server：load_map 服务换图后，yaml_filename 参数仍是启动时的那张（11-06 实测）
@@ -507,14 +587,27 @@ class Sim:
     def on_publish(self, topic, msg):
         if topic == '/initialpose' and self.loc_ready():
             p = msg.pose.pose
-            self.later(lambda: self.teleport(p.position.x, p.position.y, 2*math.atan2(p.orientation.z, p.orientation.w)))
+            bx, by, bth = p.position.x, p.position.y, 2*math.atan2(p.orientation.z, p.orientation.w)
+            if os.environ.get('GO2W_FAKE_AMCL_ERR') == '1':
+                # 像真 AMCL：机器人不动，只把「以为的位置」改成给的位姿（map→odom 偏移），约 0.3 s 后生效
+                def set_belief():
+                    a = wrap(bth - self.th); ca, sa = math.cos(a), math.sin(a)
+                    self.loc_err = (bx - (ca*self.x - sa*self.y), by - (sa*self.x + ca*self.y), a)
+                threading.Timer(0.3, lambda: self.later(set_belief)).start()
+            else:
+                self.later(lambda: self.teleport(bx, by, bth))
         elif topic == '/patrol_pose' and self.pat and len(self.pat['points']) < 2:
             p = msg.pose
             yaw = 2 * math.atan2(p.orientation.z, p.orientation.w)
             self.pat['points'].append((p.position.x, p.position.y, yaw))
             self.plog(20, '%s 点：(%.2f, %.2f)，朝向 %.0f°' % ('AB'[len(self.pat['points']) - 1], p.position.x, p.position.y, math.degrees(yaw)))
         elif topic == '/api/sport/request':
-            self.ctrl_req = (msg.header.identity.api_id, time.monotonic())
+            if msg.header.identity.api_id == 2101:
+                if self.dual is not None:
+                    on = '"climb":true' in msg.parameter.replace(' ', '')
+                    self.dual['until'] = time.monotonic() + 1.0 if on else 0.0
+            else:
+                self.ctrl_req = (msg.header.identity.api_id, time.monotonic())
         elif topic == '/cmd_vel':
             self.teleop = (msg.linear.x, msg.linear.y, msg.angular.z, time.monotonic())
 
@@ -525,7 +618,11 @@ class Sim:
         """TF 里 map → base_footprint：续建时套上 slam 坐标系的偏移（起点给对时偏移为零）。"""
         f = getattr(self, 'slam_frame', None)
         if not f or not self.procs.get('mapping'):
-            return self.x, self.y, self.th
+            e = getattr(self, 'loc_err', None)   # GO2W_FAKE_AMCL_ERR：定位偏移（导航 / 定位档）
+            if e and not self.procs.get('mapping'):
+                f = e
+            else:
+                return self.x, self.y, self.th
         tx, ty, a = f
         ca, sa = math.cos(a), math.sin(a)
         return ca*self.x - sa*self.y + tx, sa*self.x + ca*self.y + ty, wrap(self.th + a)
@@ -539,13 +636,47 @@ class Sim:
         if self.goal and self.goal['status'] in (ACCEPTED, EXECUTING):
             self.finish(ABORTED)     # 新目标抢占旧目标（Nav2 里旧目标显示为被抢占 / 放弃）
         gid = uuid.uuid4().bytes
-        p = goal.pose.pose
+        # 11-24 多点导航（NavigateThroughPoses）：goal.poses 依次经过。via = 还没经过的点；离第一个点 ≤ THROUGH_RADIUS
+        # 就划掉（和 Go2W 行为树里每轮都跑的 RemovePassedGoals 一样），最后一个点照单点导航停稳、对准朝向
+        through = hasattr(goal, 'poses')
+        ps = [q.pose for q in goal.poses] if through else [goal.pose.pose]
+        p = ps[-1]
         self.goal = {'id': gid, 'x': p.position.x, 'y': p.position.y, 'th': 2*math.atan2(p.orientation.z, p.orientation.w),
                      'status': ACCEPTED, 'fb': fb_cb, 'result': Future(), 'path': None, 'i': 0,
                      't0': time.monotonic(), 'plan_at': time.monotonic() + 0.3, 'recoveries': 0,
-                     'mark': (time.monotonic(), self.x, self.y), 'recover_until': 0.0}
+                     'mark': (time.monotonic(), self.x, self.y), 'recover_until': 0.0,
+                     'through': through, 'via': [(q.position.x, q.position.y) for q in ps]}
+        bt_file = getattr(goal, 'behavior_tree', '')
+        if through and (not ps or (bt_file and not os.path.isfile(bt_file))):
+            # 真机 bt_navigator：行为树文件读不到 → 接受后马上放弃这个目标
+            self.rosout(40, 'bt_navigator', f'BT file not found: {bt_file}' if ps else 'No goals')
+            self.goal['plan_at'] = float('inf')
+            self.later(lambda: self.goal and self.goal['id'] == gid and self.finish(ABORTED))
         self.publish_status()
         self.bt(('ComputePathToPose', 'IDLE', 'RUNNING'))
+        # 11-24 假到达：有 GO2W_FAKE_EARLY_OK 文件（默认 /tmp/go2w_fake_early_ok）时，这个目标 0.3 s 后直接报成功
+        # （真机上提前换下一站后，Nav2 有时 0.7 s 就报新目标到达，狗其实还离得远）。文件里的数字 = 还要假几次，用完删掉
+        early = os.environ.get('GO2W_FAKE_EARLY_OK', '/tmp/go2w_fake_early_ok')
+        if os.path.exists(early):
+            try:
+                left = int(open(early).read().strip() or 1) - 1
+            except (OSError, ValueError):
+                left = 0
+            try:
+                if left > 0:
+                    open(early, 'w').write(str(left))
+                else:
+                    os.unlink(early)
+            except OSError:
+                pass
+
+            def fake_ok():
+                time.sleep(0.3)
+                def apply():
+                    if self.goal and self.goal['id'] == gid and self.goal['status'] in (ACCEPTED, EXECUTING):
+                        self.finish(SUCCEEDED)
+                self.later(apply)
+            threading.Thread(target=fake_ok, daemon=True).start()
         def cancel():
             f = Future()
 
@@ -577,7 +708,8 @@ class Sim:
     def publish_status(self):
         from action_msgs.msg import GoalStatusArray
         g = self.goal
-        self.node.deliver('/navigate_to_pose/_action/status', GoalStatusArray([(g['id'], g['status'])] if g else []))
+        topic = '/navigate_through_poses/_action/status' if g and g.get('through') else '/navigate_to_pose/_action/status'
+        self.node.deliver(topic, GoalStatusArray([(g['id'], g['status'])] if g else []))
 
     def bt(self, *events):
         from nav2_msgs.msg import BehaviorTreeLog
@@ -674,7 +806,18 @@ class Sim:
         if g['status'] == ACCEPTED:
             if now < g['plan_at']:
                 return 0.0, 0.0
-            g['path'] = self.plan(g['x'], g['y'])
+            if g['through']:
+                path, start = [], (self.x, self.y)
+                for vx, vy in g['via']:
+                    seg = self.plan(vx, vy, start)
+                    if seg is None:
+                        path = None
+                        break
+                    path += seg
+                    start = (vx, vy)
+                g['path'] = path
+            else:
+                g['path'] = self.plan(g['x'], g['y'])
             if g['path'] is None:
                 self.node.get_logger().warn('fake nav: 找不到路径，放弃目标')
                 self.rosout(40, 'planner_server', 'GridBased: failed to create plan, no valid path found.')
@@ -686,6 +829,9 @@ class Sim:
             self.node.deliver('/plan', self.path_msg())
             self.rosout(20, 'controller_server', 'Received a goal, begin computing control effort.')
             g['mark'] = (now, self.x, self.y)
+        if g['through']:
+            while len(g['via']) > 1 and math.hypot(g['via'][0][0] - self.x, g['via'][0][1] - self.y) <= THROUGH_RADIUS:
+                g['via'].pop(0)
         if now < g['recover_until']:
             return 0.0, 0.0
         # 进展检查：和 nav2.yaml 的 progress_checker 一样，10 s 内没走出 0.3 m 就恢复，多次后放弃
@@ -736,9 +882,11 @@ class Sim:
         msg = N(goal_id=N(uuid=list(g['id'])),
                 feedback=N(distance_remaining=rem, navigation_time=dur(nav), estimated_time_remaining=dur(eta),
                            number_of_recoveries=g['recoveries']))
+        if g['through']:
+            msg.feedback.number_of_poses_remaining = len(g['via'])
         if g['fb']:
             g['fb'](msg)
-        self.node.deliver('/navigate_to_pose/_action/feedback', msg)   # 所有目标都有，含 patrol 发的
+        self.node.deliver('/navigate_through_poses/_action/feedback' if g['through'] else '/navigate_to_pose/_action/feedback', msg)
 
     # ---------- 运动 ----------
     def step(self, dt, now):
@@ -775,14 +923,28 @@ class Sim:
         ranges = np.where(first >= 0, r[np.maximum(first, 0)], np.inf)
         return (ranges + np.random.normal(0, 0.01, n) * np.isfinite(ranges)).astype(np.float32)
 
+    def ros_time_ns(self):
+        """统一假 ROS 时间：epoch + 单调经过时间 × 时间戳倍率；租约/超时仍继续使用真实单调时钟。"""
+        return self.ros_epoch_ns + int((time.monotonic() - self.t0) * self.stamp_rate * 1_000_000_000)
+
     def stamp(self):
-        t = (time.monotonic() - self.t0) * self.stamp_rate
-        return int(t), int((t % 1) * 1e9)
+        stamp = self.ros_time_ns()
+        self.tf_history.append((stamp, self.map_pose(), (self.x, self.y, self.th), self.tilt()))
+        return divmod(stamp, 1_000_000_000)
+
+    def tf_at(self, stamp):
+        """非零查询必须对应已实际发出的测量时间；此轻量假 TF 不做时间插值。"""
+        for sample in reversed(self.tf_history):
+            if sample[0] == stamp:
+                return sample
+        raise LookupError(f'no fake tf at measurement stamp {stamp}')
 
     def tilt(self):
         """机身 (roll, pitch)，弧度：静止约 -0.4° / 0.9°，加速抬头、转弯侧倾，外加一点抖动。"""
         t = time.monotonic()
-        return (math.radians(-0.4 + 0.6*self.w_ + 0.06*math.sin(t*5.3)),
+        if self.ctrl['state'] != 'Passive':
+            self.fall_roll = 0.0          # 站起来了：不再侧躺
+        return (math.radians(-0.4 + 0.6*self.w_ + 0.06*math.sin(t*5.3) + getattr(self, 'fall_roll', 0.0)),
                 math.radians(0.9 + 1.5*self.v + 0.08*math.sin(t*7)))
 
     def build_costmap(self):
@@ -807,7 +969,7 @@ class Sim:
     def costmap_msg(self, local):
         from nav_msgs.msg import OccupancyGrid
         m = OccupancyGrid()
-        m.info.resolution = self.res
+        m.info.resolution = float(np.float32(self.res))
         if local:   # 6 × 6 m 滚动窗口，对齐地图栅格；在 odom 坐标系（假 TF 里和 map 重合）
             half = int(3.0 / self.res)
             cx, cy = int((self.x - self.ox) / self.res), int((self.y - self.oy) / self.res)
@@ -828,7 +990,8 @@ class Sim:
         from nav_msgs.msg import OccupancyGrid
         g = OccupancyGrid()
         g.header.frame_id = 'map'
-        g.info.width, g.info.height, g.info.resolution = self.w, self.h, self.res
+        # nav_msgs/MapMetaData.resolution 在线上传输为 float32，假消息也应模拟相同舍入。
+        g.info.width, g.info.height, g.info.resolution = self.w, self.h, float(np.float32(self.res))
         g.info.origin.position.x, g.info.origin.position.y = self.ox, self.oy
         g.data = self.grid.ravel().tolist()
         self.node.deliver('/map', g)
@@ -897,14 +1060,18 @@ def run(node):
         now = time.monotonic()
         sim.ctrl_step(now)
         if os.path.exists(FAKE_FALL):
+            # 文件内容 remote = 遥控器 LT+B 趴下（机身水平）；其他 = 摔倒（侧躺 80°，和运控姿态保护 > 57° 一致）
             try:
+                with open(FAKE_FALL) as f:
+                    how = f.read().strip()
                 os.unlink(FAKE_FALL)
             except OSError:
-                pass
+                how = ''
             if sim.ctrl['state'] != 'Passive':
                 sim.ctrl.update(state='Passive', seq=sim.ctrl['seq'] + 1, t=now)
                 sim.v = sim.w_ = 0.0
-                sim.rosout(30, 'go2w_ctrl', 'FSM: Change state to Passive (fall)')
+                sim.fall_roll = 0.0 if how == 'remote' else 80.0
+                sim.rosout(30, 'go2w_ctrl', f"FSM: Change state to Passive ({'remote LT+B' if how == 'remote' else 'fall'})")
         if os.path.exists(FAKE_MOVE):
             try:
                 with open(FAKE_MOVE) as f:
@@ -941,6 +1108,8 @@ def run(node):
         map_sent = map_up
         if alive and k % 2 == 0:  # /odom、/scan、点云、Nav2 反馈 10 Hz，和真机一致
             o = Odometry()
+            o.header.frame_id = 'odom'
+            o.child_frame_id = 'base_footprint'
             o.header.stamp.sec, o.header.stamp.nanosec = sim.stamp()
             o.pose.pose.position.x, o.pose.pose.position.y = sim.x, sim.y
             o.pose.pose.orientation.z, o.pose.pose.orientation.w = math.sin(sim.th/2), math.cos(sim.th/2)
@@ -1001,6 +1170,7 @@ def run(node):
             node.deliver('/go2w/robot_lowstate', fake_lowstate())
         if sim.loc_ready() and k % 20 == 0:  # /amcl_pose：假定位误差很小，走起来略大
             a = PoseWithCovarianceStamped()
+            a.header.stamp.sec, a.header.stamp.nanosec = sim.stamp()
             a.pose.pose.position.x, a.pose.pose.position.y = sim.x, sim.y
             sd = 0.03 + 0.02*abs(sim.v)
             a.pose.covariance[0] = a.pose.covariance[7] = sd*sd

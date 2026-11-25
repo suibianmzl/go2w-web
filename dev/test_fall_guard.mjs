@@ -43,12 +43,13 @@ try {
   writeFileSync(FALL, '1');
   await until(() => state.autosave?.frozen, 5000, '摔倒后冻结');
   const F = state.autosave.frozen;
-  ok('摔倒 → 建图冻结', /意外掉到 Passive/.test(F.reason) && !F.wild, F.reason);
+  ok('摔倒 → 建图冻结', /掉到 Passive/.test(F.reason) && !F.wild, F.reason);
   ok('冻结时关上了扫描闸门', F.gate === true);
   ok('冻结信息里写着保留哪一份', F.kept === name && F.kept_wall > 0, F.kept);
   ok('日志说明了冻结和建议', logHas(/建图已冻结：.*自动保存已暂停.*续建/));
-  await until(() => incs.some(i => i.type === 'fall'), 5000, '意外趴下异常');
-  ok('记了一条「意外趴下」异常', incs.some(i => i.type === 'fall' && i.label === '意外趴下'));
+  await until(() => incs.some(i => i.type === 'fall'), 5000, '摔倒异常');
+  const F1 = incs.find(i => i.type === 'fall');
+  ok('倾角大：记了一条「摔倒」异常', F1.label === '摔倒' && /摔倒：机身倾角最大 \d+°/.test(F1.msg), F1.msg);
 
   // 2. 冻结期间自动保存不再覆盖
   const c0 = state.autosave.count, m0 = mtime(pgm);
@@ -72,6 +73,18 @@ try {
   await sleep(1500);
   ok('网页让狗趴下：不冻结、不记摔倒', !state.autosave.frozen && incs.filter(i => i.type === 'fall').length === nFall);
   await cmd('stand_up'); await until(() => ctrl() === 'Velocity', 15000, '站起 2');
+
+  // 4b. 遥控器 LT+B 趴下（机身水平）：建图照样冻结，但不记摔倒、不存包，只写日志
+  await sleep(3500);   // 过了网页趴下的宽限期（FALL_LIE_GRACE 3 s），免得被当成网页趴下的余波
+  writeFileSync(FALL, 'remote');
+  await until(() => state.autosave?.frozen, 5000, '遥控器趴下后冻结');
+  await until(() => logHas(/遥控器让狗趴下了/), 5000, '遥控器趴下日志');
+  await sleep(1000);
+  ok('遥控器趴下：不记摔倒', incs.filter(i => i.type === 'fall').length === nFall, logs.filter(t => /遥控器让狗趴下了/.test(t)).pop());
+  await cmd('stand_up'); await until(() => ctrl() === 'Velocity', 15000, '站起 3');
+  r = await cmd('map_resume');
+  ok('遥控器趴下后站起来「继续建图」成功', r.ok, r.msg);
+  await until(() => !state.autosave.frozen, 3000, '再次解除冻结');
 
   // 5. 里程计发散：冻结且不能继续
   writeFileSync(WILD, '1');

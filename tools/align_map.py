@@ -27,9 +27,14 @@ def export_map(directory, source, target, angle):
         raise ValueError('源地图必须在地图目录内')
     metadata = {}
     for line in source_yaml.read_text().splitlines():
+        # 地图配置均为顶层标量；块式示教中的image等子键不能覆盖真正底图配置。
+        if line[:1].isspace():
+            continue
         if ':' in line and not line.lstrip().startswith('#'):
             key, value = line.split(':', 1)
             metadata[key.strip()] = value.strip()
+    # 导出改变了栅格和坐标，不能把原图已校验的活动示教移植到新地图。
+    metadata.pop('go2w_taught_route', None)
     image_name = metadata['image']
     if image_name.startswith(('"', "'")):
         image_name = ast.literal_eval(image_name)

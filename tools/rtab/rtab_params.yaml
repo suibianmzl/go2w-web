@@ -1,0 +1,38 @@
+# RTAB-Map 影子库（网页 server/rtab.py 启动）：2D /scan + odom TF，只录数据库，不发 TF，不影响 slam_toolbox / AMCL
+rtab:
+  rtabmap:
+    ros__parameters:
+      frame_id: base_footprint
+      odom_frame_id: odom
+      map_frame_id: rtab_map
+      publish_tf: false
+      subscribe_depth: false
+      subscribe_rgb: false
+      subscribe_scan: true
+      approx_sync: false
+      qos_scan: 2
+      wait_for_transform: 0.3
+      Rtabmap/DetectionRate: "1"
+      Kp/MaxFeatures: "-1"
+      Mem/NotLinkedNodesKept: "false"
+      Mem/STMSize: "30"
+      Reg/Strategy: "1"
+      Reg/Force3DoF: "true"
+      RGBD/NeighborLinkRefining: "true"
+      RGBD/ProximityBySpace: "true"
+      RGBD/ProximityMaxGraphDepth: "0"
+      RGBD/ProximityPathMaxNeighbors: "10"
+      RGBD/ProximityAngle: "180"         # 360° 雷达：不按朝向筛旧节点（默认 45° 是给相机的）
+      RGBD/AngularUpdate: "0.05"
+      RGBD/LinearUpdate: "0.05"
+      RGBD/OptimizeFromGraphEnd: "false"
+      Grid/Sensor: "0"
+      Grid/CellSize: "0.05"
+      Grid/RangeMax: "20"
+      Grid/RayTracing: "true"
+      Icp/VoxelSize: "0.05"
+      Icp/PointToPlane: "false"
+      Icp/MaxCorrespondenceDistance: "0.1"
+      Icp/Iterations: "30"
+      Icp/Epsilon: "0.001"
+      Icp/CorrespondenceRatio: "0.2"

@@ -10,6 +10,7 @@ class ParameterType:
     PARAMETER_BOOL = 1
     PARAMETER_INTEGER = 2
     PARAMETER_DOUBLE = 3
+    PARAMETER_STRING = 4
 
 
 class ParameterValue:

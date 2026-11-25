@@ -487,14 +487,26 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .route-loop input:disabled,.route-loop input:disabled+span{opacity:.45}
 .route-launch .btn{width:100%}
 .route-launch .route-hint:not(:empty){margin-top:4px}
-.route-points{list-style:none;margin:6px 0 0;padding:0;max-height:180px;overflow:auto}
-.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:4px;margin-top:6px}
+.route-points{list-style:none;margin:6px 0 0;padding:0;max-height:min(48vh,420px);overflow:auto}
+.route-points li{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:4px;margin-top:6px;padding:2px 0;border-top:2px solid transparent;border-bottom:2px solid transparent}
+.route-points .route-head{display:flex;align-items:center;gap:4px;min-width:0}
+.route-points .route-grip{flex:none;cursor:grab;touch-action:none;user-select:none;color:var(--fg-2);font-size:14px;line-height:1;padding:2px 1px;overflow:visible}
+.route-points .route-grip:active{cursor:grabbing}
+.route-points .route-order{flex:none;width:28px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);text-align:center;font-size:11px;font-weight:600;padding:0}
+.route-points .route-order:focus{border-color:#6fb6ff;outline:none}
+.route-points .route-head span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.route-points li.route-dragging{opacity:.45}
+.route-points li.drop-before{border-top-color:#6fb6ff}
+.route-points li.drop-after{border-bottom-color:#6fb6ff}
+.route-points li.route-insert-after{border-bottom-color:#6fb6ff;border-bottom-style:dashed}
 .route-points span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .route-point-name{grid-column:1/-1;width:100%;min-width:0;height:24px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font-size:11px}
 .route-point-note{grid-column:1/-1;width:100%;min-width:0;min-height:38px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:4px 7px;font-family:inherit;font-size:11px;line-height:1.4;resize:vertical}
 .route-points .btn{padding:0 6px}
 .route-controls{margin-top:8px}
 .route-points .route-end{color:#94e8a8}
+.route-points li.route-replacing span{color:#6fb6ff}
+.route-points .btn.on{border-color:#6fb6ff;color:#6fb6ff}
 
 /* ---------- 右栏：任务切换 + 步骤流程（原型 web/prototype/right_panel.html） ---------- */
 .tasks{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
@@ -640,6 +652,23 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .medit .btn:disabled{opacity:.45;cursor:default}
 .medit #meditCompare.on{color:var(--accent);border-color:var(--accent-line)}
 .medit-save{width:100%}
+.medit-tabs button{flex:1;padding:6px 8px;font-weight:500}
+.medit-pane{display:flex;flex-direction:column;gap:8px}
+.keep-list{display:flex;flex-direction:column;gap:4px;max-height:220px;overflow-y:auto}
+.keep-empty{color:var(--muted);font-size:11px;line-height:1.5;padding:6px 0}
+.keep-item{display:flex;align-items:center;gap:6px;padding:3px 4px 3px 6px;border-radius:6px;border:1px solid transparent}
+.keep-item.on{border-color:rgba(255,75,92,.45);background:rgba(255,75,92,.08)}
+.keep-item input{flex:1;min-width:0;background:none;border:0;border-bottom:1px solid var(--line);color:var(--fg);font-size:12px;padding:2px 0}
+.keep-item input:focus{outline:none;border-bottom-color:var(--accent-line)}
+.keep-item .mono{flex:none;color:var(--fg-2);font-size:11px;font-family:var(--f-mono)}
+.keep-item .ib{width:22px;height:22px;flex:none}
+.keep-ic{flex:none;width:14px;height:10px}
+.keep-ic.line{border-top:2px dashed var(--crit);height:0}
+.keep-ic.zone{border:2px solid var(--crit);background:rgba(255,75,92,.25);border-radius:2px}
+.keep-live{font-size:11px;line-height:1.5;color:var(--fg-2)}
+.keep-live.ok{color:var(--ok)}
+.keep-live.warn{color:var(--warn)}
+#keepFinish{align-self:flex-start}
 .modal input.modal-select{font:12px var(--f-mono)}
 
 /* 管理地图（删除）弹窗 */
@@ -654,9 +683,85 @@ input[type=range]{width:100%;accent-color:var(--accent);height:4px}
 .mapdel-it:hover{background:var(--raise)}
 .mapdel-it input{grid-row:1 / 3;accent-color:var(--crit,#e5484d);margin:0}
 .mapdel-it .n{font-family:var(--f-mono);color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mapdel-it .n .lb{font-family:var(--f-sans,inherit);font-weight:600}
 .mapdel-it .m{grid-column:2 / 4;color:var(--muted);font-size:11px}
 .mapdel-it .m b{font-weight:500;color:var(--warn)}
 .mapdel-it .tag{font-style:normal;font-size:10px;padding:1px 6px;border-radius:9px;background:var(--raise);color:var(--accent);white-space:nowrap}
 .mapdel-it .tag.dim{color:var(--muted)}
 .mapdel-it.locked{cursor:not-allowed;opacity:.6}
 .mapdel-sum{font-size:12px;color:var(--fg-2);line-height:1.6;margin:0 0 12px;min-height:19px}
+
+/* 示教采集：四个任务入口保留紧凑横排；已保存参考和本次采样用线型及文案一起区分。 */
+#taskTabs{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}
+#taskTabs button{min-width:0;padding-left:3px;padding-right:3px;font-size:12px}
+#taskTabs button small{font-size:10px;letter-spacing:0}
+#flowTaught .hint{line-height:1.65;color:var(--fg-2)}
+#flowTaught select,#flowTaught input{min-width:0;height:30px;border:1px solid var(--line-2);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 7px;font:12px var(--f-body)}
+#flowTaught select{width:100%}#flowTaught .inrow select{flex:1}
+.taught-label{display:block;font-size:11px;color:var(--fg-2);margin:10px 0 6px}
+.taught-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0 9px}
+.taught-stats span{display:grid;gap:5px;color:var(--fg-2);font-size:11px}
+.taught-stats b{font:500 11px var(--f-mono);color:var(--fg)}
+.taught-legend{display:flex;flex-wrap:wrap;gap:5px 12px;color:var(--fg-2);font-size:10.5px;margin-bottom:12px}
+.taught-legend i{display:inline-block;width:20px;vertical-align:middle;margin-right:5px;border-top:2px solid var(--accent)}
+.taught-legend .ref{border-top-color:var(--warn);border-top-style:dashed}
+.taught-buttons{flex-wrap:wrap;margin-bottom:8px}.taught-buttons .btn{min-height:28px;height:auto;padding:5px 8px;white-space:normal}
+.taught-section{margin-top:12px;padding-top:6px;border-top:1px solid var(--line)}
+.taught-wide{width:100%;min-height:34px}
+.taught-range{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}
+.taught-range label{display:grid;gap:4px;font-size:11px;color:var(--fg-2)}
+.taught-range input{width:100%;font-family:var(--f-mono)!important}
+.taught-check-result{display:flex;align-items:center;gap:10px;margin:10px 0;padding:11px 12px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel-2)}
+.taught-check-result strong{font-size:14px;line-height:1.4}.taught-check-result p{font-size:11.5px;color:var(--fg-2);line-height:1.5;margin:3px 0 0}
+.taught-check-result[data-s="ok"]{border-color:rgba(53,212,138,.4);background:rgba(53,212,138,.08)}
+.taught-check-result[data-s="ok"] strong,.taught-check-result[data-s="ok"] .taught-status-icon{color:var(--ok)}
+.taught-check-result[data-s="crit"]{border-color:rgba(255,75,92,.4);background:rgba(255,75,92,.06)}
+.taught-check-result[data-s="crit"] strong,.taught-check-result[data-s="crit"] .taught-status-icon{color:var(--crit)}
+.taught-check-result[data-s="pending"] .taught-status-icon{color:var(--fg-2)}
+.taught-status-icon{display:flex;flex:none;width:17px;height:17px}.taught-status-icon svg{width:100%;height:100%}
+.taught-check-result .taught-status-icon{width:25px;height:25px}
+.taught-checks{padding:0;list-style:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:8px 0}
+.taught-checks li{display:flex;align-items:center;gap:7px;min-width:0;min-height:32px;padding:6px 8px;border-radius:6px;background:var(--panel-2);font-size:11.5px;line-height:1.5;color:var(--fg-2)}
+.taught-checks li>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.taught-checks li[data-s="ok"] .taught-status-icon{color:var(--ok)}.taught-checks li[data-s="crit"] .taught-status-icon{color:var(--crit)}
+.taught-checks li[data-s="pending"] .taught-status-icon{color:var(--muted)}
+.taught-check-problems{list-style:none;margin:8px 0;padding:8px 10px;border-left:2px solid var(--crit);background:rgba(255,75,92,.06);color:#ffadb5;font-size:11.5px;line-height:1.6}
+.taught-check-problems li+li{margin-top:6px}
+.taught-check-details{margin:6px 0 10px;color:var(--fg-2);font-size:11px;line-height:1.6}
+.taught-check-details summary{cursor:pointer;min-height:32px;padding:7px 0}.taught-check-details summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+.taught-check-details ul{list-style:none;padding:8px 10px;margin:0;background:var(--panel);border-radius:6px;overflow-wrap:anywhere}
+.taught-check-details li+li{margin-top:7px}
+#taughtPrepare[data-complete="true"]{opacity:1;color:var(--muted);background:var(--panel);border-color:var(--line)}
+.taught-capture-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}
+.taught-capture-head b{font-size:12px}.taught-capture-head span{font-size:10px;color:var(--fg-2)}
+.taught-link,.taught-layer-edit{color:var(--accent);font-size:11px;text-underline-offset:3px}
+.taught-editor-link{width:100%;text-decoration:none;margin-top:12px;min-height:32px}
+.taught-layer-edit{float:right;font-size:10px;margin-left:8px}
+#taughtMessage{margin-top:10px;overflow-wrap:anywhere;color:var(--fg-2)}
+#taughtState{font-size:10px}
+@media(max-width:420px){#taskTabs{grid-template-columns:repeat(2,minmax(0,1fr))}#taskTabs button{min-height:44px}}
+
+/* RTAB 影子库卡片（rtab.js） */
+#rtabNote{white-space:pre-line}
+#rtabBtns{flex-wrap:wrap;margin-bottom:2px}
+#rtabBtns[hidden]{display:none}
+#rtabCard .map-chk{margin-top:6px}
+
+/* 任务接续（11-24）：上次没跑完的断点 */
+.route-resume{margin:10px 0;padding:10px;border:1px solid var(--warn);border-radius:6px;display:grid;gap:6px}
+.route-resume-head{display:flex;justify-content:space-between;gap:8px;align-items:baseline;font-size:12px}
+.route-resume-head b{color:var(--warn)}
+.route-resume-head span{font:11px var(--f-mono);color:var(--muted)}
+.route-resume-info{font-size:12px;color:var(--fg-2)}
+.route-resume-why{font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.route-resume-stops{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:4px}
+.route-resume-stops li{min-width:22px;padding:1px 5px;border:1px solid var(--line-2);border-radius:10px;font:11px var(--f-mono);text-align:center;color:var(--muted)}
+.route-resume-stops li[data-s="done"]{border-color:var(--ok);color:var(--ok)}
+.route-resume-stops li[data-s="next"]{border-color:var(--warn);color:var(--warn);font-weight:600}
+
+/* 站点停留秒数（11-24） */
+.route-point-dwell{grid-column:1/-1;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.route-point-dwell input{width:64px;height:22px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);padding:0 6px;font:11px var(--f-mono)}
+.route-point-dwell input:disabled{opacity:.4}
+/* 设了停留的站：列表里和地图上一样用橙色 */
+.route-points .route-head span.route-stay{color:#ff9f5a}

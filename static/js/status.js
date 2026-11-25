@@ -3,7 +3,7 @@
 // 同时满足几个时取最上面的：急停 > 出发失败 > 准备出发 > 任务（恢复中 / 暂停 / 运行中）> 已到达 / 任务失败
 //   > 遥控 > 建图 / 重定位 > 档位启停 > 待命 / 未就绪。
 // 颜色和地图上的小车一致：运行琥珀、到达绿、故障红。
-import { $ } from './util.js';
+import { $, mapTitle } from './util.js';
 
 const KEEP = 0.3;   // m：到达 / 失败的结果一直显示，直到机器人离开那个位置这么远，或开始新的操作
 
@@ -60,7 +60,7 @@ export function setupRunState(store, actions, mapView){
     if (run('navigation')){
       if (!store.initPose) return ['off', '未就绪', '还没有定位'];
       if (C?.on && C.state != null && !(C.state === 'Velocity' && C.ready)) return ['idle', '待命', C.state === 'Passive' ? '趴着 · 出发时自动站起' : '站着 · 出发时启动策略'];
-      return ['idle', '待命', `已定位${store.mapCurrent ? ' · ' + store.mapCurrent : ''}`];
+      return ['idle', '待命', `已定位${store.mapCurrent ? ' · ' + mapTitle(store.mapLabels, store.mapCurrent) : ''}`];
     }
     return ['off', '未就绪', '导航没开 · 点「出发」自动启动'];
   }
