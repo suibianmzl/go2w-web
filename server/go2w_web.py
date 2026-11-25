@@ -1560,9 +1560,10 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.route = None
         self.route_job = None
         self.route_starting = False
-        self.obstacles_critic = ObstaclesCriticAPI(busy=lambda: self.route_running() and (
-            self.crossing_dirty or (self.route and any(p.get('forceCrossing') for p in self.route['record']['points']))))
         self.crossing_dirty = False
+        self.obstacles_critic = ObstaclesCriticAPI(busy=lambda: self.route_running() and (
+            self.crossing_dirty or (self.route and any(p.get('forceCrossing') for p in self.route['record']['points']))),
+            on_disabled=lambda: setattr(self, 'crossing_dirty', False))
         self.goal_pending = False
         self.resume_file = os.path.join(DATA, 'route_resume.json')
         self.resumes = {}
@@ -1806,6 +1807,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'goal':
                 if self.estop:
                     return False, '急停中：先解除急停'
+                if getattr(self, 'crossing_dirty', False):
+                    return False, '强制跨越尚未恢复为 false，请先恢复参数后再下发单点目标'
                 reason = self.ctrl_blocker()
                 if reason:
                     return False, reason
@@ -2842,9 +2845,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         """改变坐标、朝向或强制跨越区间后，旧断点不能继续使用。"""
         pts = [(round(p['x'], 3), round(p['y'], 3), round(p['th'], 3)) for p in record['points']]
         crossing = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
-        if crossing:     # 无配置的旧路线保持原来的断点指纹
-            pts.append(crossing)
-        return hashlib.sha1(json.dumps(pts).encode()).hexdigest()[:16]
+        # 字段名区分几何与配置，避免三个标记索引与一个坐标点混淆；旧路线保持原指纹。
+        payload = {'points': pts, 'forceCrossing': crossing} if crossing else pts
+        return hashlib.sha1(json.dumps(payload).encode()).hexdigest()[:16]
 
     def resume_valid(self, rid, cp, now=None):
         r = self.routes.get(rid)
@@ -3640,7 +3643,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             poses = []
             for k, (_, pt, dwell, nxt) in enumerate(seg):
                 last = k == len(seg) - 1
-                if last and (dwell or nxt is None):
+                if last and (dwell or nxt is None or seg[k][0][0] in (route.get('crossing') or ())):
                     th = pt['th']                       # 要停下来的站：站点自己的朝向
                 else:                                   # 途经点 / 分段处：面向下一站
                     q = seg[k + 1][1] if not last else self.route_pose(points, nxt[0], nxt[2])

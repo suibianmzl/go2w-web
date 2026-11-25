@@ -67,6 +67,30 @@ class ObstaclesCriticAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('node not found', await response.text())
 
     @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_ros_parameter_rejection_with_zero_exit_is_an_error(self, create_process):
+        process = Mock(returncode=0)
+        process.communicate = AsyncMock()
+        create_process.return_value = process
+        for stdout in (b'', b'client information'):
+            process.communicate.return_value = (stdout, b'Setting parameter failed: read-only parameter')
+            response = await self.client.post('/api/obstacles-critic/true')
+            self.assertEqual(response.status, 502)
+            self.assertIn('read-only parameter', await response.text())
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
+    async def test_only_successful_false_notifies_recovery(self, create_process):
+        self.api.on_disabled = Mock()
+        process = Mock(returncode=0)
+        process.communicate = AsyncMock(return_value=(b'', b'Setting parameter failed: rejected'))
+        create_process.return_value = process
+        await self.client.post('/api/obstacles-critic/false')
+        self.api.on_disabled.assert_not_called()
+        process.communicate.return_value = (b'Set parameter successful', b'')
+        response = await self.client.post('/api/obstacles-critic/false')
+        self.assertEqual(response.status, 200)
+        self.api.on_disabled.assert_called_once_with()
+
+    @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
     async def test_cross_origin_write_is_rejected(self, create_process):
         response = await self.client.post('/api/obstacles-critic/true',
                                           headers={'Origin': 'http://foreign.test'})

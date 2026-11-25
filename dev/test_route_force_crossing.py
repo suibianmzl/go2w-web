@@ -3,6 +3,7 @@ import asyncio
 from pathlib import Path
 import sys
 import threading
+import time
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import AsyncMock
@@ -41,10 +42,20 @@ class CrossingDataTests(unittest.TestCase):
 
     def test_editing_crossing_invalidates_resume_but_old_fingerprint_is_compatible(self):
         plain = self.record(points())
+        self.assertEqual(Server.route_fp(plain), '74d505e275f1339a')
         marked = self.record(points((1, 3)))
         self.assertNotEqual(Server.route_fp(plain), Server.route_fp(marked))
         renamed = {**plain, 'name':'改名'}
         self.assertEqual(Server.route_fp(plain), Server.route_fp(renamed))
+
+    def test_marker_indices_cannot_collide_with_an_added_waypoint(self):
+        marked = self.record(points((0, 1, 3))[:4])
+        plain = self.record(points()[:4] + [dict(x=0, y=1, th=3)])
+        self.assertNotEqual(Server.route_fp(marked), Server.route_fp(plain))
+        host = Server.__new__(Server)
+        host.routes = {'test':plain}
+        checkpoint = dict(fp=Server.route_fp(marked), index=2, loop=1, done=2, time=time.time())
+        self.assertFalse(host.resume_valid('test', checkpoint))
 
 
 class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -52,7 +63,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         host = Server.__new__(Server)
         trace, logs = [], []
         node = NS(fixed='map', lock=threading.Lock(), goal=None, position=pos,
-                  nav_through=NS(server_is_ready=lambda: True))
+                  nav_through=NS(server_is_ready=lambda: True), sent_poses=[])
         node.lookup = lambda _: node.position
         node.event = lambda level, message: logs.append((level, message))
         counter = 0
@@ -60,6 +71,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
             nonlocal counter
             counter += 1
             trace.append(('send', tuple(p[0] for p in poses)))
+            node.sent_poses.extend(poses)
             handle = NS(accepted=True, goal_id=NS(uuid=[counter]), poses=poses,
                         cancel_goal_async=AsyncMock(return_value=None))
             future = asyncio.get_running_loop().create_future(); future.set_result(handle)
@@ -201,6 +213,46 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         await host.run_route(None, route)
         self.assertEqual(trace[0], ('param', False))
         self.assertFalse(host.crossing_dirty)
+
+    async def test_crossing_boundaries_keep_point_headings_in_both_modes(self):
+        for through in (False, True):
+            with self.subTest(through=through):
+                host, route, _, _ = self.rig(through=through)
+                route['record']['points'][1]['th'] = 1.3
+                route['record']['points'][3]['th'] = -1.3
+                await host.run_route(None, route)
+                sent = {p[0]:p[2] for p in host.node.sent_poses}
+                self.assertEqual((sent[2.], sent[4.]), (1.3, -1.3))
+
+    async def test_single_goal_cannot_bypass_failed_crossing_reset(self):
+        host, route, trace, _ = self.rig()
+        async def fail(enabled):
+            if not enabled:
+                raise RuntimeError('reset unavailable')
+        host.obstacles_critic.apply.side_effect = fail
+        await host.run_route(None, route)
+        self.assertTrue(host.crossing_dirty)
+        class WS:
+            closed = False
+        ws = WS()
+        host.clients = {ws:{}}
+        host.route, host.route_job = route, None
+        host.map_busy = host.checking_route = host.estop = host.goal_pending = False
+        host._taught_job = host.climb = None
+        host.taught_recording = host.taught_open = lambda: False
+        host.ctrl_blocker = lambda: None
+        host.prof = lambda _: 'stop'
+        host.node.nav = NS(server_is_ready=lambda: True)
+        host.node.map_current = 'lab'
+        host.node.is_armed = lambda: True
+        host.node.goal = None
+        host.check_ordinary_taught_binding = AsyncMock(return_value=(True, ''))
+        host.keepout_blocker = lambda *_: None
+        tracked = host.node.track_goal
+        host.node.track_goal = lambda handle, pose, kind='goal': tracked(handle, pose, kind)
+        reply = await host.handle_cmd(ws, dict(op='goal', x=99., y=0., th=0.))
+        self.assertFalse(reply[0], reply)
+        self.assertFalse(any(e == ('send', (99.,)) for e in trace))
 
 
 if __name__ == '__main__':

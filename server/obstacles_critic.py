@@ -10,9 +10,10 @@ class ObstaclesCriticAPI:
     PARAMETER = 'FollowPath.ObstaclesCritic.enabled'
     TIMEOUT = 10.0
 
-    def __init__(self, busy=lambda: False):
+    def __init__(self, busy=lambda: False, on_disabled=lambda: None):
         self.lock = asyncio.Lock()
         self.busy = busy
+        self.on_disabled = on_disabled
 
     def routes(self, app):
         app.router.add_post('/api/obstacles-critic/true', self.set_from_true)
@@ -61,7 +62,11 @@ class ObstaclesCriticAPI:
             raise web.HTTPGatewayTimeout(text='设置 ROS 参数超时')
         except OSError as e:
             raise web.HTTPBadGateway(text=f'无法执行 ros2：{e.strerror or e}')
-        output = (stdout or stderr).decode('utf-8', errors='replace').strip()
-        if proc.returncode != 0:
+        output = b'\n'.join(part for part in (stdout, stderr) if part).decode('utf-8', errors='replace').strip()
+        # Humble 的 ros2param 在节点拒绝修改时仍可能以 0 退出。
+        rejected = any(line.strip().startswith('Setting parameter failed') for line in output.splitlines())
+        if proc.returncode != 0 or rejected:
             raise web.HTTPBadGateway(text=output or f'ros2 命令失败（退出码 {proc.returncode}）')
+        if not enabled:
+            self.on_disabled()
         return output
