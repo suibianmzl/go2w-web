@@ -190,7 +190,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#estopBanner').hidden = !store.estop;
   }
   $('#armBtn').onclick = () => actions.arm();
-  $('#estopBtn').onclick = () => actions.estop();
+  $('#estopBtn').onclick = () => actions.estop('急停按钮');
   $('#estopRelease').onclick = () => actions.releaseEstop();
   // 「导航任务」卡片上的临时调速 + 调试区的指令超时：滑条平时跟着实际参数走（真机上来自 cmd_bridge）；
   // 拖动中不打断，松手后立即设给 cmd_bridge，只影响这次运行（任务里保存的参数不变），失败就弹回实际值。

@@ -93,7 +93,7 @@ $$('[data-tool]').forEach(button => { button.onclick = () => setTool(button.data
 window.addEventListener('keydown', e => {
   if (e.target.closest('input,select,textarea')) return;
   const k = e.key.toLowerCase();
-  if (e.code === 'Space'){ e.preventDefault(); actions.estop(); return; }
+  if (e.code === 'Space'){ e.preventDefault(); actions.estop('空格键'); return; }
   if (mapView.tool === 'edit' && mapView.editKey(e)) return;   // 地图编辑：Ctrl/⌘+Z 撤销、Ctrl/⌘+Shift+Z 重做
   if (mapView.tool === 'teleop' && 'wasdqe'.includes(k) && k.length === 1){
     if (!keys[k]){ keys[k] = true; $$(`.keys kbd[data-k="${k}"]`).forEach(x => x.classList.add('dn')); teleCmd(); }

@@ -35,9 +35,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   };
   const busyMsg = () => store.mapSaving || store.mapBusy ? '地图正在保存，请稍等' : store.busy ? '上一个启停还没完成，稍等几秒' : '';
   // 停车：取消任务 + 上锁（导航栈不动）
-  async function park(){
-    if (routeActive() || store.task.type !== 'idle') await exec(src.cmd.cancel());
-    if (store.armed) await exec(src.cmd.arm(false));
+  async function park(why){
+    if (routeActive() || store.task.type !== 'idle') await exec(src.cmd.cancel(why));
+    if (store.armed) await exec(src.cmd.arm(false, why));
   }
 
   function startStack(mode, title, body, uiTask){
@@ -64,7 +64,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     if (t === 'taught'){
       const go = async () => {
         if (up('mapping')){ const r = await exec(src.cmd.setMode(null)); if (r?.ok === false) return; }
-        await park(); setTool('pan'); resetPrep(); store.uiTask = 'taught'; taught.enter(); render();
+        await park('切到示教'); setTool('pan'); resetPrep(); store.uiTask = 'taught'; taught.enter(); render();
       };
       if (up('mapping')) return formBox({title:'切换到示教采集',body:'将停止建图，使用已保存的地图记录参考轨迹。',warn:leavingMapWarn(),ok:'停止建图并切换',danger:!store.mapSavedAt,onOk:go});
       if (routeActive()) return formBox({title:'切换到示教采集',body:'当前导航任务会取消，底盘会上锁。选择地图并完成定位自检后，再明确开始采集。',ok:'取消任务并切换',danger:true,onOk:go});
@@ -87,7 +87,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     }
     if (t === 'reloc'){
       if (run('navigation')){
-        const go = async () => { store.uiTask = 'reloc'; resetPrep(); render(); await park(); toast('导航栈保持运行，底盘已上锁', 'warn'); };
+        const go = async () => { store.uiTask = 'reloc'; resetPrep(); render(); await park('切到重定位'); toast('导航栈保持运行，底盘已上锁', 'warn'); };
         if (routeActive()) return formBox({ title: '切换到重定位', body: '当前多站任务会被取消，底盘会上锁。导航栈保持运行，改完位置可以直接回到导航。', ok: '取消任务并切换', danger: true, onOk: go });
         return go();
       }

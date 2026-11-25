@@ -1715,6 +1715,15 @@ class Server(TaughtWeb, RT.RtabWeb):
     def remote(self, ws):
         return self.clients.get(ws, {}).get('remote', '?')
 
+    def cmd_source(self, ws, d):
+        """停车类指令的来源，写进日志：IP（127.0.0.1 = 本机云端网关转发）+ 网页说明的触发方式（why，如「取消按钮」「切到重定位」）。"""
+        ip = self.remote(ws)
+        src = f'云端网关 {ip}' if str(ip).startswith('127.0.0.1') else str(ip)
+        why = d.get('why')
+        if isinstance(why, str) and why.strip():
+            src += f'，{why.strip()[:24]}'
+        return src
+
     async def run_cmd(self, ws, d):
         try:
             ok, text, *data = await self.handle_cmd(ws, d)
@@ -1764,15 +1773,16 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'estop':
                 # 先停车，再记日志
                 self.estop, self.estop_t = True, time.monotonic()
-                self.climb_off(f'网页急停（{self.remote(ws)}）')
-                errors = await self.disarm_and_cancel(f'网页急停（{self.remote(ws)}）')
+                src = self.cmd_source(ws, d)
+                self.climb_off(f'网页急停（{src}）')
+                errors = await self.disarm_and_cancel(f'网页急停（{src}）')
                 if 'estop' not in self.inc_open:
-                    self.inc_open['estop'] = self.incident('estop', f'网页急停（{self.remote(ws)}）', ongoing=True)
+                    self.inc_open['estop'] = self.incident('estop', f'网页急停（{src}）', ongoing=True)
                 return (False, '急停已锁存，但：' + '；'.join(errors)) if errors else (True, '已急停：导航已取消，底盘已上锁')
             if op == 'release_estop':
                 self.estop = False
                 self.incident_close('estop')
-                n.event('INFO', '急停已解除（底盘仍上锁）')
+                n.event('INFO', f'急停已解除（底盘仍上锁）（{self.cmd_source(ws, d)}）')
                 return True, '急停已解除，底盘仍处于上锁'
             if op == 'initial_pose':
                 if 'amcl' not in n.get_node_names():
@@ -1846,10 +1856,13 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'cancel':
                 if cancelled_preparation:
                     return True, '已取消示教准备，不再继续后续站立或定位阶段'
-                await self.taught_interrupt('手动取消，示教草稿已保留')
+                src = self.cmd_source(ws, d)
+                await self.taught_interrupt(f'手动取消（{src}），示教草稿已保留')
                 self.motion_stops += 1
                 try:
-                    self.stop_route('手动取消')
+                    if not self.route_running():
+                        n.event('INFO', f'手动取消导航（{src}）')
+                    self.stop_route(f'手动取消（{src}）')
                     # 巡逻中只取消当前目标的话，patrol.py 会重试，机器人又走起来：要连巡逻一起停
                     if self.prof('patrol') != 'stop':
                         await self.procs.stop_patrol()
@@ -1869,14 +1882,14 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if on and self.estop:
                     return False, '急停中：先解除急停'
                 if not on and self.route_running():
-                    errors = await self.disarm_and_cancel('底盘上锁')
+                    errors = await self.disarm_and_cancel(f'底盘上锁（{self.cmd_source(ws, d)}）')
                     return (False, '；'.join(errors)) if errors else (True, '底盘已上锁，任务已取消')
                 if not n.arm_cli.service_is_ready():
                     return False, '速度桥没有运行（刚开机或刚切换档位时要等几秒）'
                 r = await self.aw(n.call_arm(on), 2.0)
                 if r.success:
                     n.armed, n.armed_t = on, time.monotonic()
-                n.event('WARN' if on else 'INFO', f"{'解锁' if on else '上锁'}：{r.message}（{self.remote(ws)}）")
+                n.event('WARN' if on else 'INFO', f"{'解锁' if on else '上锁'}：{r.message}（{self.cmd_source(ws, d)}）")
                 return r.success, r.message  # 以 cmd_bridge 的回复为准
             if op == 'set_param':
                 key = d.get('key')
@@ -5685,20 +5698,23 @@ class Server(TaughtWeb, RT.RtabWeb):
                 note += f'；{len(self.keepouts[name])} 个禁行区已带到新图'
             except (ValueError, OSError) as e:
                 note += f'；禁行区没能带到新图（{e}）'
+        # 11-25：原来是把原图的任务「改到」新图（原图上的任务就没了）。另存为是复制一份新图，
+        # 原图和它的任务都不该动 → 改成复制：新图得到一份新 id 的副本，原图任务原样保留
         if d.get('routes'):
-            if self.route_running():
-                note = '；有任务正在执行，路线没有改到新图'
-            else:
-                routes = {k: (dict(r, map=name) if r.get('map') == source else r) for k, r in self.routes.items()}
-                moved = sum(1 for k in routes if routes[k].get('map') != self.routes[k].get('map'))
-                if moved:
-                    try:
-                        self.write_routes(routes)
-                        await self.send_all(self.routes_message(), key='routes')
-                    except OSError as e:
-                        moved, note = 0, f'；路线没能改到新图（{e}）'
-        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务改到新图" if moved else ""}；{who}）')
-        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已改到新图' if moved else '') + note
+            copies = {}
+            for r in self.routes.values():
+                if r.get('map') == source:
+                    rid = uuid.uuid4().hex
+                    copies[rid] = dict(r, id=rid, map=name)
+            if copies:
+                try:
+                    self.write_routes({**self.routes, **copies})
+                    moved = len(copies)
+                    await self.send_all(self.routes_message(), key='routes')
+                except OSError as e:
+                    note = f'；任务没能复制到新图（{e}）'
+        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务复制到新图（原图任务保留）" if moved else ""}；{who}）')
+        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已复制到新图（原图任务保留）' if moved else '') + note
 
     # ---------- 删除地图（11-18） ----------
     # 不是真删：<名字>.* 整套文件挪进 data/maps/.trash/<时间>_<名字>/，绑在这张图上的任务（routes.json）

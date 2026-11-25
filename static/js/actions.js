@@ -191,20 +191,25 @@ export function createActions(store, src){
         warn: `激光和地图的匹配率只有 ${m.toFixed(0)}%，建议先重新定位。`,
         onCancel: () => resolve(null), onOk: () => resolve(go()) }));
     },
-    cancel(){ if (ready('cancel')) exec(src.cmd.cancel(), '任务已取消'); },
+    cancel(){
+      if (!ready('cancel')) return;
+      const go = () => exec(src.cmd.cancel('取消按钮'), '任务已取消');
+      if (store.task.type === 'idle') return go();   // 没有任务在跑：不用确认
+      confirmBox({ title: '取消任务', body: '机器狗会停下，当前任务结束（多点任务之后可以「继续」从断点接着跑）。', ok: '确认取消', danger: true, onOk: go });
+    },
     pause(){ if (ready('pause')) src.cmd.pause(!src.paused); },
     arm(){
       if (!ready('arm') || store.estop) return;
-      if (store.armed) return exec(src.cmd.arm(false), '底盘已锁定');
+      if (store.armed) return exec(src.cmd.arm(false, '上锁按钮'), '底盘已锁定');
       if (!run('navigation') && !run('bridge')) return toast('速度桥不在线（刚开机或刚切换档位时要等几秒）', 'err');
       if (run('navigation') && !store.odomOk) return toast('里程计不健康，不能解锁', 'err');
       confirmBox({ title: '解锁底盘', body: '解锁后机器人会执行导航和遥控的速度指令。确认机器人周围没有人和障碍物。', ok: '解锁',
         onOk: () => exec(src.cmd.arm(true), '底盘已解锁') });
     },
-    estop(){
+    estop(why){
       if (!ready('estop') || store.estop) return;
       store.estop = true; // 先在界面上锁存，后端的状态随后确认
-      Promise.resolve(src.cmd.estop()).then(r => {
+      Promise.resolve(src.cmd.estop(why)).then(r => {
         if (r && r.ok === false) toast(store.link.ok ? `急停没有完全生效：${r.msg}` : '急停没有发出去：网页和后端断开了，请用遥控器停车', 'err');
       });
     },
