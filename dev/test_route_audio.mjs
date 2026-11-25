@@ -110,7 +110,9 @@ try {
   await go(q, { ...first, th:-Math.PI / 2 }); await until(() => c.heard.length, '起点播', 8000); await ended(q.name); await quiet();
   assert.deepEqual(names(), ['走廊讲解']); console.log('PASS 已在第 1 站附近出发：第 1 站照样播');
 
-  const lp = await save('播报-循环', [{ ...points[0], audio:A }, points[1], points[2]], { loop:true, loops:2 }); made.push(lp);
+  // 第 3 站放远（3.5 m）：经过半径 1.0 m 时 A、B、C（两两 0.7 m）会在同一拍一起划掉，「回到 1 号点」和出发时的 1 号点挤在一起只播一次
+  const far = { x:3.06, y:-2.71, th:0, name:'远处', manualHeading:true };
+  const lp = await save('播报-循环', [{ ...points[0], audio:A }, points[1], far], { loop:true, loops:2 }); made.push(lp);
   await cmd('initial_pose', { ...points[2], th:Math.PI / 2 }); await cmd('arm', { on:true }); c.heard.length = 0;
   await cmd('route_start', { route_id:lp.id, round_trip:true, loops:2 }); await ended(lp.name, 120000); assert.equal(c.task.status, 'succeeded', c.task.message); await quiet();
   assert.deepEqual(names(), ['入口讲解', '入口讲解', '入口讲解']); console.log('PASS 循环 2 圈：出发、每次回到 1 号点都播（3 次）');
