@@ -66,6 +66,37 @@ int main() {
 
 
 class SaveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_names_include_reason_tags_and_remain_valid(self):
+        import go2w_web as W
+        from datetime import datetime
+        with tempfile.TemporaryDirectory() as d:
+            server=W.Server.__new__(W.Server)
+            server.procs_status={'rollback':True};server.rollback_saving=False
+            server.node=NS(event=lambda *args:None)
+            names=[]
+            async def advance(_delay):
+                request=Path(d)/'bags/.rollback/request'
+                if request.exists():
+                    name=request.read_text().split()[0];request.unlink();names.append(name)
+                    bag=Path(d)/'bags'/name;bag.mkdir()
+                    (bag/'metadata.yaml').write_text('duration:\n  nanoseconds: 30000000000\n')
+            stamp=datetime(2026,11,25,15,35,58);strftime=W.time.strftime
+            cases=[(('nav_fail',),'_navfail_'),(('stuck',),'_longstop_'),
+                   (('nav_fail','stuck'),'_longstop_navfail_'),
+                   (('stuck','nav_fail'),'_longstop_navfail_')]
+            with patch.object(W,'DATA',d),patch.object(W.time,'strftime',side_effect=lambda fmt,*_:strftime(fmt,stamp.timetuple())), \
+                    patch.object(W.asyncio,'sleep',side_effect=advance):
+                for rid in ('go2w-02','a'*30):
+                    with patch.object(W,'robot_id',return_value=(rid,'test')):
+                        for types,marker in cases:
+                            ok,msg=await server.rollback_save('auto',30,incident_types=types)
+                            self.assertTrue(ok,msg)
+                            self.assertIn(marker,names[-1])
+                            self.assertLessEqual(len(names[-1]),48)
+                            self.assertRegex(names[-1],W.P.SAFE_NAME)
+            self.assertEqual(len(names),len(set(names)))
+            self.assertTrue(names[3].endswith('_2'))
+
     async def test_long_robot_id_and_collisions_keep_manual_capture_name_valid(self):
         import go2w_web as W
         from datetime import datetime

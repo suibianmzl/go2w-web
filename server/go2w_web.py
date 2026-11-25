@@ -4262,10 +4262,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             await asyncio.sleep(1.0)
         for rid in p['ids']:
             L.set_bag(rid, 'saving')
-        labels = '、'.join(dict.fromkeys(r['label'] for r in map(L.get, p['ids']) if r))
+        records = [r for r in map(L.get, p['ids']) if r]
+        labels = '、'.join(dict.fromkeys(r['label'] for r in records))
         try:
             # 起点固定在第一条异常前 STUCK_BEFORE 秒；等手动保存多过去的秒数也算进去
-            ok, msg = await self.rollback_save(f'异常自动保存：{labels}', STUCK_BEFORE + time.monotonic() - p['t0'])
+            ok, msg = await self.rollback_save(f'异常自动保存：{labels}', STUCK_BEFORE + time.monotonic() - p['t0'],
+                                               incident_types={r['type'] for r in records})
         except Exception as e:
             ok, msg = False, f'{e!r}'
         name = self.rollback_last if ok else None
@@ -4300,8 +4302,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False),
                                  headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
-    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None, voice_seconds=None):
-        """trigger：人在网页上点「保存刚才 N 秒」→ 包名 狗编号_trigger_MMDD_HHMMSS；异常自动保存不带（11-24）。"""
+    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None, voice_seconds=None, incident_types=()):
+        """手动包带 trigger；自动包按 incident_types 添加 longstop/navfail 原因标签。"""
         if not (self.procs_status or {}).get('rollback'):
             return False, '回溯录制没在运行：先打开回溯，并启动建图 / 定位 / 导航'
         if self.rollback_saving:
@@ -4313,7 +4315,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
         rid = robot_id()[0]
-        base = time.strftime(f"{rid}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
+        reasons = ''.join('_' + tag for typ, tag in (('stuck', 'longstop'), ('nav_fail', 'navfail'))
+                          if typ in incident_types)
+        base = time.strftime(f"{rid}{'_trigger' if trigger else reasons}_%m%d_%H%M%S")
         if after:
             base += '_r'  # 独立后缀避免收集后10秒期间与普通分段同名。
         def capture_name(suffix=''):

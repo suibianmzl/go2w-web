@@ -70,9 +70,11 @@ def fake_server(tmp):
         setattr(s, name, getattr(W.Server, name).__get__(s))
     s.shown_map = lambda: 'lab'
     s.fail_save = False
+    s.save_types = []
 
-    async def rollback_save(who, seconds):
+    async def rollback_save(who, seconds, *, incident_types=()):
         saves.append((who, round(seconds, 1)))
+        s.save_types.append(incident_types)
         if s.fail_save:
             return False, '回溯保存超时'
         name = f'go2w-01_bag{len(saves)}'
@@ -101,6 +103,7 @@ async def scheduling(tmp):
     await asyncio.sleep(0.5)
     check(f'只存了一个包，长度 = 前 15 + 后 0.4 {saves}', len(saves) == 1 and saves[0][1] == 15.4)
     check('包名写回两条异常', L.get(a)['bag'] == L.get(b)['bag'] == {'state': 'saved', 'name': 'go2w-01_bag1', 'msg': ''})
+    check('合并异常的两种原因传入命名', set(s.save_types[0]) == {'stuck', 'nav_fail'})
     check('存包说明里列出两种异常', '长时受阻' in saves[0][0] and '导航失败' in saves[0][0])
     with open(os.path.join(tmp, 'bags', 'go2w-01_bag1', 'incidents.json'), encoding='utf-8') as f:
         check('包目录里有异常说明', [x['id'] for x in json.load(f)] == [a, b])
