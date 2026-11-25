@@ -1916,7 +1916,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     return ok, msg, {'name': self.rollback_last, 'duration_s': bag.get('dur'), 'requested_s': ROLLBACK_SECONDS + ROLLBACK_AFTER}
                 return ok, msg, {'uncertain': '超时' in msg or '已提交' in msg}
             if op == 'bag_upload':
-                return await self.bag_upload(d.get('name'), self.remote(ws))
+                return await self.bag_upload(d.get('name'), self.remote(ws), verify=d.get('verify') is True)
             if op == 'bag_stop':
                 await self.bag_stop()
                 n.event('INFO', '录包已停止')
@@ -4537,6 +4537,20 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.rollback_saving = False
 
+    def bag_source_fingerprint(self, name):
+        root = os.path.join(DATA, 'bags', name)
+        files = []
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and not os.path.islink(os.path.join(folder, d))]
+            for filename in names:
+                path = os.path.join(folder, filename)
+                relative = os.path.relpath(path, root)
+                if filename.startswith('.') or relative == 'recording-link.json' or os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                files.append((relative, st.st_size, st.st_mtime_ns))
+        return hashlib.sha256(json.dumps(sorted(files)).encode()).hexdigest()
+
     def restore_upload_receipts(self):
         try:
             with open(self.uploads_file) as f:
@@ -4545,6 +4559,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
                     continue
                 bag = os.path.join(DATA, 'bags', name)
+                stale_reason = '录包关联信息已变化，请核对并补齐'
                 if isinstance(value, dict):
                     fingerprint = value.get('bundle_fingerprint')
                     try:
@@ -4553,21 +4568,32 @@ class Server(TaughtWeb, RT.RtabWeb):
                     except OSError:
                         current = None
                     done = bool(fingerprint and fingerprint == current)
+                    if value.get('upload_target') != UPLOAD_DEST:
+                        done = False
+                        stale_reason = '上传目标已变化或旧回执未记录目标，请核对当前服务器'
+                    if done:
+                        try:
+                            done = bool(value.get('source_fingerprint') and value['source_fingerprint'] == self.bag_source_fingerprint(name))
+                        except OSError:
+                            done = False
+                        if not done:
+                            stale_reason = '录包内容已变化或旧回执不完整，请重新核对'
                     msg = value.get('msg', '')
                 elif isinstance(value, str):
                     fingerprint, msg = None, value
-                    done = not any(os.path.exists(os.path.join(bag, fn)) for fn in ('voice-note.audio', 'voice-note.json', 'capture.json'))
-                    done = done and not os.path.exists(os.path.join(DATA, 'bags', '.captures', 'by-name', name + '.json'))
+                    done = False
+                    stale_reason = '旧上传回执未记录目标，请核对当前服务器'
                 else:
                     continue
                 self.uploads[name] = {'state': 'done' if done else 'stale', 'pct': 100 if done else 0,
-                                      'msg': msg if done else '旧上传回执未核对数据与录音，请重新上传整包',
-                                      **({'bundle_fingerprint': fingerprint} if fingerprint else {})}
+                                      'msg': msg if done else stale_reason,
+                                      **({'bundle_fingerprint': fingerprint} if fingerprint else {}),
+                                      **({key: value[key] for key in ('upload_target', 'source_fingerprint') if key in value} if isinstance(value, dict) else {})}
         except (OSError, ValueError, AttributeError):
             pass
 
     def save_upload_receipts(self):
-        done = {k: {'msg': u['msg'], 'bundle_fingerprint': u['bundle_fingerprint']} if u.get('bundle_fingerprint') else u['msg']
+        done = {k: {key: u[key] for key in ('msg', 'bundle_fingerprint', 'upload_target', 'source_fingerprint') if key in u} if u.get('bundle_fingerprint') else u['msg']
                 for k, u in self.uploads.items() if u['state'] == 'done'}
         try:
             with open(self.uploads_file, 'w') as f:
@@ -4577,11 +4603,11 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     def bag_content_changed(self, name):
         if self.uploads.get(name, {}).get('state') == 'done':
-            self.uploads[name] = {'state': 'stale', 'pct': 0, 'msg': '语音备注已更新，请重新上传整包'}
+            self.uploads[name] = {'state': 'stale', 'pct': 0, 'msg': '语音备注已更新，请核对并补齐录包'}
             self.save_upload_receipts()
 
-    async def bag_upload(self, name, who):
-        """整包排队上传，最多同时执行两个；各包独立保留进度与结果。"""
+    async def bag_upload(self, name, who, *, verify=False):
+        """有效回执直接返回；显式核对时按原目录补齐，最多两个并行。"""
         if not name or not P.SAFE_NAME.match(name):
             return False, '包名不对'
         bags_dir = os.path.join(DATA, 'bags')
@@ -4594,6 +4620,17 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return False, f'{name} 正在录制，先停止录包再上传'
         if self.uploads.get(name, {}).get('state') in ('queued', 'run'):
             return False, f'{name} 已排队或正在上传，请勿重复提交'
+        receipt = self.uploads.get(name, {})
+        if not verify and receipt.get('state') == 'done' and receipt.get('bundle_fingerprint') and receipt.get('upload_target') == UPLOAD_DEST:
+            try:
+                link = self.recording_api.bundle(name)
+                with open(os.path.join(bags_dir, name, 'recording-link.json'), 'rb') as stream:
+                    fingerprint = hashlib.sha256(stream.read()).hexdigest()
+                if (link is not None and fingerprint == receipt['bundle_fingerprint'] and
+                        receipt.get('source_fingerprint') == self.bag_source_fingerprint(name)):
+                    return True, f'{name} 已上传，无需重复上传'
+            except (OSError, web.HTTPException):
+                pass  # 回执不能证明当前整包仍一致时，按原流程重新核对。
         key = os.path.join(DATA, 'ssh', 'id_ed25519')
         if not os.path.exists(key) or not shutil.which('rsync') or not shutil.which('ssh'):
             return False, '扩展坞上缺上传工具：需要 data/ssh 密钥，以及镜像里的 rsync / ssh（重建 go2w-humble 镜像）'
@@ -4616,11 +4653,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             await self.recording_api.wait_bundle(name, BAG_VOICE_WAIT)
             with open(os.path.join(DATA, 'bags', name, 'recording-link.json'), 'rb') as f:
                 bundle_fingerprint = hashlib.sha256(f.read()).hexdigest()
+            source_fingerprint = self.bag_source_fingerprint(name)
             # 从此处到启动rsync之间不让语音文件再变动，避免目录扫描时漏掉后到的录音。
             self.uploads[name] = {'state': 'run', 'phase': 'sending', 'pct': 0, 'msg': '数据、录音与匹配信息一起上传'}
             p = await asyncio.create_subprocess_exec(
                 'rsync', '-rt', '--compress', '--compress-choice=zstd', '--compress-level=1',
-                '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
+                '--checksum', '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
                 os.path.join(DATA, 'bags', name), UPLOAD_DEST,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             buf = b''
@@ -4645,14 +4683,17 @@ class Server(TaughtWeb, RT.RtabWeb):
                     else:
                         tail.append(line)
             code = await p.wait()
+            if code == 0 and source_fingerprint != self.bag_source_fingerprint(name):
+                raise RuntimeError('同步期间录包内容发生变化，请重新核对')
         except Exception as e:
             code, tail = -1, deque([getattr(e, 'text', None) or str(e) or repr(e)])
         dt = time.monotonic() - t0
         if code == 0:
             msg = time.strftime('%m-%d %H:%M')
-            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg, 'bundle_fingerprint': bundle_fingerprint}
+            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg, 'bundle_fingerprint': bundle_fingerprint,
+                                  'upload_target': UPLOAD_DEST, 'source_fingerprint': source_fingerprint}
             self.save_upload_receipts()
-            n.event('INFO', f'已上传录包 {name} → {UPLOAD_LABEL}/{name}（{size:.0f} MB，用时 {dt:.0f} s）')
+            n.event('INFO', f'已上传录包 {name} → {UPLOAD_LABEL}/{name}（包总大小 {size:.0f} MB，同步用时 {dt:.1f} s）')
         else:
             why = ' | '.join(tail) or f'rsync 退出码 {code}'
             self.uploads[name] = {'state': 'fail', 'pct': last_pct, 'msg': why[-200:]}

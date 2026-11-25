@@ -464,15 +464,17 @@ export function createActions(store, src){
       return rollbackCapture.save();
     },
     uploadBag(bag){
+      if (!ready('uploadBag')) return;
+      if (store.uploads[bag.name]?.state === 'done') return confirmBox({ title:'核对已上传录包',
+        body:`${bag.name} 已上传，无需重复上传。核对服务器时只补齐缺失或变化的文件，仍使用同一个目录。`, ok:'核对并补齐',
+        onOk:() => exec(src.cmd.uploadBag(bag.name, true), null) });
       return A.uploadBags([bag]);
     },
     uploadBags(bags){
       if (!ready('uploadBag')) return;
-      const names = [...new Set(bags.map(b => b.name))].filter(name => !['queued', 'run'].includes(store.uploads[name]?.state));
+      const names = [...new Set(bags.map(b => b.name))].filter(name => !['queued', 'run', 'done'].includes(store.uploads[name]?.state));
       if (!names.length) return;
       const send = () => Promise.all(names.map(name => exec(src.cmd.uploadBag(name), null)));
-      const done = names.filter(name => store.uploads[name]?.state === 'done');
-      if (done.length) return confirmBox({ title:'重新上传', body:`所选 ${names.length} 个包中有 ${done.length} 个已上传。重新上传会补齐 166 上缺的部分，已有的文件不重复传。`, ok:'上传', onOk:send });
       return send();
     },
     simulateDrop(){ if (ready('simulateDrop')) exec(src.cmd.simulateDrop(), null); },

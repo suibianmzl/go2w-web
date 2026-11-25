@@ -265,7 +265,7 @@ export function createRosSource(store, bus){
     deleteMaps: names => send('map_delete', { names }, 60000),
     setMapLabel: (name, label) => send('map_label', { name, label }),
     saveKeepout: (map, shapes) => send('keepout_save', { map, shapes }, 20000),
-    uploadBag: name => send('bag_upload', { name }),
+    uploadBag: (name, verify = false) => send('bag_upload', { name, verify }),
     setRollback: on => send('rollback_set', { on }),
     setTaughtNav: on => send('set_taught_nav', { on }),
     saveRollback: (request_id, voice_seconds) => send('rollback_save', { request_id, voice_seconds }, 40000),

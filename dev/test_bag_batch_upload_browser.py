@@ -57,12 +57,26 @@ def main():
         assert page.evaluate('["first-bag","second-bag","third-bag","fourth-bag"].every(n=>go2w.store.uploads[n].state==="done")')
         expect(page.locator('#bagList .bag-st.done')).to_have_count(4)
         page.locator('#bagUploadAll').check()
-        expect(page.locator('#bagList input[data-bag-select]:checked')).to_have_count(5)
-        page.locator('#bagUploadSelected').click()
-        expect(page.locator('.scrim')).to_have_count(1)
-        expect(page.locator('.scrim')).to_contain_text('所选 5 个包中有 4 个已上传')
+        expect(page.locator('#bagList input[data-bag-select]:checked')).to_have_count(1)
+        expect(page.get_by_role('checkbox',name='选择录包 first-bag',exact=True)).to_be_disabled()
+        result=page.evaluate('go2w.src.cmd.uploadBag("first-bag")')
+        assert result['ok'] and '无需重复上传' in result['msg']
+        assert page.evaluate('go2w.store.uploads["first-bag"].state')=='done'
+        verify=page.get_by_role('button',name='核对已上传录包 first-bag',exact=True)
+        verify.click()
+        expect(page.locator('.scrim')).to_contain_text('仍使用同一个目录')
         page.locator('.scrim [data-a=c]').click()
-        page.locator('#bagUploadAll').uncheck()
+        verify.click()
+        page.locator('.scrim [data-a=o]').click()
+        assert page.evaluate('go2w.store.uploads["first-bag"].state')=='run'
+        page.clock.run_for(3000)
+        assert page.evaluate('go2w.store.uploads["first-bag"].state')=='done'
+        page.locator('#bagUploadSelected').click()
+        expect(page.locator('.scrim')).to_have_count(0)
+        assert page.evaluate('go2w.store.uploads["fifth-bag"].state')=='run'
+        page.clock.run_for(3000)
+        assert page.evaluate('go2w.store.bags.length')==5
+        expect(page.locator('#bagUploadAll')).to_be_disabled()
         expect(page.locator('#bagList input[data-bag-select]:checked')).to_have_count(0)
         for width,height in [(1440,1000),(375,812)]:
             page.set_viewport_size({'width':width,'height':height})

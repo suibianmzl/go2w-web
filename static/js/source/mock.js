@@ -410,9 +410,10 @@ export function createMockSource(store, bus){
       store.rollback.saving = false;
       return { ok:true, msg:`已保存回溯 ${name}（模拟）`, data:{name} };
     },
-    uploadBag(name){
+    uploadBag(name, verify = false){
       if (!store.bags.some(b => b.name === name)) return { ok:false, msg:`data/bags 里没有 ${name}` };
       if (['queued','run'].includes(store.uploads[name]?.state)) return { ok:false, msg:`${name} 已排队或正在上传，请勿重复提交` };
+      if (!verify && store.uploads[name]?.state === 'done') return { ok:true, msg:`${name} 已上传，无需重复上传（模拟）` };
       store.uploads = { ...store.uploads, [name]: { state:'queued', pct:0, msg:'等待上传空位' } };
       bagUploadQueue.push(name);pumpBagUploads();
       return { ok:true, msg:`已提交上传 ${name} → 166:~/go2w_bags（模拟）` };
