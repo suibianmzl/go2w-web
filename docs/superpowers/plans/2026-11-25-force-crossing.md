@@ -42,3 +42,5 @@ Interface: 复用站点字段，单选时禁用确认/保存/出发并显示原�
 ## 执行结果
 
 按用户既有的直接开发授权在本会话实施，没有修改原工程。异常恢复规则已由用户明确确认。新增真实HTTP/WebSocket假机器人集成测试 `dev/test_route_force_crossing_integration.py`。独立代码审阅发现手动HTTP排队竞态，已用失败回归复现并将任务冲突检查移到参数锁内，修正后11项HTTP测试通过。完整验证与已复现的基线测试问题见 `docs/development/2026-11-25-force-crossing.md`。
+
+2026-11-25 用户更正参数映射：首边界false、末边界true，异常恢复true。业务开关与原始ROS参数分开表示，保留HTTP接口字面值；循环回程保持true，版本v1.3.1。

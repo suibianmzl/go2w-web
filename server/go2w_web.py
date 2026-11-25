@@ -1563,7 +1563,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.crossing_dirty = False
         self.obstacles_critic = ObstaclesCriticAPI(busy=lambda: self.route_running() and (
             self.crossing_dirty or (self.route and any(p.get('forceCrossing') for p in self.route['record']['points']))),
-            on_disabled=lambda: setattr(self, 'crossing_dirty', False))
+            on_enabled=lambda: setattr(self, 'crossing_dirty', False))
         self.goal_pending = False
         self.resume_file = os.path.join(DATA, 'route_resume.json')
         self.resumes = {}
@@ -1808,7 +1808,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if self.estop:
                     return False, '急停中：先解除急停'
                 if getattr(self, 'crossing_dirty', False):
-                    return False, '强制跨越尚未恢复为 false，请先恢复参数后再下发单点目标'
+                    return False, '强制跨越尚未退出（避障参数应恢复为 true），暂不能下发单点目标'
                 reason = self.ctrl_blocker()
                 if reason:
                     return False, reason
@@ -3539,18 +3539,20 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.node.event('WARN', f'{name}播报没播：{msg}')
         self.background(go())
 
-    async def route_crossing_set(self, route, enabled):
-        if enabled:
-            route['crossing_dirty'] = True  # 失败或超时仍可能已写入，退出时必须尝试关闭
+    async def route_crossing_set(self, route, active):
+        critic_enabled = not active  # 强制跨越时关闭障碍评分，退出时恢复正常避障。
+        if active:
+            route['crossing_dirty'] = True  # 失败或超时仍可能已写入，退出时必须尝试恢复避障
             self.crossing_dirty = True
         try:
-            await self.obstacles_critic.apply(enabled)
+            await self.obstacles_critic.apply(critic_enabled)
         except Exception as e:
             detail = e.text if isinstance(e, web.HTTPException) else str(e)
-            raise RuntimeError(f'强制跨越{"开启" if enabled else "关闭"}失败：{detail}') from e
-        route['crossing_dirty'] = enabled
-        self.crossing_dirty = enabled
-        self.node.event('INFO', f'强制跨越：已设置 {str(enabled).lower()}（ROS 命令成功）')
+            raise RuntimeError(f'强制跨越{"开启" if active else "关闭"}失败：{detail}') from e
+        route['crossing_dirty'] = active
+        self.crossing_dirty = active
+        self.node.event('INFO', f'强制跨越{"开启" if active else "关闭"}：FollowPath.ObstaclesCritic.enabled='
+                               f'{str(critic_enabled).lower()}（ROS 命令成功）')
 
     async def route_crossing_arrived(self, route, state):
         bounds = route.get('crossing')

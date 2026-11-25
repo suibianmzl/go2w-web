@@ -23,11 +23,11 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             (maps/'lab.pgm').write_bytes(b'P5\n200 200\n255\n'+bytes([254])*40000)
             bindir = base/'bin'; bindir.mkdir()
             command_log = base/'params.jsonl'
-            reject_false = base/'reject-false'
+            reject_true = base/'reject-true'
             ros2 = bindir/'ros2'
             ros2.write_text(f'#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n'
                             f'with Path({str(command_log)!r}).open("a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n'
-                            f'if sys.argv[-1] == "false" and Path({str(reject_false)!r}).exists():\n'
+                            f'if sys.argv[-1] == "true" and Path({str(reject_true)!r}).exists():\n'
                             ' print("Setting parameter failed: reset unavailable", file=sys.stderr)\n sys.exit(0)\n'
                             'print("Successfully set parameter")\n')
             ros2.chmod(0o755)
@@ -104,36 +104,36 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                 await command('route_start', route_id=record['id'])
                                 await until(lambda: (state.get('task', {}).get('task') or {}).get('name') == name
                                             and state['task']['task']['status'] == 'succeeded', name)
-                                self.assertEqual(values(), ['true', 'false'])
-                                print(f'PASS 真实WebSocket {name}到点后执行 true → false', flush=True)
+                                self.assertEqual(values(), ['false', 'true'])
+                                print(f'PASS 真实WebSocket {name}到点后执行 false → true', flush=True)
                                 await asyncio.sleep(.2)
                             await command('initial_pose', x=0., y=0., th=0.)
                             await command('arm', on=True)
                             command_log.write_text('')
                             await command('route_start', route_id=record['id'])
-                            await until(lambda: values() == ['true'], '进入跨越区间')
-                            async with session.post(url+'/api/obstacles-critic/false') as response:
+                            await until(lambda: values() == ['false'], '进入跨越区间')
+                            async with session.post(url+'/api/obstacles-critic/true') as response:
                                 self.assertEqual(response.status, 409, '手动请求不能覆盖路线配置')
-                            self.assertEqual(values(), ['true'])
+                            self.assertEqual(values(), ['false'])
                             await command('cancel')
-                            await until(lambda: values() == ['true', 'false'], '取消恢复')
-                            print('PASS 真实WebSocket 取消后执行 false', flush=True)
+                            await until(lambda: values() == ['false', 'true'], '取消恢复')
+                            print('PASS 真实WebSocket 取消后执行 true', flush=True)
                             await asyncio.sleep(.2)
                             await command('initial_pose', x=0., y=0., th=0.)
                             await command('arm', on=True)
                             command_log.write_text('')
-                            reject_false.touch()
+                            reject_true.touch()
                             await command('route_start', route_id=record['id'])
                             await until(lambda: '强制跨越恢复失败' in (state.get('task', {}).get('task') or {}).get('message', ''), '恢复失败')
-                            self.assertEqual(values(), ['true', 'false', 'false'])
+                            self.assertEqual(values(), ['false', 'true', 'true'])
                             reply = await command('goal', expected_ok=False, x=2.5, y=0., th=0.)
                             self.assertIn('强制跨越', reply['msg'])
-                            reject_false.unlink()
-                            async with session.post(url+'/api/obstacles-critic/false') as response:
+                            reject_true.unlink()
+                            async with session.post(url+'/api/obstacles-critic/true') as response:
                                 self.assertEqual(response.status, 200)
                             await command('goal', x=2.5, y=0., th=0.)
                             await command('cancel')
-                            print('PASS ROS拒绝且退出0时任务失败；单点被拦截；HTTP恢复false后单点可用', flush=True)
+                            print('PASS ROS拒绝且退出0时任务失败；单点被拦截；HTTP恢复true后单点可用', flush=True)
                         finally:
                             for task in tasks: task.cancel()
                             await asyncio.gather(*tasks, return_exceptions=True)

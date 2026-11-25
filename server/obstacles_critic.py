@@ -10,10 +10,10 @@ class ObstaclesCriticAPI:
     PARAMETER = 'FollowPath.ObstaclesCritic.enabled'
     TIMEOUT = 10.0
 
-    def __init__(self, busy=lambda: False, on_disabled=lambda: None):
+    def __init__(self, busy=lambda: False, on_enabled=lambda: None):
         self.lock = asyncio.Lock()
         self.busy = busy
-        self.on_disabled = on_disabled
+        self.on_enabled = on_enabled
 
     def routes(self, app):
         app.router.add_post('/api/obstacles-critic/true', self.set_from_true)
@@ -67,6 +67,6 @@ class ObstaclesCriticAPI:
         rejected = any(line.strip().startswith('Setting parameter failed') for line in output.splitlines())
         if proc.returncode != 0 or rejected:
             raise web.HTTPBadGateway(text=output or f'ros2 命令失败（退出码 {proc.returncode}）')
-        if not enabled:
-            self.on_disabled()
+        if enabled:
+            self.on_enabled()
         return output
