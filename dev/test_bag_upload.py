@@ -2,7 +2,10 @@
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace as NS
@@ -27,6 +30,7 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         (self.bag/'capture.json').write_text(json.dumps({'request_id':'request-one','name':'test-bag',
             'before_s':20,'after_s':10,'voice':{'state':'pending','requested_s':20}}))
         self.remote=self.root/'remote';self.remote.mkdir()
+        self.destination=str(self.remote)
         self.audio=b'\x1aE\xdf\xa3'+b'voice-data'*10
         self.server=W.Server.__new__(W.Server)
         self.server.node=NS(event=lambda *args:None)
@@ -40,7 +44,13 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         async def local_rsync(*args,**kwargs):
             self.calls.append(args)
             self.assertEqual(args[0],'rsync');self.assertEqual(args[-1],W.UPLOAD_DEST)
-            return await real_spawn(*args[:-1],str(self.remote),**kwargs)
+            self.assertIn('--compress',args)
+            self.assertIn('--compress-choice=zstd',args)
+            self.assertIn('--compress-level=1',args)
+            command=list(args[:-1])
+            if self.destination.startswith('rsync://'):
+                shell=command.index('-e');del command[shell:shell+2]
+            return await real_spawn(*command,self.destination,**kwargs)
         self.redirect=patch.object(W.asyncio,'create_subprocess_exec',side_effect=local_rsync)
         self.redirect.start();self.data=patch.object(W,'DATA',str(self.root));self.data.start()
 
@@ -57,6 +67,7 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls,[],'语音尚未完成时不开始传数据')
         self.assertEqual((await self.upload_voice()).status,201)
         await asyncio.wait_for(job,5)
+        self.assertEqual(self.server.uploads['test-bag']['state'],'done',self.server.uploads['test-bag'])
         dest=self.remote/'test-bag'
         self.assertEqual((dest/'test-bag_0.mcap').read_bytes(),b'original-robot-data')
         self.assertEqual((dest/'voice-note.audio').read_bytes(),self.audio)
@@ -70,6 +81,36 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(link['audio']['sha256'],hashlib.sha256(self.audio).hexdigest())
         self.assertTrue((dest/'capture.json').is_file())
         self.assertEqual(self.server.uploads['test-bag']['state'],'done')
+
+    async def test_zstd_wire_transfer_preserves_data_voice_and_manifest(self):
+        # Local rsync copies skip wire compression; use a loopback-only receiver.
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        config=self.root/'rsyncd.conf'
+        identity='uid = 0\ngid = 0\n' if os.geteuid()==0 else ''
+        config.write_text('use chroot = no\n'+identity+
+            f'pid file = {self.root}/rsync.pid\nlock file = {self.root}/rsync.lock\n'
+            f'log file = {self.root}/rsync.log\n[bags]\npath = {self.remote}\nread only = no\n')
+        daemon=subprocess.Popen(['rsync','--daemon','--no-detach','--address=127.0.0.1',
+            f'--port={port}',f'--config={config}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                self.assertIsNone(daemon.poll(),'rsync receiver exited')
+                try:
+                    with socket.create_connection(('127.0.0.1',port),timeout=.1):break
+                except OSError:await asyncio.sleep(.02)
+            else:self.fail('rsync receiver did not start')
+            self.destination=f'rsync://127.0.0.1:{port}/bags'
+            payload=(b'point-cloud-sample\x00'*4096)*64
+            (self.bag/'test-bag_0.mcap').write_bytes(payload)
+            self.assertEqual((await self.upload_voice()).status,201)
+            await asyncio.wait_for(self.server.bag_upload_run('test-bag',len(payload)/1024**2,
+                '/unused-test-key','loopback-zstd'),10)
+            self.assertEqual(self.server.uploads['test-bag']['state'],'done',self.server.uploads['test-bag'])
+            self.assertEqual({p.name:p.read_bytes() for p in self.bag.iterdir() if p.is_file()},
+                {p.name:p.read_bytes() for p in (self.remote/'test-bag').iterdir() if p.is_file()})
+        finally:
+            daemon.terminate();daemon.wait(timeout=5)
 
     async def test_pending_voice_timeout_never_marks_data_only_upload_done(self):
         with patch.object(W,'BAG_VOICE_WAIT',0):

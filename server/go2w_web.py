@@ -4461,7 +4461,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             # 从此处到启动rsync之间不让语音文件再变动，避免目录扫描时漏掉后到的录音。
             self.uploads[name] = {'state': 'run', 'phase': 'sending', 'pct': 0, 'msg': '数据、录音与匹配信息一起上传'}
             p = await asyncio.create_subprocess_exec(
-                'rsync', '-rt', '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
+                'rsync', '-rt', '--compress', '--compress-choice=zstd', '--compress-level=1',
+                '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
                 os.path.join(DATA, 'bags', name), UPLOAD_DEST,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             buf = b''
