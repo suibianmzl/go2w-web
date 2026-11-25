@@ -12,6 +12,15 @@ function html(value, fallback = '—'){
   })[char]);
 }
 
+function onlineClass(online){
+  return `device${online ? '' : ' offline'}`;
+}
+
+function taskTypeLabel(value){
+  const labels = { route:'巡检任务', patrol:'巡逻任务', goal:'导航任务' };
+  return labels[value] || text(value, '任务');
+}
+
 function render(robots){
   currentDevices = robots;
   $('#device-count').textContent = robots.length;
@@ -26,10 +35,10 @@ function render(robots){
 
   devices.replaceChildren(...robots.map(robot => {
     const card = document.createElement('article');
-    card.className = 'device';
+    card.className = onlineClass(!!robot.online);
     const online = !!robot.online;
     const task = robot.task === 'active'
-      ? `${text(robot.task_type, '任务')}执行中`
+      ? `${taskTypeLabel(robot.task_type)}执行中`
       : online ? '空闲待命' : '等待重新连接';
     const battery = robot.battery == null ? '电量 —' : `电量 ${Math.round(robot.battery)}%`;
     const lastSeen = robot.last_seen_seconds == null ? '' : ` · ${robot.last_seen_seconds.toFixed(1)} 秒前`;
@@ -45,7 +54,7 @@ function render(robots){
       : '';
     card.innerHTML = `
       <div class="device-head">
-        <span class="badge ${online ? '' : 'offline'}">${online ? '● 在线' : '● 离线'}</span>
+        <span class="badge ${online ? '' : 'offline'}">${online ? '在线' : '离线'}</span>
         <span class="robot-id" title="${html(robot.robot_id)}">${html(robot.robot_id)}</span>
       </div>
       <div class="visual"><div class="robot-icon"></div></div>

@@ -1,83 +1,42 @@
 import { gridToCanvas } from '../js/util.js';
 import { createRtcViewer } from '../js/rtc_viewer.js';
+import { INSPECTION_NODES, COT_BY_NOTE } from './cot_mapping.js';
 
 const $ = selector => document.querySelector(selector);
 const T_MAP = 1;
 const POSE_RENDER_MS = 1000;
 const TRAIL_MIN_MOVE = 0.04;
 const HEARTBEAT_MS = 500;
-
-const INSPECTION_NODES = [
-  {
-    code:'01',
-    name:'起点',
-    cot:[
-      '已获取导航路径，立即前往【电动车存放处】',
-      '已识别门禁打开，正在通过',
-      '已识别大门打开，正在通过',
-      '识别到台阶，正在通过',
-    ],
-  },
-  {
-    code:'02',
-    name:'电动车存放处',
-    cot:[
-      '已到达巡逻点位【电动车存放处】',
-      '定点巡逻中（30s）...',
-      '巡逻结束，出发前往【人行步道】',
-      '已识别门禁打开，正在通过...',
-    ],
-  },
-  {
-    code:'03',
-    name:'人行步道',
-    cot:[
-      '已到达巡逻点位【人行步道】',
-      '定点巡逻中（30s）...',
-      '巡逻结束，准备返回起点',
-    ],
-  },
-  {
-    code:'04',
-    name:'返回起点',
-    cot:['正在返回起点中'],
-  },
-];
+const COT_REVEAL_MS = 700;
+const DEFAULT_ROUTE_ID = '49997f67fac041ecb7a74ab12259b3af';
 
 const els = {
   robotChip: $('#robotChip'),
   linkChip: $('#linkChip'),
   clock: $('#clock'),
   consoleLink: $('#consoleLink'),
+  fleetLink: $('#fleetLink'),
   routeSelect: $('#routeSelect'),
-  routeMap: $('#routeMap'),
-  routeCount: $('#routeCount'),
   taskPill: $('#taskPill'),
   taskStateText: $('#taskStateText'),
   taskPercent: $('#taskPercent'),
   taskProgress: $('#taskProgress'),
   startBtn: $('#startBtn'),
   stopBtn: $('#stopBtn'),
-  actionHint: $('#actionHint'),
   steps: $('#steps'),
-  currentPoint: $('#currentPoint'),
   presence: $('#presence'),
   modeValue: $('#modeValue'),
   speedValue: $('#speedValue'),
   batteryValue: $('#batteryValue'),
   cpuValue: $('#cpuValue'),
-  preflight: $('#preflight'),
   rtcBadge: $('#rtcBadge'),
   rtcMessage: $('#rtcMessage'),
   rtcVideo: $('#rtcVideo'),
   mapOverlay: $('#mapOverlay'),
   mapCanvas: $('#inspectionMap'),
-  mapTitle: $('#mapTitle'),
   mapEmpty: $('#mapEmpty'),
-  poseValue: $('#poseValue'),
   zoomOutMap: $('#zoomOutMap'),
   zoomInMap: $('#zoomInMap'),
-  fitMap: $('#fitMap'),
   collapseMap: $('#collapseMap'),
   expandMap: $('#expandMap'),
   exceptionRows: $('#exceptionRows'),
@@ -107,8 +66,10 @@ const els = {
   playbackPoint: $('#playbackPoint'),
   playbackBag: $('#playbackBag'),
   incidentSnapshot: $('#incidentSnapshot'),
-  playbackMap: $('#playbackMap'),
   snapshotPlaceholder: $('#snapshotPlaceholder'),
+  snapshotPlaceholderTitle: $('#snapshotPlaceholderTitle'),
+  snapshotPlaceholderText: $('#snapshotPlaceholderText'),
+  snapshotRetry: $('#snapshotRetry'),
   playbackClose: $('#playbackClose'),
   toast: $('#toast'),
 };
@@ -134,19 +95,23 @@ const state = {
   incidents: [],
   history: { items: new Map(), before: null, loading: false, hasMore: true },
   playbackId: null,
-  lastFixedNodeIndex: null,
   openNodeIndex: null,
   lastOpenedNodeIndex: null,
-  cotVisible: new Map(),
+  activeNodeIndex: -1,
+  activeCotKey: '',
+  cotEvents: [],
+  cotEventKeys: new Set(),
   cotTimer: null,
-  cotSegment: null,
-  cotMoving: false,
+  cotLastAt: null,
   preparing: false,
+  prepareText: '',
   inspectionRunStart: null,
   inspectionRouteId: null,
   trail: [],
   lastTrailPoint: null,
   rtcStarted: false,
+  snapshotToken: 0,
+  snapshotObjectUrl: '',
 };
 
 const rtc = createRtcViewer(els.rtcVideo, message => {
@@ -183,49 +148,53 @@ function taskForSelectedRoute(){
   return state.task?.type !== 'idle' && state.task?.routeId === state.selectedRouteId;
 }
 
-function beginInspectionRun(task, startedAt = Date.now()){
-  stopCotReveal();
-  state.inspectionRunStart = startedAt;
-  state.inspectionRouteId = task?.routeId || null;
-  state.openNodeIndex = null;
-  state.lastOpenedNodeIndex = null;
-  state.cotVisible.clear();
-  state.cotSegment = null;
-  state.cotMoving = false;
-  state.lastFixedNodeIndex = null;
+function routeForTask(task){
+  return state.routes.find(item => item.id === task?.routeId) || null;
 }
 
-function taskNodeIndex(task){
-  const point = Number(task?.point);
-  if (!Number.isInteger(point) || point < 1) return -1;
-  return Math.min(INSPECTION_NODES.length - 1, point - 1);
+function routePointForTask(task){
+  const route = routeForTask(task);
+  const index = Number(task?.point) - 1;
+  return Number.isInteger(index) && index >= 0 ? route?.points?.[index] || null : null;
 }
 
-function robotMoving(task){
-  const pose = state.pose;
-  return !!(
-    task?.status === 'active'
-    && task?.phase === 'follow'
-    && pose?.valid
-    && (Math.abs(Number(pose.v) || 0) > 0.03 || Math.abs(Number(pose.w) || 0) > 0.05)
-  );
+function taskNote(task){
+  return String(task?.pointNote || routePointForTask(task)?.note || '').trim();
 }
 
-function displayedTaskNodeIndex(task){
-  if (!task || task.type === 'idle') return -1;
-  if (task.back) return INSPECTION_NODES.length - 1;
-  const target = taskNodeIndex(task);
-  if (task.status === 'active' && target > 0 && !robotMoving(task)){
-    return target - 1;
+function taskPointName(task){
+  return String(task?.pointName || routePointForTask(task)?.name || '').trim();
+}
+
+function cotDefinitionForTask(task){
+  if (task?.back){
+    const returning = COT_BY_NOTE.get('position_end');
+    return returning ? { ...returning, cruiseName:'返回起点', back:true } : null;
   }
-  return target;
+  const note = taskNote(task).toLowerCase();
+  return note ? COT_BY_NOTE.get(note) || null : null;
+}
+
+function inspectionNodeForTask(task){
+  return cotDefinitionForTask(task)?.nodeIndex ?? -1;
+}
+
+function displayedInspectionNodeIndex(task){
+  const mapped = inspectionNodeForTask(task);
+  return mapped >= 0 ? mapped : state.activeNodeIndex;
+}
+
+function nodeCots(index){
+  return state.cotEvents.filter(event => event.nodeIndex === index);
+}
+
+function isBlockingIncident(item){
+  return item?.type === 'stuck'
+    || /阻塞|受阻|无通行空间/.test(`${item?.label || ''}${item?.msg || ''}`);
 }
 
 function incidentNodeIndex(item){
-  const point = Number(item.task?.point);
-  return Number.isInteger(point) && point >= 1 && point <= INSPECTION_NODES.length
-    ? point - 1
-    : -1;
+  return inspectionNodeForTask(item?.task);
 }
 
 function nodeIncidents(index){
@@ -248,41 +217,135 @@ function stopCotReveal(){
   }
 }
 
-function scheduleMovementCot(index){
-  const node = INSPECTION_NODES[index];
-  if (!node || !state.cotMoving || state.cotTimer || state.openNodeIndex !== index) return;
-  const shown = state.cotVisible.get(index) || 0;
-  if (shown >= node.cot.length) return;
-  state.cotTimer = setTimeout(() => {
-    state.cotTimer = null;
-    if (!state.cotMoving) return;
-    state.cotVisible.set(index, Math.min(node.cot.length, shown + 1));
-    renderTask();
-  }, shown === 0 ? 250 : 900);
+function resetCotOutput(){
+  stopCotReveal();
+  state.cotEvents = [];
+  state.cotEventKeys.clear();
+  state.activeNodeIndex = -1;
+  state.activeCotKey = '';
+  state.openNodeIndex = null;
+  state.lastOpenedNodeIndex = null;
+  state.cotLastAt = null;
+  state.inspectionRunStart = null;
+  state.inspectionRouteId = null;
 }
 
-function syncMovementCot(task, related, currentIndex){
-  const moving = related && robotMoving(task);
-  state.cotMoving = moving;
-  if (!moving){
-    stopCotReveal();
+function beginInspectionRun(task, startedAt = Date.now()){
+  resetCotOutput();
+  state.inspectionRunStart = startedAt;
+  state.inspectionRouteId = task?.routeId || null;
+}
+
+function finalizeActiveCot(){
+  const event = state.cotEvents.find(item => item.key === state.activeCotKey);
+  if (event) event.visible = event.lines.length;
+  stopCotReveal();
+}
+
+function normalizeCotLines(lines){
+  return (Array.isArray(lines) ? lines : []).map(line => {
+    if (typeof line === 'string'){
+      return { text:line, delayMs:COT_REVEAL_MS };
+    }
+    return {
+      text:String(line?.text || ''),
+      delayMs:Number.isFinite(line?.delayMs) ? Math.max(0, line.delayMs) : COT_REVEAL_MS,
+    };
+  }).filter(line => line.text);
+}
+
+function scheduleCotReveal(){
+  stopCotReveal();
+  const event = state.cotEvents.find(item => item.key === state.activeCotKey);
+  if (!event || event.visible >= event.lines.length) return;
+  const nextLine = event.lines[event.visible];
+  const delay = event.visible === 0
+    ? 160
+    : Math.max(0, nextLine?.delayMs ?? COT_REVEAL_MS);
+  state.cotTimer = setTimeout(() => {
+    state.cotTimer = null;
+    if (state.activeCotKey !== event.key) return;
+    event.visible = Math.min(event.lines.length, event.visible + 1);
+    renderTask();
+    scheduleCotReveal();
+  }, delay);
+}
+
+function ingestTaskCot(task){
+  if (!task || task.type !== 'route') return;
+  state.cotLastAt = Date.now();
+  const definition = cotDefinitionForTask(task);
+  if (!definition || definition.nodeIndex < 0) return;
+  if (!Array.isArray(definition.lines) || !definition.lines.length){
+    finalizeActiveCot();
+    state.activeNodeIndex = definition.nodeIndex;
+    if (state.openNodeIndex === null) state.openNodeIndex = definition.nodeIndex;
     return;
   }
-  const cotIndex = (task.back || currentIndex >= INSPECTION_NODES.length - 1)
-    ? INSPECTION_NODES.length - 1
-    : Math.max(0, currentIndex);
-  const segment = [
+  const point = Number(task.point) || 1;
+  const loop = Number(task.loop) || 1;
+  const key = [
     task.routeId || '',
-    task.loop || 1,
+    loop,
     task.back ? 'back' : 'forward',
-    cotIndex,
+    point,
+    definition.note,
   ].join(':');
-  if (segment !== state.cotSegment){
-    state.cotSegment = segment;
-    state.openNodeIndex = cotIndex;
-    state.cotVisible.set(cotIndex, 0);
+
+  if (state.cotEventKeys.has(key)){
+    state.activeCotKey = key;
+    state.activeNodeIndex = definition.nodeIndex;
+    return;
   }
-  scheduleMovementCot(cotIndex);
+
+  finalizeActiveCot();
+  const event = {
+    key,
+    routeId:task.routeId || '',
+    point,
+    loop,
+    back:!!task.back,
+    note:definition.back ? definition.note : taskNote(task) || definition.note,
+    cruiseName:definition.back ? definition.cruiseName : taskPointName(task) || definition.cruiseName,
+    nodeIndex:definition.nodeIndex,
+    lines:normalizeCotLines(definition.lines),
+    visible:0,
+    at:Date.now(),
+    fallback:!!definition.fallback,
+  };
+  state.cotEvents.push(event);
+  state.cotEventKeys.add(key);
+  state.activeCotKey = key;
+  const nodeChanged = state.activeNodeIndex !== definition.nodeIndex;
+  state.activeNodeIndex = definition.nodeIndex;
+  if (nodeChanged || state.openNodeIndex === null) state.openNodeIndex = definition.nodeIndex;
+  scheduleCotReveal();
+}
+
+function inspectionNodeState(index, task, related){
+  const incidents = nodeIncidents(index);
+  const ongoing = incidents.find(item => item.ongoing);
+  if (related && ongoing){
+    return {
+      state:'failed',
+      label:isBlockingIncident(ongoing) ? '阻塞中' : '异常中',
+    };
+  }
+  if (!related) return { state:'pending', label:'待执行' };
+  if (task.status === 'succeeded') return { state:'done', label:'已完成' };
+  const active = displayedInspectionNodeIndex(task);
+  if (task.status === 'active'){
+    if (active >= 0 && index < active) return { state:'done', label:'已完成' };
+    if (index === active) return { state:'active', label:'进行中' };
+    return { state:'pending', label:'待执行' };
+  }
+  if ((task.status === 'aborted' || task.status === 'canceled') && index === active){
+    return { state:'failed', label:task.status === 'aborted' ? '失败' : '已中止' };
+  }
+  if ((active >= 0 && index < active) || nodeCots(index).length){
+    return { state:'done', label:'已完成' };
+  }
+  return { state:'pending', label:'待执行' };
 }
 
 function formatIncidentTime(value){
@@ -335,7 +398,9 @@ function renderRouteOptions(){
   if (activeRouteId && state.routes.some(route => route.id === activeRouteId)){
     state.selectedRouteId = activeRouteId;
   } else if (!state.routes.some(route => route.id === previous)){
-    state.selectedRouteId = state.routes[0]?.id || '';
+    state.selectedRouteId = state.routes.some(route => route.id === DEFAULT_ROUTE_ID)
+      ? DEFAULT_ROUTE_ID
+      : state.routes[0]?.id || '';
   }
 
   if (!state.routes.length){
@@ -358,29 +423,102 @@ function renderRouteOptions(){
 function renderSelectedRoute(){
   const route = selectedRoute();
   els.routeSelect.disabled = !state.routes.length || taskActive();
-  els.routeMap.textContent = route?.map ? `地图 ${route.map}` : '地图 --';
-  els.routeCount.textContent = `固定 ${INSPECTION_NODES.length} 个节点`;
   els.startBtn.disabled = !route || !state.wsOpen || !state.online || taskActive() || state.preparing;
   els.startBtn.textContent = state.preparing ? '正在准备…' : '开始巡检';
   els.stopBtn.disabled = !state.wsOpen || !taskActive();
+  const reason = preflightReason(route);
+  els.startBtn.title = reason || '下发巡检任务并自动解锁底盘';
   renderTask();
 }
 
 function taskStateLabel(){
   const task = state.task || {};
   const route = selectedRoute();
-  if (!route) return '选择任务后开始巡检';
+  if (!route) return '选择巡检任务';
   if (!taskForSelectedRoute()) return taskActive() ? '其他任务执行中' : '等待下发任务';
   if (task.status === 'active') {
-    if (task.phase === 'checking') return '出发准备中';
-    const index = displayedTaskNodeIndex(task);
-    const node = INSPECTION_NODES[index];
-    return node ? `${node.code} · ${node.name}` : `第 ${task.point || 1} 站`;
+    if (task.phase === 'checking') return '正在准备巡检';
+    const node = INSPECTION_NODES[displayedInspectionNodeIndex(task)];
+    return node ? `正在巡检 · ${node.name}` : `正在前往第 ${task.point || 1} 站`;
   }
   if (task.status === 'succeeded') return '巡检已完成';
   if (task.status === 'canceled') return '巡检已中止';
   if (task.status === 'aborted') return `巡检失败：${task.message || '导航异常'}`;
   return '等待下发任务';
+}
+
+function visibleNodeCotLines(events){
+  const rows = [];
+  const seen = new Set();
+  for (const event of events){
+    const current = event.key === state.activeCotKey;
+    const shown = current
+      ? Math.max(0, Math.min(event.lines.length, event.visible || 0))
+      : event.lines.length;
+    event.lines.slice(0, shown).forEach((line, index) => {
+      const text = line.text;
+      if (seen.has(text)) return;
+      seen.add(text);
+      rows.push({ line:text, event, index, current });
+    });
+  }
+  return rows;
+}
+
+function renderSteps(task, related){
+  const activeDefinition = related ? cotDefinitionForTask(task) : null;
+  const activeIndex = related ? displayedInspectionNodeIndex(task) : -1;
+  const activeHasCot = (activeDefinition?.lines?.length || 0) > 0;
+  els.steps.innerHTML = INSPECTION_NODES.map((node, index) => {
+    const { state:stepState, label } = inspectionNodeState(index, task, related);
+    const events = nodeCots(index);
+    const incidents = nodeIncidents(index);
+    const expanded = state.openNodeIndex === index;
+    const rows = visibleNodeCotLines(events);
+    const cotHtml = rows.length ? `
+      <div class="node-cot">
+        <span class="cot-label">CoT</span>
+        <div class="cot-list">
+          ${rows.map(row => {
+            const kind = /阻塞|无通行空间|翻越|越障|推理其他/.test(row.line) ? 'block' : 'normal';
+            return `<div class="cot-item" data-kind="${kind}"><i></i><span>${esc(row.line)}</span></div>`;
+          }).join('')}
+        </div>
+      </div>
+    ` : index === activeIndex && activeHasCot ? '<div class="node-empty">等待 CoT 输出…</div>' : '';
+    const incidentHtml = incidents.length ? `
+      <div class="node-incidents">
+        ${incidents.slice(0, 6).map(item => `
+          <button class="node-incident" type="button" data-step-incident="${esc(item.id)}" data-blocking="${isBlockingIncident(item)}">
+            <i></i>
+            <span>${isBlockingIncident(item) ? '阻塞 · ' : ''}${esc(item.label)}</span>
+            <b>${esc(incidentDuration(item))}${item.ongoing ? ' · 持续中' : ''}</b>
+          </button>
+        `).join('')}
+      </div>
+    ` : '';
+    const marker = stepState === 'done' ? '✓' : esc(node.code);
+    return `<li class="inspection-node" data-s="${stepState}">
+      <button class="inspection-node-head" type="button" data-open-node="${index}" aria-expanded="${expanded}">
+        <span class="node-index">${marker}</span>
+        <span class="node-name">${esc(node.name)}</span>
+        <span class="node-state">${esc(label)}</span>
+        <span class="chevron">${expanded ? '⌃' : '⌄'}</span>
+      </button>
+      <div class="node-body" ${expanded ? '' : 'hidden'}>
+        ${cotHtml}
+        ${incidentHtml}
+      </div>
+    </li>`;
+  }).join('');
+
+  if (state.openNodeIndex !== null && state.openNodeIndex !== state.lastOpenedNodeIndex){
+    state.lastOpenedNodeIndex = state.openNodeIndex;
+    requestAnimationFrame(() => {
+      els.steps.querySelector(`[data-open-node="${state.openNodeIndex}"]`)
+        ?.scrollIntoView({ block:'nearest', behavior:'smooth' });
+    });
+  }
 }
 
 function renderTask(){
@@ -395,83 +533,16 @@ function renderTask(){
     : status === 'succeeded' ? 'ok'
       : status === 'canceled' ? 'warn'
         : status === 'aborted' ? 'danger' : 'idle';
-  els.taskPill.textContent = status === 'active' ? '执行中'
+  els.taskPill.textContent = status === 'active' ? '巡检中'
     : status === 'succeeded' ? '已完成'
       : status === 'canceled' ? '已中止'
         : status === 'aborted' ? '失败' : '等待任务';
-  els.taskStateText.textContent = taskStateLabel();
+  els.taskStateText.textContent = state.preparing
+    ? state.prepareText || '正在准备巡检…'
+    : taskStateLabel();
   els.taskPercent.textContent = `${Math.round(progress * 100)}%`;
   els.taskProgress.style.width = `${progress * 100}%`;
-  const currentIndex = related ? displayedTaskNodeIndex(task) : -1;
-  const currentNode = INSPECTION_NODES[currentIndex];
-  els.currentPoint.textContent = currentNode
-    ? `${currentIndex + 1}/${INSPECTION_NODES.length} · ${currentNode.name}`
-    : '--';
-  syncMovementCot(task, related, currentIndex);
-  renderSteps(task, related, currentIndex);
-  renderHint(selectedRoute());
-}
-
-function renderSteps(task, related, currentIndex){
-  els.steps.innerHTML = INSPECTION_NODES.map((node, index) => {
-    let stepState = 'pending';
-    let label = '待执行';
-    if (related && task.status === 'succeeded'){
-      stepState = 'done';
-      label = '已完成';
-    } else if (related && task.status === 'aborted' && index === currentIndex){
-      stepState = 'failed';
-      label = '失败';
-    } else if (related && task.status === 'canceled' && index === currentIndex){
-      stepState = 'failed';
-      label = '已中止';
-    } else if (related && task.status === 'active'){
-      if (currentIndex >= 0 && index < currentIndex){
-        stepState = 'done';
-        label = '已完成';
-      } else if (index === currentIndex){
-        stepState = 'active';
-        label = task.back ? '返回中' : '当前节点';
-      }
-    }
-    const incidents = nodeIncidents(index);
-    const expanded = state.openNodeIndex === index;
-    const visibleCot = node.cot.slice(0, state.cotVisible.get(index) || 0);
-    const incidentHtml = incidents.length ? `
-      <div class="node-incidents">
-        ${incidents.slice(0, 3).map(item => `
-          <button class="node-incident" type="button" data-step-incident="${esc(item.id)}">
-            <i></i>
-            <span>${esc(item.label)} · ${esc(incidentDuration(item))}</span>
-            <b>${item.ongoing ? '持续中' : '已归档'}</b>
-          </button>
-        `).join('')}
-        ${incidents.length > 3 ? `<small>另有 ${incidents.length - 3} 条异常</small>` : ''}
-      </div>
-    ` : '';
-    return `<li data-s="${stepState}">
-      <button class="step-head" type="button" data-open-node="${index}" aria-expanded="${expanded}">
-        <span class="index">${esc(node.code)}</span>
-        <span class="name" title="${esc(node.name)}">${esc(node.name)}</span>
-        <span class="state">${label}</span>
-        <span class="chevron">⌄</span>
-      </button>
-      <div class="cot-content" ${expanded ? '' : 'hidden'}>
-        <div class="cot-list">
-          ${visibleCot.map(text => `<div class="cot-item"><i></i><span>${esc(text)}</span></div>`).join('')}
-        </div>
-        ${incidentHtml}
-      </div>
-    </li>`;
-  }).join('');
-  state.lastFixedNodeIndex = currentIndex;
-  if (state.openNodeIndex !== null && state.openNodeIndex !== state.lastOpenedNodeIndex){
-    state.lastOpenedNodeIndex = state.openNodeIndex;
-    requestAnimationFrame(() => {
-      els.steps.querySelector(`[data-open-node="${state.openNodeIndex}"]`)
-        ?.scrollIntoView({ block:'center', behavior:'smooth' });
-    });
-  }
+  renderSteps(task, related);
 }
 
 function preflightReason(route){
@@ -484,27 +555,6 @@ function preflightReason(route){
   return '';
 }
 
-function renderHint(route){
-  if (state.preparing){
-    els.startBtn.title = '正在准备导航和定位';
-    return;
-  }
-  const reason = preflightReason(route);
-  const nav = state.machine?.profiles?.navigation;
-  const poseReady = !!state.pose?.valid && state.pose?.frame === 'map';
-  const mapReady = route && state.machine?.mapCurrent === route.map;
-  const ready = nav === 'run' && poseReady && mapReady;
-  const mapping = state.machine?.profiles?.mapping === 'run';
-  els.actionHint.textContent = reason || (ready
-    ? '导航和定位已就绪，可以下发巡检任务'
-    : mapping
-      ? '点击开始将停止建图并自动启动导航、定位'
-      : '点击开始将自动启动导航、定位并下发任务');
-  els.actionHint.style.color = reason ? 'var(--warn)' : ready ? 'var(--green)' : 'var(--fg-2)';
-  if (reason) els.startBtn.title = reason;
-  else els.startBtn.title = '下发巡检任务并自动解锁底盘';
-}
-
 function renderTelemetry(){
   const machine = state.machine || {};
   const pose = state.pose;
@@ -513,26 +563,12 @@ function renderTelemetry(){
     : profiles.localization === 'run' ? '定位'
       : profiles.mapping === 'run' ? '建图' : '未启动';
   els.modeValue.textContent = mode;
-  els.speedValue.textContent = pose?.valid && Number.isFinite(pose.v) ? `${pose.v.toFixed(2)} m/s` : '--';
+  const speed = pose?.valid && Number.isFinite(pose.v)
+    ? (Math.abs(pose.v) < 0.05 ? 0 : pose.v)
+    : null;
+  els.speedValue.textContent = speed == null ? '--' : `${speed.toFixed(2)} m/s`;
   els.batteryValue.textContent = Number.isFinite(machine.battery) ? `${Math.round(machine.battery)}%` : '--';
   els.cpuValue.textContent = Number.isFinite(machine.sys?.cpu) ? `${Math.round(machine.sys.cpu)}%` : '--';
-
-  const nav = profiles.navigation === 'run';
-  const mapReady = !!state.map && !!machine.mapCurrent;
-  const poseReady = !!pose?.valid && pose.frame === 'map' && machine.odomOk !== false;
-  const values = {
-    nav: [nav ? 'ok' : 'warn', nav ? '运行中' : '未启动'],
-    map: [mapReady ? 'ok' : 'warn', mapReady ? machine.mapCurrent : '等待'],
-    pose: [poseReady ? 'ok' : 'warn', poseReady ? '已就绪' : '未就绪'],
-  };
-  for (const [key, [status, text]] of Object.entries(values)){
-    const node = els.preflight.querySelector(`[data-k="${key}"]`);
-    node.dataset.s = status;
-    node.querySelector('b').textContent = text;
-  }
-  els.poseValue.textContent = pose?.valid
-    ? `x ${pose.x.toFixed(2)} · y ${pose.y.toFixed(2)} · θ ${(pose.th * 180 / Math.PI).toFixed(0)}°`
-    : 'x -- · y -- · θ --';
 }
 
 function normalizeIncident(item, index = 0){
@@ -642,6 +678,245 @@ function renderHistory(){
   `).join('');
 }
 
+function setSnapshotPlaceholder(title, text, kind, retry = false){
+  els.snapshotPlaceholderTitle.textContent = title;
+  els.snapshotPlaceholderText.textContent = text;
+  els.snapshotPlaceholder.dataset.s = kind;
+  els.snapshotRetry.hidden = !retry;
+  els.snapshotPlaceholder.hidden = false;
+}
+
+function releaseSnapshotObjectUrl(){
+  if (!state.snapshotObjectUrl) return;
+  URL.revokeObjectURL(state.snapshotObjectUrl);
+  state.snapshotObjectUrl = '';
+}
+
+function roundRectPath(context, x, y, width, height, radius){
+  context.beginPath();
+  context.roundRect(x, y, width, height, radius);
+}
+
+function drawSnapshotMapPanel(context, width, height, item){
+  const pose = item.pose;
+  const map = state.map;
+  const currentMap = state.machine?.mapCurrent;
+  if (!map || !Number.isFinite(pose?.x) || !Number.isFinite(pose?.y)
+      || (item.map && currentMap && item.map !== currentMap)) return false;
+
+  const panelWidth = Math.round(Math.min(width * 0.46, 620));
+  const panelHeight = Math.round(Math.min(height * 0.52, 360));
+  const panelX = width - panelWidth - 24;
+  const panelY = height - panelHeight - 24;
+  const headerHeight = 40;
+  const bodyX = panelX + 1;
+  const bodyY = panelY + headerHeight;
+  const bodyWidth = panelWidth - 2;
+  const bodyHeight = panelHeight - headerHeight - 1;
+  const centerX = bodyX + bodyWidth / 2;
+  const centerY = bodyY + bodyHeight / 2;
+  const scale = Math.min(bodyWidth / 20, bodyHeight / 14);
+  const mapPoint = (x, y) => [
+    centerX + (x - pose.x) * scale,
+    centerY - (y - pose.y) * scale,
+  ];
+
+  context.save();
+  context.shadowColor = 'rgba(0,0,0,.38)';
+  context.shadowBlur = 24;
+  context.shadowOffsetY = 8;
+  context.fillStyle = '#fff';
+  roundRectPath(context, panelX, panelY, panelWidth, panelHeight, 18);
+  context.fill();
+  context.restore();
+
+  context.save();
+  roundRectPath(context, panelX, panelY, panelWidth, panelHeight, 18);
+  context.clip();
+  context.fillStyle = '#fff';
+  context.fillRect(panelX, panelY, panelWidth, headerHeight);
+  context.fillStyle = '#e9e9eb';
+  context.fillRect(bodyX, bodyY, bodyWidth, bodyHeight);
+
+  context.save();
+  context.beginPath();
+  context.rect(bodyX, bodyY, bodyWidth, bodyHeight);
+  context.clip();
+  context.strokeStyle = '#dedee3';
+  context.lineWidth = 1;
+  const grid = Math.max(18, Math.round(bodyWidth / 25));
+  for (let x = bodyX; x <= bodyX + bodyWidth; x += grid){
+    context.beginPath();
+    context.moveTo(x, bodyY);
+    context.lineTo(x, bodyY + bodyHeight);
+    context.stroke();
+  }
+  for (let y = bodyY; y <= bodyY + bodyHeight; y += grid){
+    context.beginPath();
+    context.moveTo(bodyX, y);
+    context.lineTo(bodyX + bodyWidth, y);
+    context.stroke();
+  }
+
+  context.save();
+  context.globalAlpha = .94;
+  if (Math.abs(map.yaw || 0) < 1e-5){
+    const [ox, oy] = mapPoint(map.ox, map.oy + map.h);
+    context.drawImage(map.img, ox, oy, map.w * scale, map.h * scale);
+  } else {
+    const [ox, oy] = mapPoint(map.ox, map.oy);
+    context.translate(ox, oy);
+    context.rotate(-map.yaw);
+    context.drawImage(map.img, 0, -map.h * scale, map.w * scale, map.h * scale);
+  }
+  context.restore();
+
+  const route = state.routes.find(entry => entry.id === item.task?.routeId);
+  if (route?.points?.length > 1){
+    context.save();
+    context.strokeStyle = '#1fa9bb';
+    context.lineWidth = 2.2;
+    context.lineJoin = 'round';
+    context.lineCap = 'round';
+    context.beginPath();
+    route.points.forEach((point, index) => {
+      const [x, y] = mapPoint(point.x, point.y);
+      if (index) context.lineTo(x, y);
+      else context.moveTo(x, y);
+    });
+    context.stroke();
+    context.restore();
+  }
+
+  const [poseX, poseY] = mapPoint(pose.x, pose.y);
+  context.save();
+  context.translate(poseX, poseY);
+  context.rotate(-pose.th);
+  context.fillStyle = '#f3a51f';
+  context.strokeStyle = '#fff';
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(0, 0, 8, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+  context.fillStyle = '#f3a51f';
+  context.beginPath();
+  context.moveTo(20, 0);
+  context.lineTo(8, -5);
+  context.lineTo(8, 5);
+  context.closePath();
+  context.fill();
+  context.restore();
+
+  const legendWidth = Math.max(120, Math.min(194, bodyWidth - 20));
+  const legendHeight = 24;
+  const legendX = bodyX + bodyWidth - legendWidth - 10;
+  const legendY = bodyY + bodyHeight - legendHeight - 10;
+  context.fillStyle = 'rgba(255,255,255,.94)';
+  roundRectPath(context, legendX, legendY, legendWidth, legendHeight, 6);
+  context.fill();
+  context.font = '10px Inter, sans-serif';
+  context.textAlign = 'left';
+  context.textBaseline = 'middle';
+  context.strokeStyle = '#27272a';
+  context.lineWidth = 2;
+  context.beginPath();
+  context.moveTo(legendX + 8, legendY + 12);
+  context.lineTo(legendX + 21, legendY + 12);
+  context.stroke();
+  context.fillStyle = '#65656f';
+  context.fillText('规划路线', legendX + 26, legendY + 12);
+  context.strokeStyle = '#168354';
+  context.beginPath();
+  context.moveTo(legendX + 76, legendY + 12);
+  context.lineTo(legendX + 89, legendY + 12);
+  context.stroke();
+  context.fillStyle = '#65656f';
+  context.fillText('已完成', legendX + 94, legendY + 12);
+  context.fillStyle = '#f3a51f';
+  context.beginPath();
+  context.arc(legendX + 141, legendY + 12, 3.5, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = '#65656f';
+  context.fillText('异常位置', legendX + 149, legendY + 12);
+  context.restore();
+
+  const controls = ['−', '+', '⌄'];
+  controls.forEach((label, index) => {
+    const size = 27;
+    const x = panelX + panelWidth - (controls.length - index) * (size + 6) - 7;
+    const y = panelY + 7;
+    context.fillStyle = '#f8f8fa';
+    context.strokeStyle = '#e2e2e7';
+    context.lineWidth = 1;
+    roundRectPath(context, x, y, size, size, 6);
+    context.fill();
+    context.stroke();
+    context.fillStyle = '#666671';
+    context.font = '14px Inter, sans-serif';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(label, x + size / 2, y + size / 2 + 1);
+  });
+  context.textAlign = 'left';
+  context.restore();
+  return true;
+}
+
+function composeIncidentSnapshot(item, image){
+  const canvas = document.createElement('canvas');
+  canvas.width = image.naturalWidth || 1280;
+  canvas.height = image.naturalHeight || 720;
+  const context = canvas.getContext('2d');
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  drawSnapshotMapPanel(context, canvas.width, canvas.height, item);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => {
+      if (blob) resolve(blob);
+      else reject(new Error('snapshot compose failed'));
+    }, 'image/jpeg', 0.92);
+  });
+}
+
+function loadIncidentSnapshot(url, item){
+  state.snapshotToken += 1;
+  const token = state.snapshotToken;
+  const request = new URL(url, location.href);
+  request.searchParams.set('_snapshot', String(Date.now()));
+  releaseSnapshotObjectUrl();
+  els.incidentSnapshot.hidden = true;
+  delete els.incidentSnapshot.dataset.composite;
+  els.incidentSnapshot.dataset.source = url;
+  els.incidentSnapshot.dataset.request = request.href;
+  setSnapshotPlaceholder('正在加载异常截图', '正在合成 RTC 画面与异常位置地图…', 'loading');
+
+  const image = new Image();
+  image.decoding = 'async';
+  image.onload = async () => {
+    if (token !== state.snapshotToken) return;
+    try {
+      const blob = await composeIncidentSnapshot(item, image);
+      if (token !== state.snapshotToken) return;
+      const objectUrl = URL.createObjectURL(blob);
+      state.snapshotObjectUrl = objectUrl;
+      els.incidentSnapshot.dataset.request = objectUrl;
+      els.incidentSnapshot.dataset.composite = '1';
+      els.incidentSnapshot.src = objectUrl;
+    } catch {
+      if (token !== state.snapshotToken) return;
+      els.incidentSnapshot.dataset.request = request.href;
+      els.incidentSnapshot.dataset.composite = '0';
+      els.incidentSnapshot.src = request.href;
+    }
+  };
+  image.onerror = () => {
+    if (token !== state.snapshotToken) return;
+    els.incidentSnapshot.hidden = true;
+    setSnapshotPlaceholder('截图加载失败', '请检查快照地址或网络连接后重试', 'error', true);
+  };
+  image.src = request.href;
+}
+
 function renderPlayback(item){
   if (!item) return;
   state.playbackId = item.id;
@@ -652,66 +927,17 @@ function renderPlayback(item){
   els.playbackBag.textContent = bagLabel(item);
   const url = item.snapshot?.local_url || item.snapshot?.url;
   if (url){
-    els.incidentSnapshot.src = url;
-    els.incidentSnapshot.hidden = false;
-    els.snapshotPlaceholder.hidden = true;
+    loadIncidentSnapshot(url, item);
   } else {
+    state.snapshotToken += 1;
+    releaseSnapshotObjectUrl();
     els.incidentSnapshot.removeAttribute('src');
+    delete els.incidentSnapshot.dataset.source;
+    delete els.incidentSnapshot.dataset.request;
+    delete els.incidentSnapshot.dataset.composite;
     els.incidentSnapshot.hidden = true;
-    els.snapshotPlaceholder.hidden = false;
+    setSnapshotPlaceholder('该异常暂无截图', '该异常没有关联快照数据', 'empty');
   }
-  drawPlaybackMap(item);
-}
-
-function drawPlaybackMap(item){
-  const canvas = els.playbackMap;
-  const pose = item.pose;
-  const map = state.map;
-  if (!map || !Number.isFinite(pose?.x) || !Number.isFinite(pose?.y)
-    || (item.map && state.machine?.mapCurrent && item.map !== state.machine.mapCurrent)){
-    canvas.hidden = true;
-    return;
-  }
-  canvas.hidden = false;
-  const context = canvas.getContext('2d');
-  const width = canvas.width, height = canvas.height;
-  const rangeX = 16, rangeY = rangeX * height / width;
-  const scale = Math.min(width / rangeX, height / rangeY);
-  const sx = x => width / 2 + (x - pose.x) * scale;
-  const sy = y => height / 2 - (y - pose.y) * scale;
-  context.clearRect(0, 0, width, height);
-  context.fillStyle = '#030910';
-  context.fillRect(0, 0, width, height);
-  context.save();
-  context.globalAlpha = .78;
-  if (Math.abs(map.yaw || 0) < 1e-5){
-    context.drawImage(map.img, sx(map.ox), sy(map.oy + map.h), map.w * scale, map.h * scale);
-  } else {
-    context.translate(sx(map.ox), sy(map.oy));
-    context.rotate(-map.yaw);
-    context.drawImage(map.img, 0, -map.h * scale, map.w * scale, map.h * scale);
-  }
-  context.restore();
-
-  const x = sx(pose.x), y = sy(pose.y);
-  context.save();
-  context.strokeStyle = '#f3b13f';
-  context.fillStyle = 'rgba(243,177,63,.28)';
-  context.lineWidth = 2;
-  context.beginPath();
-  context.arc(x, y, 9, 0, Math.PI * 2);
-  context.fill();
-  context.stroke();
-  context.beginPath();
-  context.moveTo(x, y);
-  context.lineTo(x + Math.cos(-pose.th) * 22, y + Math.sin(-pose.th) * 22);
-  context.stroke();
-  context.restore();
-  context.fillStyle = 'rgba(8,15,22,.8)';
-  context.fillRect(0, 0, width, 30);
-  context.fillStyle = '#9eb0c4';
-  context.font = '12px "JetBrains Mono", monospace';
-  context.fillText(`异常位置  ${item.map || state.machine?.mapCurrent || 'map'}`, 10, 20);
 }
 
 function openIncidentPlayback(item){
@@ -722,8 +948,13 @@ function openIncidentPlayback(item){
 
 function closeIncidentPlayback(){
   state.playbackId = null;
+  state.snapshotToken += 1;
+  releaseSnapshotObjectUrl();
   els.incidentPlayback.hidden = true;
   els.incidentSnapshot.removeAttribute('src');
+  delete els.incidentSnapshot.dataset.source;
+  delete els.incidentSnapshot.dataset.request;
+  delete els.incidentSnapshot.dataset.composite;
 }
 
 async function loadHistory(reset = false){
@@ -839,7 +1070,10 @@ function onJson(message){
       if (message.robot_id && message.robot_id !== state.robotId) break;
       state.online = !!message.online;
       if (typeof message.video_upload_enabled === 'boolean') state.videoUploadEnabled = message.video_upload_enabled;
-      if (!state.online) state.task = { type:'idle' };
+      if (!state.online){
+        state.task = { type:'idle' };
+        resetCotOutput();
+      }
       renderConnection();
       updateRtc();
       renderSelectedRoute();
@@ -869,6 +1103,12 @@ function onJson(message){
         );
       }
       state.task = next;
+      if (next.status === 'active' && next.type === 'route'){
+        ingestTaskCot(next);
+      } else {
+        finalizeActiveCot();
+        if (next.type === 'idle') resetCotOutput();
+      }
       if (taskActive() && state.task.routeId) {
         state.selectedRouteId = state.task.routeId;
         els.routeSelect.value = state.selectedRouteId;
@@ -882,14 +1122,12 @@ function onJson(message){
       state.pose = message;
       state.poseAt = performance.now();
       renderTelemetry();
-      renderHint(selectedRoute());
       break;
     case 'state':
       state.machine = message;
       if (taskActive()) els.routeSelect.disabled = true;
       renderTelemetry();
       renderTask();
-      renderHint(selectedRoute());
       break;
     case 'incidents':
       mergeIncidents(message.items, true);
@@ -956,8 +1194,8 @@ async function waitForCondition(check, timeout, label){
 }
 
 function showPrepare(message){
-  els.actionHint.textContent = message;
-  els.actionHint.style.color = 'var(--accent)';
+  state.prepareText = message;
+  if (state.preparing) els.taskStateText.textContent = message;
 }
 
 async function prepareInspection(route){
@@ -1080,8 +1318,8 @@ async function startInspection(){
     toast(error?.message || String(error), 'err');
   } finally {
     state.preparing = false;
+    state.prepareText = '';
     renderSelectedRoute();
-    renderHint(route);
   }
 }
 
@@ -1113,6 +1351,7 @@ function setRobotQuery(robotId){
   url.searchParams.set('robot_id', robotId);
   history.replaceState(null, '', url);
   els.consoleLink.href = `/quadruped/?robot_id=${encodeURIComponent(robotId)}`;
+  els.fleetLink.href = `/quadruped/fleet/?robot_id=${encodeURIComponent(robotId)}`;
 }
 
 function connect(){
@@ -1120,7 +1359,7 @@ function connect(){
   if (!state.robotId){
     setChip(els.robotChip, 'off', '未选择');
     setChip(els.linkChip, 'off', '无设备');
-    els.actionHint.textContent = '设备列表中还没有可用的机器狗';
+    els.taskStateText.textContent = '设备列表中还没有可用的机器狗';
     return;
   }
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1357,9 +1596,7 @@ function drawMap(){
 }
 
 function renderRealtime(){
-  const route = selectedRoute();
   if (state.pose?.valid && state.pose.frame === 'map') samplePose(state.pose);
-  els.mapTitle.textContent = route ? `${route.name} · 坐标线路` : '巡检坐标线路';
   renderTelemetry();
   renderTask();
   drawMap();
@@ -1390,6 +1627,7 @@ els.routeSelect.addEventListener('change', () => {
   state.selectedRouteId = els.routeSelect.value;
   state.trail = [];
   state.lastTrailPoint = null;
+  if (!taskActive()) resetCotOutput();
   renderSelectedRoute();
   fitView();
   drawMap();
@@ -1398,7 +1636,6 @@ els.startBtn.addEventListener('click', startInspection);
 els.stopBtn.addEventListener('click', stopInspection);
 els.zoomOutMap.addEventListener('click', () => zoomMap(0.8));
 els.zoomInMap.addEventListener('click', () => zoomMap(1.25));
-els.fitMap.addEventListener('click', () => { fitView(); drawMap(); });
 els.collapseMap.addEventListener('click', () => setMapCollapsed(true));
 els.expandMap.addEventListener('click', () => setMapCollapsed(false));
 els.steps.addEventListener('click', event => {
@@ -1412,7 +1649,6 @@ els.steps.addEventListener('click', event => {
     } else {
       state.openNodeIndex = index;
       renderTask();
-      if (state.cotMoving) scheduleMovementCot(index);
     }
     return;
   }
@@ -1469,9 +1705,23 @@ els.playbackClose.addEventListener('click', closeIncidentPlayback);
 els.incidentPlayback.addEventListener('click', event => {
   if (event.target === els.incidentPlayback) closeIncidentPlayback();
 });
+els.incidentSnapshot.addEventListener('load', () => {
+  if (!els.incidentSnapshot.dataset.request
+      || els.incidentSnapshot.currentSrc !== els.incidentSnapshot.dataset.request) return;
+  els.snapshotPlaceholder.hidden = true;
+  els.incidentSnapshot.hidden = false;
+});
 els.incidentSnapshot.addEventListener('error', () => {
+  if (!els.incidentSnapshot.dataset.request
+      || els.incidentSnapshot.currentSrc !== els.incidentSnapshot.dataset.request) return;
   els.incidentSnapshot.hidden = true;
-  els.snapshotPlaceholder.hidden = false;
+  setSnapshotPlaceholder('截图加载失败', '请检查快照地址或网络连接后重试', 'error', true);
+});
+els.snapshotRetry.addEventListener('click', () => {
+  const source = els.incidentSnapshot.dataset.source;
+  const item = state.incidents.find(entry => entry.id === state.playbackId)
+    || state.history.items.get(state.playbackId);
+  if (source && item) loadIncidentSnapshot(source, item);
 });
 window.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;

@@ -30,7 +30,7 @@
       </div>
       <nav class="top-actions">
         <a id="consoleLink" class="text-link" href="/quadruped/">设备控制台</a>
-        <a class="text-link" href="/quadruped/fleet/">设备列表</a>
+        <a class="text-link" id="fleetLink" href="/quadruped/fleet/">设备列表</a>
       </nav>
     </header>
 
@@ -45,15 +45,9 @@
             <span class="pill" id="taskPill" data-s="idle">等待任务</span>
           </div>
 
-          <label class="field-label" for="routeSelect">选择机器狗上报的巡检任务</label>
           <select id="routeSelect" disabled>
             <option value="">正在读取任务列表…</option>
           </select>
-
-          <div class="route-meta">
-            <span id="routeMap">地图 --</span>
-            <span id="routeCount">0 个节点</span>
-          </div>
 
           <div class="progress-block">
             <div class="progress-label">
@@ -66,12 +60,6 @@
           <div class="task-actions">
             <button class="primary" id="startBtn" type="button" disabled>开始巡检</button>
             <button class="danger" id="stopBtn" type="button" disabled>中止任务</button>
-          </div>
-          <p class="action-hint" id="actionHint">等待机器狗连接</p>
-
-          <div class="steps-head">
-            <span>巡检节点</span>
-            <span id="currentPoint">--</span>
           </div>
           <ol class="steps" id="steps">
             <li class="empty-step">选择任务后显示巡检节点</li>
@@ -96,24 +84,15 @@
 
             <section class="map-overlay" id="mapOverlay" aria-label="巡检地图">
               <div class="map-overlay-head">
-                <div class="map-overlay-title">
-                  <span class="eyebrow">NAVIGATION MAP</span>
-                  <h2 id="mapTitle">巡检坐标线路</h2>
-                </div>
                 <div class="map-tools" role="group" aria-label="地图控制">
                   <button id="zoomOutMap" type="button" title="缩小地图" aria-label="缩小地图">−</button>
                   <button id="zoomInMap" type="button" title="放大地图" aria-label="放大地图">＋</button>
-                  <button id="fitMap" type="button" title="适配地图">适配</button>
                   <button id="collapseMap" type="button" title="收起地图" aria-label="收起地图">⌄</button>
                 </div>
               </div>
               <div class="map-canvas-wrap">
                 <canvas id="inspectionMap"></canvas>
                 <div class="map-empty" id="mapEmpty">等待机器狗上报地图和巡检路线</div>
-                <div class="map-hud">
-                  <span>位置</span>
-                  <b class="mono" id="poseValue">x -- · y -- · θ --</b>
-                </div>
                 <div class="map-legend">
                   <span><i class="legend-route"></i>规划路线</span>
                   <span><i class="legend-done"></i>已完成</span>
@@ -146,11 +125,6 @@
               <div><span>电量</span><b class="mono" id="batteryValue">--</b></div>
               <div><span>CPU</span><b class="mono" id="cpuValue">--</b></div>
             </div>
-            <div class="preflight" id="preflight">
-              <div data-k="nav"><i></i><span>导航</span><b>--</b></div>
-              <div data-k="map"><i></i><span>地图</span><b>--</b></div>
-              <div data-k="pose"><i></i><span>定位</span><b>--</b></div>
-            </div>
           </section>
 
           <section class="panel exception-panel">
@@ -164,8 +138,6 @@
                 <button class="more-button" id="exceptionMore" type="button">更多</button>
               </div>
             </div>
-            <p class="panel-note">实时接收机器狗异常记录，同一异常会按 ID 自动更新。</p>
-
             <div class="exception-table-wrap">
               <table class="exception-table">
                 <thead>
@@ -250,10 +222,10 @@
         </div>
         <div class="playback-stage">
           <img id="incidentSnapshot" alt="异常发生时的机器狗视频截图">
-          <canvas id="playbackMap" width="400" height="240" hidden></canvas>
-          <div class="snapshot-placeholder" id="snapshotPlaceholder">
-            <b>截图生成中</b>
-            <span>正在等待云端 RTC 视频帧</span>
+          <div class="snapshot-placeholder" id="snapshotPlaceholder" data-s="empty">
+            <b id="snapshotPlaceholderTitle">该异常暂无截图</b>
+            <span id="snapshotPlaceholderText">该异常没有关联快照数据</span>
+            <button class="snapshot-retry" id="snapshotRetry" type="button" hidden>重新加载</button>
           </div>
         </div>
         <div class="playback-meta">
