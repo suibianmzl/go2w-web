@@ -362,9 +362,7 @@ CTRL_WAIT = 3.0        # s：每一步切换（插值走完之后）最多等这
 CTRL_INTERP = 2.0      # s：FixStand 从趴姿插值到站姿的时间（config.yaml 的 ts 末项）
 POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到新进程的 Passive
 CTRL_RESEND = 0.5      # s：请求还没被接受就重发（运控 0.2 s 后作废没取走的请求，DDS 也可能丢）
-# 爬台模式（11-23）：融合策略（rough + climb）下网页开关，开着时 5 Hz 发 2101 续约（运控 1 s 没收到就回 rough）。
-# 开着最长这么久自动关，免得忘了关一直用 climb 策略走路
-CLIMB_MAX = float(os.environ.get('GO2W_CLIMB_MAX', '300'))
+# 爬台模式是持久选择；后台5Hz维持2101续约，不依赖页面或导航状态。
 # 网页站起来（或跑过任务）的机器狗，空闲这么久就原地趴下；0 = 不自动趴下
 IDLE_LIE = float(os.environ.get('GO2W_IDLE_LIE', '30'))
 # 电机过热自动趴下（11-18，用户：「有关节到 68 度就自动趴下」）：16 个电机（12 个腿关节 + 4 个轮子）任何一个
@@ -1584,7 +1582,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                               why='' if self.ctrl else '没连上域 0，喇叭不可用')
         self.audio.used = self.audio_used
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
-        self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
+        self.climb = None          # 选中的爬台模式：{'who': 来源, 't': 开启时间}，不绑定页面
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
         self.ctrl_abort = False    # 站起过程中被要求趴下
         self.ctrl_msg = ''         # 最近一次站起 / 趴下的结果
@@ -1695,8 +1693,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '另一个网页正在进行示教采集，请在原页面操作'
         if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize', 'autoloc_move'):
             return False, '正在检查路线，请稍等'
-        if self.climb is not None and op in ('goal', 'route_start', 'auto_localize', 'autoloc_move', 'taught_start'):
-            return False, '爬台模式开着：先关掉爬台模式（切回 rough）再导航'
         if (self.route_running() or getattr(self, 'route_starting', False)) and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
@@ -1711,7 +1707,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'estop':
                 # 先停车，再记日志
                 self.estop, self.estop_t = True, time.monotonic()
-                self.climb_off(f'网页急停（{self.remote(ws)}）')
                 errors = await self.disarm_and_cancel(f'网页急停（{self.remote(ws)}）')
                 if 'estop' not in self.inc_open:
                     self.inc_open['estop'] = self.incident('estop', f'网页急停（{self.remote(ws)}）', ongoing=True)
@@ -2133,7 +2128,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             return True, '已经趴着'
         if self.ctrl_op == 'down':
             return False, '正在趴下'
-        self.climb_off(f'趴下（{who}）')
         self.ctrl_abort = True                 # 正在站起就打断
         while self.ctrl_op == 'up':
             await asyncio.sleep(0.05)
@@ -2329,64 +2323,31 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     # ---------- 爬台模式（融合策略 2101） ----------
     def set_climb(self, ws, on):
-        who = self.remote(ws)
-        if not on:
-            if self.climb is None:
-                return True, '爬台模式已经是关的'
-            self.climb_off(f'关闭爬台模式（{who}）')
-            return True, '已关闭爬台模式，运控切回 rough'
+        who = self.remote(ws) if ws is not None else '强制跨越任务'
         if self.ctrl is None:
-            return False, self.ctrl_blocker() or '运控接入已关闭（GO2W_CTRL=0）'
+            return False, '运控连接不可用'
+        if not on:
+            self.climb_off(f'关闭爬台模式（{who}）')
+            return True, '已选择 rough 模式'
         if self.estop:
             return False, '急停中：先解除急停'
-        if self.ctrl_op:
-            return False, '运控正在操作（站起 / 趴下 / 切策略），请稍等'
-        s, ready, _ = self.ctrl_get()
-        if s is None:
-            return False, '收不到运控状态（/go2w_ctrl/state）'
-        if s != 'Velocity' or not ready:
-            return False, f'只能站着（策略运行中）开爬台模式（现在：{s}）'
         if self.ctrl.get_dual(CTRL_STALE) is None:
             return False, '当前运控策略不是融合策略（rough + climb），没有爬台模式'
-        n = self.node
-        if (self.route_running() or self.goal_pending or n.nav_active() or self.taught_recording()
-                or self._taught_job is not None or self.prof('patrol') != 'stop'):
-            return False, '有导航任务在跑：先取消任务再开爬台模式（爬台用遥控或网页摇杆）'
-        if self.climb is not None:
-            self.climb['ws'] = ws
-            return True, '爬台模式已经开着'
-        self.climb = {'ws': ws, 'who': who, 't': time.monotonic()}
         self.ctrl.climb(True)
-        n.event('WARN', f'开启爬台模式（{who}）：切到 climb 策略，最长 {CLIMB_MAX:.0f} s 自动关')
-        return True, '爬台模式已开：速度 |vx|≤0.5、|vy|≤0.15、|wz|≤0.15 时切到 climb'
+        self.climb = {'who':who, 't':time.monotonic()}
+        self.node.event('INFO', f'已选择 climb 模式（{who}）')
+        return True, '已选择 climb 模式，导航和其他功能照常可用'
 
     def climb_off(self, reason):
-        if self.climb is None:
-            return
         self.climb = None
         if self.ctrl is not None:
             self.ctrl.climb(False)
             self.ctrl.climb(False)   # 发两帧防丢；真丢了运控 1 s 没续约也会自己回 rough
-        self.node.event('INFO', f'爬台模式已关：{reason}，运控切回 rough')
+        self.node.event('INFO', f'已选择 rough 模式：{reason}')
 
     def climb_tick(self):
-        """safety 循环 5 Hz：开着就续约；出状况就关。"""
-        c = self.climb
-        if c is None:
-            return
-        s, ready, _ = self.ctrl_get()
-        ws = c['ws']
-        gap = time.monotonic() - self.clients[ws]['last_ping'] if ws in self.clients else None
-        reason = ('急停' if self.estop
-                  else '开启爬台模式的网页断开了' if gap is None
-                  else f'开启爬台模式的网页心跳丢失 {gap:.1f} s' if gap > self.heartbeat
-                  else f'运控状态 {s or "离线"}，不在行走状态' if s != 'Velocity'
-                  else '运控状态里没有融合策略信息' if self.ctrl.get_dual(CTRL_STALE) is None
-                  else f'已开 {CLIMB_MAX:.0f} s，自动关闭' if time.monotonic() - c['t'] > CLIMB_MAX
-                  else None)
-        if reason:
-            self.climb_off(reason)
-        else:
+        """后台5Hz维持续约；页面、时长和其他功能不改变模式选择。"""
+        if self.climb is not None and self.ctrl is not None:
             self.ctrl.climb(True)
 
     def ctrl_busy(self):
@@ -2395,7 +2356,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         return bool(self.route_running() or self.goal_pending or n.nav_active() or self.teleop is not None
                     or self.taught_recording() or self._taught_job is not None
                     or self.checking_route or self.autoloc_busy or self.ctrl_op or self.busy or self.map_loading
-                    or self.stand_hold or self.climb is not None or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
+                    or self.stand_hold or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
                     or self.prof('patrol') != 'stop' or self.moving())
 
     def idle_tick(self):
@@ -2542,7 +2503,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 'lieIn': None if left is None else round(left, 1), 'hotLie': MOTOR_HOT_LIE,
                 'policy': self.policy_now()[0], 'policies': self.policies(),
                 'dual': None if dual is None else {'policy': dual[0], 'switching': dual[1], 'req': dual[2]},
-                'climb': None if self.climb is None else {'since': round(time.monotonic() - self.climb['t'], 1), 'max': CLIMB_MAX}}
+                'climb': None if self.climb is None else {'since': round(time.monotonic() - self.climb['t'], 1)}}
 
     # ---------- 多点导航 ----------
     @staticmethod
@@ -3580,13 +3541,35 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.node.event('WARN', f'{name}播报没播：{msg}')
         self.background(go())
 
+    async def route_climb_set(self, route, on):
+        if not on and not route.get('climb_touched'):
+            return
+        if on and (route['stop'].is_set() or self.estop):
+            raise RuntimeError('任务已停止，未切换爬台模式')
+        route['climb_touched'] = True
+        ok, message = self.set_climb(None,on)
+        if not ok:
+            raise RuntimeError(message)
+        if not on:
+            route['climb_touched'] = False
+
     async def route_crossing_set(self, route, active):
         critic_enabled = not active  # 强制跨越时关闭障碍评分，退出时恢复正常避障。
         if active:
             route['crossing_dirty'] = True  # 失败或超时仍可能已写入，退出时必须尝试恢复避障
             self.crossing_dirty = True
         try:
-            await self.obstacles_critic.apply(critic_enabled)
+            if active:
+                await self.route_climb_set(route, True)
+                if route['stop'].is_set() or self.estop:
+                    raise RuntimeError('任务已停止，未继续关闭避障评分')
+                await self.obstacles_critic.apply(False)
+            else:
+                results = await asyncio.gather(self.route_climb_set(route,False),
+                                               self.obstacles_critic.apply(True),return_exceptions=True)
+                errors = [r.text if isinstance(r,web.HTTPException) else str(r) for r in results if isinstance(r,Exception)]
+                if errors:
+                    raise RuntimeError('；'.join(errors))
         except Exception as e:
             detail = e.text if isinstance(e, web.HTTPException) else str(e)
             raise RuntimeError(f'强制跨越{"开启" if active else "关闭"}失败：{detail}') from e
@@ -6124,8 +6107,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.clients.pop(ws, None)
             self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
-            if self.climb is not None and self.climb['ws'] is ws:
-                self.climb_off(f'开启爬台模式的网页断开（{remote}）')
             if ws is self.owner:
                 self.owner = None
                 await self.lose_owner(f'控制方网页断开（{remote}）', owner=ws)

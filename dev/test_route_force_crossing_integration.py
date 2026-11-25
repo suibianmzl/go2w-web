@@ -33,7 +33,7 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ros2.chmod(0o755)
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
-            env = {**os.environ, 'GO2W_FAKE_PROCS':'1', 'GO2W_DATA':str(base/'data'),
+            env = {**os.environ, 'GO2W_FAKE_PROCS':'1', 'GO2W_FAKE_DUAL':'1', 'GO2W_DATA':str(base/'data'),
                    'GO2W_FAKE_MAP':str(maps/'lab_20261021.yaml'), 'GO2W_FAKE_START':'0,0,0',
                    'GO2W_CAM_ADDR':'127.0.0.1:9', 'PATH':str(bindir)+os.pathsep+os.environ['PATH'],
                    'PYTHONPATH':os.pathsep.join([str(ROOT/'dev/fake_ros'), str(ROOT.parent/'go2w/src/navigation/go2w_taught_route')])}
@@ -98,7 +98,11 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                 while not check():
                                     await asyncio.sleep(.05)
                         def values():
-                            return [json.loads(line)[-1] for line in command_log.read_text().splitlines()]
+                            return [row[-1] for line in command_log.read_text().splitlines()
+                                    if (row:=json.loads(line))[-2]=='FollowPath.ObstaclesCritic.enabled']
+                        def voxel_values():
+                            return [row[-1] for line in command_log.read_text().splitlines()
+                                    if (row:=json.loads(line))[-2]=='voxel_layer.enabled']
                         tasks = [asyncio.create_task(read()), asyncio.create_task(ping())]
                         try:
                             await until(lambda: state.get('state', {}).get('ctrl', {}).get('ready')
@@ -117,13 +121,19 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                 await until(lambda: (state.get('task', {}).get('task') or {}).get('name') == name
                                             and state['task']['task']['status'] == 'succeeded', name)
                                 self.assertEqual(values(), ['true', 'false', 'true'])
+                                self.assertEqual(voxel_values(),values())
+                                await until(lambda: state['state']['ctrl']['dual']['policy']=='rough'
+                                            and not state['state']['ctrl']['dual']['req'],'退出爬台')
+                                self.assertIsNone(state['state']['ctrl']['climb'])
                                 print(f'PASS 真实WebSocket {name}先初始化true，再到点执行 false → true', flush=True)
                                 await asyncio.sleep(.2)
                             await command('initial_pose', x=0., y=0., th=0.)
                             await command('arm', on=True)
                             command_log.write_text('')
                             await command('route_start', route_id=record['id'])
-                            await until(lambda: values() == ['true', 'false'], '进入跨越区间')
+                            await until(lambda: values() == ['true', 'false']
+                                        and state['state']['ctrl']['dual']['policy']=='climb'
+                                        and state['state']['ctrl']['dual']['req'], '进入跨越区间并开启爬台')
                             async with session.post(url+'/api/obstacles-critic/true') as response:
                                 self.assertEqual(response.status, 409, '手动请求不能覆盖路线配置')
                             self.assertEqual(values(), ['true', 'false'])

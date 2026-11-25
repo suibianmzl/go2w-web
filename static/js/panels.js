@@ -258,22 +258,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   // 爬台模式：后端 ctrl.dual = 运控回报的 {policy, switching, req}，ctrl.climb = 网页开着爬台模式 {since, max}
   function renderClimb(C){
     const D = C.dual, row = $('#climbRow');
-    row.hidden = !D;
-    if (!D) return;
-    const on = !!C.climb, climbing = D.policy === 'climb';
-    const st = D.switching ? (climbing ? '切到 climb 中…' : '切回 rough 中…')
-      : D.req && !climbing ? '等速度降下来再切（vx≤0.5 vy≤0.15 wz≤0.15）'
-      : climbing ? (on ? 'climb（爬台中）' : 'climb（遥控器 RB）')
+    row.hidden = !D && !C.climb;
+    if (row.hidden) return;
+    const on = !!C.climb, climbing = D?.policy === 'climb';
+    const st = !D ? '已选 climb，等待运控反馈' : D.switching ? (climbing ? '切到 climb 中…' : '切回 rough 中…')
+      : D.req && !climbing ? '已请求，等待策略切换…'
+      : climbing ? (on ? 'climb（爬台中）' : 'climb（外部请求）')
       : on ? '已请求，等运控切换…' : 'rough';
-    const left = on && C.climb.max ? ` · 剩 ${Math.max(0, Math.ceil((C.climb.max - C.climb.since) / 60))} 分钟` : '';
     const t = $('#climbTxt');
     t.className = 'pose-txt' + (climbing || on ? ' warn' : '');
-    t.innerHTML = `爬台 <b>${st}</b>${left}`;
+    t.innerHTML = `爬台 <b>${st}</b>`;
     const b = $('#climbBtn');
     b.textContent = on ? '关爬台模式' : '开爬台模式';
     b.classList.toggle('danger', on);
-    b.disabled = !on && (!(C.state === 'Velocity' && C.ready) || !!C.op || store.estop);
-    setAttr(b, 'title', on ? '切回 rough' : '切到 climb 策略（只能站着时开）');
+    b.disabled = false;
+    setAttr(b, 'title', on ? '切回 rough 模式' : '切到 climb 模式，导航和其他功能照常可用');
   }
   function renderPolicy(C){
     const sel = $('#policySel'), list = C.policies || [];

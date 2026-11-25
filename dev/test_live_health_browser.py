@@ -23,7 +23,7 @@ def main():
             page.route('https://fonts.gstatic.com/**',lambda r:r.abort())
             page.add_init_script('''window.WebSocket = class {
                 constructor(){ this.readyState=1;window.healthSocket=this;setTimeout(()=>this.onopen?.({}),0); }
-                send(raw){const m=JSON.parse(raw);if(m.t==='cmd')this.deliver({t:'ack',id:m.id,ok:true});}
+                send(raw){const m=JSON.parse(raw);if(m.t==='cmd'){window.lastHealthCommand=m;this.deliver({t:'ack',id:m.id,ok:true});}}
                 deliver(d){this.onmessage?.({data:JSON.stringify(d)});}
                 close(){this.readyState=3;this.onclose?.({});}
             };''')
@@ -52,6 +52,33 @@ def main():
             page.evaluate('(s)=>healthSocket.deliver(s)',state)
             expect(page.locator('#chPose b')).to_have_text('已站起')
             assert page.evaluate('go2w.actions.walking()')
+            # Climb is an ordinary mode choice: available before standing and without a modal or countdown.
+            state['ctrl'].update(state='Passive',ready=True,climb=None,
+                                 dual={'policy':'rough','switching':False,'req':False})
+            state['robotFeedback']['posture']='lying'
+            page.evaluate('(s)=>healthSocket.deliver(s)',state)
+            expect(page.locator('#climbBtn')).to_be_enabled()
+            page.locator('#climbBtn').click()
+            assert page.evaluate('lastHealthCommand.op')=='climb'
+            assert page.evaluate('lastHealthCommand.on') is True
+            expect(page.get_by_role('dialog')).to_have_count(0)
+            state['ctrl']['dual']={'policy':'climb','switching':False,'req':True}
+            page.evaluate('(s)=>healthSocket.deliver(s)',state)
+            expect(page.locator('#climbBtn')).to_have_text('开爬台模式')
+            expect(page.locator('#climbTxt')).to_contain_text('外部请求')
+            page.locator('#climbBtn').click()
+            assert page.evaluate('lastHealthCommand.on') is True
+            state['ctrl'].update(state='Velocity',ready=True,climb={'since':10000},
+                                 dual={'policy':'climb','switching':False,'req':True})
+            state['robotFeedback']['posture']='standing'
+            page.evaluate('(s)=>healthSocket.deliver(s)',state)
+            expect(page.locator('#climbTxt')).not_to_contain_text('剩')
+            state['ctrl']['dual']=None
+            page.evaluate('(s)=>healthSocket.deliver(s)',state)
+            expect(page.locator('#climbRow')).to_be_visible()
+            expect(page.locator('#climbTxt')).to_contain_text('等待运控反馈')
+            page.locator('#climbBtn').click()
+            assert page.evaluate('lastHealthCommand.on') is False
             state['robotFeedback']['posture']='unknown'
             state['ctrl']['physicalReady']=True
             page.evaluate('(s)=>healthSocket.deliver(s)',state)

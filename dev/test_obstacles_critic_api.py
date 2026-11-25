@@ -158,24 +158,32 @@ class ObstaclesCriticAPITests(unittest.IsolatedAsyncioTestCase):
 
     @patch('obstacles_critic.asyncio.create_subprocess_exec', new_callable=AsyncMock)
     async def test_parameter_writes_are_serialized(self, create_process):
-        entered, release = asyncio.Event(), asyncio.Event()
-        first, second = Mock(returncode=0), Mock(returncode=0)
-        async def pending():
-            entered.set()
-            await release.wait()
+        entered, release = [asyncio.Event() for _ in range(2)], [asyncio.Event() for _ in range(2)]
+        processes = [Mock(returncode=0) for _ in range(4)]
+        async def pending(index):
+            entered[index].set()
+            await release[index].wait()
             return b'OK', b''
-        first.communicate = AsyncMock(side_effect=pending)
-        second.communicate = AsyncMock(return_value=(b'OK', b''))
-        create_process.side_effect = [first, second]
+        async def first():return await pending(0)
+        async def second():return await pending(1)
+        processes[0].communicate = AsyncMock(side_effect=first)
+        processes[1].communicate = AsyncMock(side_effect=second)
+        for process in processes[2:]:process.communicate = AsyncMock(return_value=(b'OK',b''))
+        create_process.side_effect = processes
         api = ObstaclesCriticAPI()
         one = asyncio.create_task(api.apply(True))
-        await entered.wait()
+        await entered[0].wait()
         two = asyncio.create_task(api.apply(False))
         await asyncio.sleep(0)
         self.assertEqual(create_process.await_count, 1)
-        release.set()
-        self.assertEqual(await asyncio.gather(one, two), ['OK', 'OK'])
-        self.assertEqual([c.args[-1] for c in create_process.await_args_list], ['true', 'false'])
+        release[0].set()
+        await entered[1].wait()
+        await asyncio.sleep(0)
+        self.assertEqual(create_process.await_count,2,'第二个参数完成前不能交叉下一次请求')
+        release[1].set()
+        results=await asyncio.gather(one,two)
+        self.assertEqual([[row['enabled'] for row in rows] for rows in results],[[True,True],[False,False]])
+        self.assertEqual([c.args[-1] for c in create_process.await_args_list], ['true','true','false','false'])
 
 
 if __name__ == '__main__':

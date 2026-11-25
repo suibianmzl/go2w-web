@@ -76,17 +76,10 @@ export function createActions(store, src){
         onOk: () => exec(src.cmd.setPolicy(name), null).finally(() => onDone?.()),
         onCancel: () => onDone?.() });
     },
-    // 爬台模式（融合策略）：开着时后端一直续约 2101；关掉、网页断开、急停、趴下、超时都会切回 rough
+    // 爬台是普通模式选择，不与导航、示教或姿态操作互斥。
     climb(on){
-      const C = store.ctrl;
       if (!ready('climb')) return;
-      if (!on) return exec(src.cmd.climb(false), null);
-      if (store.estop) return toast('急停中：先解除急停', 'err');
-      if (!(C?.state === 'Velocity' && C.ready) || C.op) return toast('只能站着（策略运行中）开爬台模式', 'err');
-      const max = Math.round((C.dual && C.climb?.max) || 300);
-      confirmBox({ title: '开爬台模式', ok: '开启',
-        body: `运控切到 climb 策略（约 0.5 s 过渡）。速度要在 vx ≤ 0.5、vy ≤ 0.15、wz ≤ 0.15 以内才会切，超了先挂起、降下来自动切；建议先停稳再开。上台用遥控器或网页摇杆慢慢走。关掉、网页断开、急停、趴下或开满 ${Math.round(max / 60)} 分钟都会自动切回 rough。开着时不能发导航任务。`,
-        onOk: () => exec(src.cmd.climb(true), null) });
+      return exec(src.cmd.climb(!!on), null);
     },
     // fine = 重定位的微调：后端用小协方差，AMCL 不会把粒子撒开
     initialPose(p, fine = false){

@@ -456,8 +456,8 @@ export function setupRouteEditor(store, actions, setTool){
     const marked = draft.points.flatMap((p, i) => p.forceCrossing ? [i + 1] : []);
     const crossingInvalid = marked.length === 1;
     crossingHint.textContent = crossingInvalid ? '强制跨越需要至少选择两个点，或者全部不选。'
-      : marked.length ? `强制跨越：到达第 ${marked[0]} 站后开始跨越，到达第 ${marked.at(-1)} 站后恢复正常避障，其间未选中的站点也在区间内。取消或失败时也尝试恢复正常避障。`
-      : '强制跨越可不选；启用时至少选择两个点。';
+      : marked.length ? `强制跨越：到达第 ${marked[0]} 站后开始跨越并开启爬台，到达第 ${marked.at(-1)} 站后恢复正常避障并关闭爬台，其间未选中的站点也在区间内。取消或失败时也尝试恢复。`
+      : '强制跨越可不选；启用时至少选择两个点，区间内自动开启爬台模式。';
     crossingHint.classList.toggle('route-crossing-error', crossingInvalid);
     const pointsDirty = draft !== savedDraft;
     const matching = draft.map && draft.map === store.mapCurrent;

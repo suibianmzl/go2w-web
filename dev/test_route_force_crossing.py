@@ -96,6 +96,18 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
             return asyncio.create_task(arrive())
         node.track_goal = track
         host.node = node
+        host.climb = None
+        host.estop = False
+        host.ctrl_op = None
+        host.heartbeat = 20.
+        host.clients = {None:{'last_ping':time.monotonic()}}
+        host.remote = lambda _:'test browser'
+        dual = ['rough',False,False]
+        def climb(on):
+            trace.append(('climb',on))
+            dual[:] = ['climb' if on else 'rough',False,on]
+        host.ctrl = NS(climb=climb,get_dual=lambda _:tuple(dual))
+        host.ctrl_get = lambda:('Velocity',True,1)
         async def apply(enabled):
             trace.append(('param', enabled))
             return 'Successfully set parameter'
@@ -114,6 +126,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         route = dict(record=record, loops=loops, resume=resume, index=0, loop=1, back=False,
                      stop=asyncio.Event(), status='active', started=0., done=0, checking=True,
                      goal=None, through=False)
+        host.route = route
         return host, route, trace, logs
 
     async def run_case(self, **kwargs):
@@ -172,12 +185,12 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_starting_at_marked_first_point_enables_before_departing(self):
         _, _, trace, _ = await self.run_case(marked=(0, 3), pos=(1., 0., 0.))
-        self.assertEqual(trace[:2], [('param', True), ('param', False)])
+        self.assertEqual([e for e in trace if e[0]=='param'][:2], [('param', True), ('param', False)])
         self.assertEqual([e for e in trace if e[0] == 'param'], [('param', True), ('param', False), ('param', True)])
 
     async def test_resume_inside_span_reenables_before_sending_goal(self):
         _, _, trace, _ = await self.run_case(resume=(2, 1, False))
-        self.assertEqual(trace[0], ('param', False))
+        self.assertEqual(next(e for e in trace if e[0]=='param'), ('param', False))
         self.assertEqual([e for e in trace if e[0] == 'param'], [('param', False), ('param', True)])
 
     async def test_resume_after_span_does_not_enable(self):
@@ -285,6 +298,102 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
                 await host.run_route(None, route)
                 sent = {p[0]:p[2] for p in host.node.sent_poses}
                 self.assertEqual((sent[2.], sent[4.]), (1.3, -1.3))
+
+    async def test_crossing_also_enables_climb_before_dispatch_and_restores_it_at_end(self):
+        for through in (False,True):
+            host,route,trace,_=await self.run_case(through=through)
+            opened=trace.index(('param',False))
+            self.assertLess(trace.index(('arrive',2.)),trace.index(('climb',True)))
+            self.assertLess(trace.index(('climb',True)),opened)
+            self.assertLess(opened,trace.index(('send',(3.,4.) if through else (3.,))))
+            self.assertFalse(host.climb)
+            self.assertFalse(route.get('climb_touched'))
+            self.assertIn(('climb',False),trace)
+
+    async def test_climb_is_reenabled_for_resume_and_each_loop_but_not_normal_routes(self):
+        for through in (False,True):
+            for options,count in (({'resume':(2,1,False)},1),({'marked':(0,3),'loops':2},2),({'marked':()},0)):
+                _,_,trace,_=await self.run_case(through=through,**options)
+                self.assertEqual(trace.count(('climb',True)),count)
+
+    async def test_unsupported_climb_aborts_before_crossing_or_next_goal(self):
+        host,route,trace,_=self.rig()
+        host.ctrl.get_dual=lambda _:None
+        await host.run_route(None,route)
+        self.assertEqual(route['status'],'aborted')
+        self.assertNotIn(('param',False),trace)
+        self.assertFalse(any(e[0]=='send' and max(e[1])>2 for e in trace))
+
+    async def test_climb_request_failure_stops_and_attempts_both_restores(self):
+        host,route,trace,_=self.rig()
+        def fail(on):
+            trace.append(('climb',on))
+            if on:raise RuntimeError('send failed')
+        host.ctrl.climb=fail
+        await host.run_route(None,route)
+        self.assertEqual(route['status'],'aborted')
+        self.assertNotIn(('param',False),trace)
+        self.assertIn(('climb',False),trace)
+        self.assertGreaterEqual(trace.count(('param',True)),2)
+        self.assertFalse(host.climb)
+
+    async def test_climb_close_failure_still_restores_critic_and_stops_next_goal(self):
+        host,route,trace,_=self.rig()
+        original=host.ctrl.climb
+        def fail(on):
+            trace.append(('climb_attempt',on))
+            if not on:raise RuntimeError('close failed')
+            original(on)
+        host.ctrl.climb=fail
+        await host.run_route(None,route)
+        self.assertEqual(route['status'],'aborted')
+        self.assertIn(('climb_attempt',False),trace)
+        opened=trace.index(('param',False))
+        self.assertIn(('param',True),trace[opened+1:])
+        self.assertFalse(any(e[0]=='send' and max(e[1])>4 for e in trace))
+
+    async def test_mode_remains_selected_without_clients_or_time_limit_and_manual_switches_are_allowed(self):
+        host,route,trace,_=self.rig()
+        await host.route_crossing_set(route,True)
+        self.assertTrue(host.set_climb(None,False)[0])
+        self.assertTrue(host.set_climb(None,True)[0])
+        host.climb['t']=time.monotonic()-10000
+        host.clients.clear()
+        host.climb_tick()
+        self.assertIsNotNone(host.climb)
+        self.assertEqual(trace[-1],('climb',True))
+        await host.route_crossing_set(route,False)
+
+    async def test_switching_mode_during_navigation_or_before_standing_does_not_add_a_mode_lock(self):
+        host,route,_,_=self.rig()
+        host.route_running=lambda:True
+        host.node.nav_active=lambda:True
+        host.ctrl_get=lambda:('Passive',True,1)
+        self.assertTrue(host.set_climb(None,True)[0])
+        self.assertEqual(route['status'],'active')
+        self.assertTrue(host.set_climb(None,False)[0])
+        self.assertEqual(route['status'],'active')
+
+    async def test_an_unmarked_navigation_task_does_not_reset_manually_selected_climb(self):
+        host,route,trace,_=self.rig(marked=())
+        self.assertTrue(host.set_climb(None,True)[0])
+        await host.run_route(None,route)
+        self.assertEqual(route['status'],'succeeded')
+        self.assertIsNotNone(host.climb)
+        self.assertNotIn(('climb',False),trace)
+
+    async def test_cancel_while_entering_climb_never_disables_critic_or_dispatches_next_goal(self):
+        host,route,trace,_=self.rig()
+        original=host.ctrl.climb
+        def canceled(on):
+            original(on)
+            if on:host.finish_route(route,'canceled','test cancel')
+        host.ctrl.climb=canceled
+        await host.run_route(None,route)
+        self.assertEqual(route['status'],'canceled')
+        self.assertNotIn(('param',False),trace)
+        self.assertIn(('climb',False),trace)
+        self.assertFalse(host.climb)
 
     async def test_single_goal_cannot_bypass_failed_crossing_reset(self):
         host, route, trace, _ = self.rig()
