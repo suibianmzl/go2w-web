@@ -150,100 +150,170 @@ class ArchiveStore:
         statements = [
             '''
             CREATE TABLE IF NOT EXISTS robot_session (
-                session_id VARCHAR(64) NOT NULL,
-                robot_id VARCHAR(128) NOT NULL,
-                connected_at DATETIME(3) NOT NULL,
-                disconnected_at DATETIME(3) NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'active',
-                remote_info VARCHAR(255) NULL,
-                edge_version VARCHAR(128) NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                session_id VARCHAR(64) NOT NULL COMMENT '机器人连接会话ID',
+                robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+                connected_at DATETIME(3) NOT NULL COMMENT '控制连接建立时间（UTC）',
+                disconnected_at DATETIME(3) NULL COMMENT '控制连接断开时间（UTC）',
+                status VARCHAR(32) NOT NULL DEFAULT 'active' COMMENT '会话状态',
+                remote_info VARCHAR(255) NULL COMMENT '机器狗远端连接信息',
+                edge_version VARCHAR(128) NULL COMMENT '边缘网关版本',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
                 updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-                    ON UPDATE CURRENT_TIMESTAMP(3),
+                    ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '记录更新时间（UTC）',
                 PRIMARY KEY (session_id),
                 KEY idx_robot_session_robot_time (robot_id, connected_at),
                 KEY idx_robot_session_status (status, updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_0900_ai_ci
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='机器狗连接会话'
             ''',
             '''
             CREATE TABLE IF NOT EXISTS robot_command (
-                command_id VARCHAR(64) NOT NULL,
-                robot_id VARCHAR(128) NOT NULL,
-                session_id VARCHAR(64) NULL,
-                browser_session VARCHAR(64) NULL,
-                request_id VARCHAR(128) NULL,
-                upstream_id VARCHAR(128) NULL,
-                operation VARCHAR(64) NOT NULL,
-                task_id VARCHAR(128) NULL,
-                payload JSON NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'issued',
-                issued_at DATETIME(3) NOT NULL,
-                sent_at DATETIME(3) NULL,
-                ack_at DATETIME(3) NULL,
-                ok TINYINT(1) NULL,
-                message TEXT NULL,
-                response JSON NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                command_id VARCHAR(64) NOT NULL COMMENT '云端指令唯一ID',
+                robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+                session_id VARCHAR(64) NULL COMMENT '机器人连接会话ID',
+                browser_session VARCHAR(64) NULL COMMENT '发起指令的浏览器会话',
+                request_id VARCHAR(128) NULL COMMENT '浏览器原始请求ID',
+                upstream_id VARCHAR(128) NULL COMMENT '云端发送给机器人的请求ID',
+                operation VARCHAR(64) NOT NULL COMMENT '指令操作',
+                task_id VARCHAR(128) NULL COMMENT '关联巡检或导航任务',
+                payload JSON NULL COMMENT '完整下发指令',
+                status VARCHAR(32) NOT NULL DEFAULT 'issued' COMMENT '指令状态',
+                issued_at DATETIME(3) NOT NULL COMMENT '云端受理时间（UTC）',
+                sent_at DATETIME(3) NULL COMMENT '发送时间（UTC）',
+                ack_at DATETIME(3) NULL COMMENT 'ACK时间（UTC）',
+                ok TINYINT(1) NULL COMMENT 'ACK结果',
+                message TEXT NULL COMMENT 'ACK消息',
+                response JSON NULL COMMENT '完整ACK数据',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
                 updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-                    ON UPDATE CURRENT_TIMESTAMP(3),
+                    ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '记录更新时间（UTC）',
                 PRIMARY KEY (command_id),
                 KEY idx_robot_command_robot_time (robot_id, issued_at),
                 KEY idx_robot_command_status (status, updated_at),
                 KEY idx_robot_command_session (session_id, issued_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_0900_ai_ci
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='云端下发指令及确认记录'
             ''',
             '''
             CREATE TABLE IF NOT EXISTS robot_data_object (
-                object_id VARCHAR(64) NOT NULL,
-                robot_id VARCHAR(128) NOT NULL,
-                session_id VARCHAR(64) NULL,
-                direction VARCHAR(16) NOT NULL,
-                stream_type VARCHAR(64) NOT NULL,
-                format VARCHAR(32) NOT NULL,
-                period_start DATETIME(3) NOT NULL,
-                period_end DATETIME(3) NOT NULL,
-                message_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
-                byte_size BIGINT UNSIGNED NOT NULL DEFAULT 0,
-                tos_bucket VARCHAR(128) NOT NULL,
-                tos_key VARCHAR(512) NOT NULL,
-                sha256 CHAR(64) NOT NULL,
-                schema_version INT UNSIGNED NOT NULL DEFAULT 1,
-                status VARCHAR(32) NOT NULL DEFAULT 'uploaded',
-                uploaded_at DATETIME(3) NOT NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                object_id VARCHAR(64) NOT NULL COMMENT '数据对象ID',
+                robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+                session_id VARCHAR(64) NULL COMMENT '机器人连接会话ID',
+                direction VARCHAR(16) NOT NULL COMMENT '数据方向：up/down',
+                stream_type VARCHAR(64) NOT NULL COMMENT '数据流类型',
+                format VARCHAR(32) NOT NULL COMMENT '对象格式',
+                period_start DATETIME(3) NOT NULL COMMENT '分片开始时间（UTC）',
+                period_end DATETIME(3) NOT NULL COMMENT '分片结束时间（UTC）',
+                message_count BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '消息数量',
+                byte_size BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '上传对象字节数',
+                tos_bucket VARCHAR(128) NOT NULL COMMENT 'TOS存储桶',
+                tos_key VARCHAR(512) NOT NULL COMMENT 'TOS对象Key',
+                sha256 CHAR(64) NOT NULL COMMENT '上传对象SHA256',
+                schema_version INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '数据协议版本',
+                status VARCHAR(32) NOT NULL DEFAULT 'uploaded' COMMENT '归档状态',
+                uploaded_at DATETIME(3) NOT NULL COMMENT '上传完成时间（UTC）',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
                 PRIMARY KEY (object_id),
                 UNIQUE KEY uk_robot_data_object_tos_key (tos_bucket, tos_key),
                 KEY idx_robot_data_object_robot_time (robot_id, period_start),
                 KEY idx_robot_data_object_session (session_id, period_start),
                 KEY idx_robot_data_object_type (stream_type, period_start)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_0900_ai_ci
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='机器狗归档数据TOS对象清单'
             ''',
             '''
             CREATE TABLE IF NOT EXISTS robot_incident (
-                robot_id VARCHAR(128) NOT NULL,
-                incident_id VARCHAR(128) NOT NULL,
-                started_at_ms BIGINT NOT NULL,
-                ended_at_ms BIGINT NULL,
-                duration_s DOUBLE NULL,
-                ongoing TINYINT(1) NOT NULL DEFAULT 0,
-                incident_type VARCHAR(64) NOT NULL,
-                label VARCHAR(128) NOT NULL,
-                level VARCHAR(16) NOT NULL,
-                message TEXT NULL,
-                map_name VARCHAR(255) NULL,
-                payload JSON NOT NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+                incident_id VARCHAR(128) NOT NULL COMMENT '异常事件唯一ID',
+                started_at_ms BIGINT NOT NULL COMMENT '发生时间：Unix毫秒',
+                ended_at_ms BIGINT NULL COMMENT '结束时间：Unix毫秒',
+                duration_s DOUBLE NULL COMMENT '持续秒数',
+                ongoing TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否持续中',
+                incident_type VARCHAR(64) NOT NULL COMMENT '异常类型代码',
+                label VARCHAR(128) NOT NULL COMMENT '异常类型名称',
+                level VARCHAR(16) NOT NULL COMMENT '异常级别：warn/error',
+                message TEXT NULL COMMENT '异常说明',
+                map_name VARCHAR(255) NULL COMMENT '发生地图',
+                payload JSON NOT NULL COMMENT '完整异常记录',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
                 updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-                    ON UPDATE CURRENT_TIMESTAMP(3),
+                    ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '记录更新时间（UTC）',
                 PRIMARY KEY (robot_id, incident_id),
                 KEY idx_robot_incident_time (robot_id, started_at_ms),
                 KEY idx_robot_incident_type (robot_id, incident_type, started_at_ms),
                 KEY idx_robot_incident_ongoing (robot_id, ongoing, started_at_ms)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-              COLLATE=utf8mb4_0900_ai_ci
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='机器狗异常事件记录'
+            ''',
+            '''
+            CREATE TABLE IF NOT EXISTS robot_rtc_recording (
+                recording_id CHAR(32) NOT NULL COMMENT '云端内部录制记录ID',
+                robot_id VARCHAR(128) NOT NULL COMMENT '机器狗业务ID',
+                online_session_id VARCHAR(64) NOT NULL COMMENT '机器狗本次在线会话ID',
+                control_session_id VARCHAR(64) NULL COMMENT '创建时的控制连接会话ID',
+                video_session_id VARCHAR(64) NULL COMMENT '创建时的视频连接会话ID',
+                app_id VARCHAR(64) NOT NULL COMMENT '火山RTC应用ID',
+                room_id VARCHAR(128) NOT NULL COMMENT 'RTC房间ID',
+                task_id VARCHAR(128) NOT NULL COMMENT '火山RTC录制任务ID',
+                publisher_user_id VARCHAR(128) NOT NULL COMMENT 'RTC视频发布者用户ID',
+                business_id VARCHAR(128) NULL COMMENT 'RTC云端录制业务标识',
+                start_reason VARCHAR(128) NULL COMMENT '发起录制原因',
+                stop_reason VARCHAR(128) NULL COMMENT '停止录制原因',
+                status VARCHAR(32) NOT NULL COMMENT '录制任务状态',
+                requested_at DATETIME(3) NOT NULL COMMENT '请求录制时间（UTC）',
+                recording_started_at DATETIME(3) NULL COMMENT '录制实际开始时间（UTC）',
+                stopping_at DATETIME(3) NULL COMMENT '请求停止时间（UTC）',
+                recording_stopped_at DATETIME(3) NULL COMMENT '录制实际结束时间（UTC）',
+                upload_finished_at DATETIME(3) NULL COMMENT '文件上传完成时间（UTC）',
+                duration_ms BIGINT UNSIGNED NULL COMMENT '录制总时长（毫秒）',
+                file_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '生成文件数量',
+                total_byte_size BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '生成文件总字节数',
+                tos_bucket VARCHAR(128) NULL COMMENT 'TOS存储桶',
+                request_config JSON NULL COMMENT 'StartRecord请求配置（已脱敏）',
+                error_code VARCHAR(128) NULL COMMENT '最近错误码',
+                error_message TEXT NULL COMMENT '最近错误信息',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
+                updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '记录更新时间（UTC）',
+                PRIMARY KEY (recording_id),
+                UNIQUE KEY uk_rtc_recording_task (app_id, room_id, task_id),
+                KEY idx_rtc_recording_session (online_session_id, requested_at),
+                KEY idx_rtc_recording_robot_time (robot_id, requested_at),
+                KEY idx_rtc_recording_status (status, updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='RTC云端录制任务'
+            ''',
+            '''
+            CREATE TABLE IF NOT EXISTS robot_rtc_recording_file (
+                recording_file_id CHAR(32) NOT NULL COMMENT '录制文件记录ID',
+                recording_id CHAR(32) NOT NULL COMMENT '关联的录制任务记录ID',
+                file_index INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '同一任务内文件序号',
+                file_format VARCHAR(16) NOT NULL COMMENT '文件格式',
+                tos_bucket VARCHAR(128) NOT NULL COMMENT 'TOS存储桶',
+                tos_key VARCHAR(512) NOT NULL COMMENT 'TOS对象Key',
+                duration_ms BIGINT UNSIGNED NULL COMMENT '文件时长（毫秒）',
+                byte_size BIGINT UNSIGNED NULL COMMENT '文件大小（字节）',
+                started_at DATETIME(3) NULL COMMENT '文件开始时间（UTC）',
+                ended_at DATETIME(3) NULL COMMENT '文件结束时间（UTC）',
+                video_width INT UNSIGNED NULL COMMENT '视频宽度（像素）',
+                video_height INT UNSIGNED NULL COMMENT '视频高度（像素）',
+                video_codec VARCHAR(32) NULL COMMENT '视频编码',
+                audio_codec VARCHAR(32) NULL COMMENT '音频编码',
+                status VARCHAR(32) NOT NULL DEFAULT 'uploaded' COMMENT '文件状态',
+                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    COMMENT '记录创建时间（UTC）',
+                updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                    ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '记录更新时间（UTC）',
+                PRIMARY KEY (recording_file_id),
+                UNIQUE KEY uk_rtc_recording_file_object (tos_bucket, tos_key),
+                KEY idx_rtc_recording_file_task (recording_id, file_index)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_0900_ai_ci COMMENT='RTC云端录制文件清单'
             ''',
         ]
         async with self._pool.acquire() as connection:
@@ -251,6 +321,217 @@ class ArchiveStore:
                 for statement in statements:
                     await cursor.execute(statement)
             await connection.commit()
+
+    async def rtc_recording_created(self, record):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    '''
+                    INSERT INTO robot_rtc_recording (
+                        recording_id, robot_id, online_session_id,
+                        control_session_id, video_session_id, app_id, room_id,
+                        task_id, publisher_user_id, business_id, start_reason,
+                        status, requested_at, tos_bucket, request_config
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'starting', %s, %s, %s
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        start_reason=VALUES(start_reason),
+                        request_config=VALUES(request_config),
+                        updated_at=UTC_TIMESTAMP(3)
+                    ''',
+                    (
+                        record['recording_id'],
+                        record['robot_id'],
+                        record['online_session_id'],
+                        record.get('control_session_id'),
+                        record.get('video_session_id'),
+                        record['app_id'],
+                        record['room_id'],
+                        record['task_id'],
+                        record['publisher_user_id'],
+                        record.get('business_id'),
+                        record.get('start_reason'),
+                        record.get('requested_at') or utc_now(),
+                        record.get('tos_bucket'),
+                        compact_json(record.get('request_config')),
+                    ),
+                )
+            await connection.commit()
+
+    async def rtc_recording_status(self, app_id, room_id, task_id, status, *,
+                                   recording_started_at=None, stopping_at=None,
+                                   stop_reason=None, error_code=None,
+                                   error_message=None):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    '''
+                    UPDATE robot_rtc_recording
+                    SET status=%s,
+                        recording_started_at=COALESCE(
+                            %s, recording_started_at),
+                        stopping_at=COALESCE(%s, stopping_at),
+                        stop_reason=COALESCE(%s, stop_reason),
+                        error_code=COALESCE(%s, error_code),
+                        error_message=COALESCE(%s, error_message),
+                        updated_at=UTC_TIMESTAMP(3)
+                    WHERE app_id=%s AND room_id=%s AND task_id=%s
+                    ''',
+                    (
+                        status, recording_started_at, stopping_at, stop_reason,
+                        str(error_code) if error_code is not None else None,
+                        str(error_message) if error_message is not None else None,
+                        app_id, room_id, task_id,
+                    ),
+                )
+            await connection.commit()
+
+    async def rtc_recording_finished(
+        self,
+        app_id,
+        room_id,
+        task_id,
+        status,
+        *,
+        stopped_at=None,
+        duration_ms=0,
+        total_byte_size=0,
+        error_code=None,
+        error_message=None,
+        files=None,
+    ):
+        await self.ensure()
+        files = list(files or [])
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    '''
+                    UPDATE robot_rtc_recording
+                    SET status=%s,
+                        recording_stopped_at=%s,
+                        upload_finished_at=%s,
+                        duration_ms=%s,
+                        file_count=%s,
+                        total_byte_size=%s,
+                        error_code=%s,
+                        error_message=%s,
+                        updated_at=UTC_TIMESTAMP(3)
+                    WHERE app_id=%s AND room_id=%s AND task_id=%s
+                    ''',
+                    (
+                        status,
+                        stopped_at or utc_now(),
+                        stopped_at or utc_now(),
+                        int(duration_ms or 0),
+                        len(files),
+                        int(total_byte_size or 0),
+                        str(error_code) if error_code is not None else None,
+                        str(error_message) if error_message is not None else None,
+                        app_id,
+                        room_id,
+                        task_id,
+                    ),
+                )
+                await cursor.execute(
+                    '''
+                    SELECT recording_id
+                    FROM robot_rtc_recording
+                    WHERE app_id=%s AND room_id=%s AND task_id=%s
+                    ''',
+                    (app_id, room_id, task_id),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await connection.commit()
+                    return
+                recording_id = row[0]
+                for item in files:
+                    await cursor.execute(
+                        '''
+                        INSERT INTO robot_rtc_recording_file (
+                            recording_file_id, recording_id, file_index,
+                            file_format, tos_bucket, tos_key, duration_ms,
+                            byte_size, started_at, ended_at, video_width,
+                            video_height, video_codec, audio_codec, status
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            recording_id=VALUES(recording_id),
+                            file_index=VALUES(file_index),
+                            file_format=VALUES(file_format),
+                            duration_ms=VALUES(duration_ms),
+                            byte_size=VALUES(byte_size),
+                            started_at=VALUES(started_at),
+                            ended_at=VALUES(ended_at),
+                            video_width=VALUES(video_width),
+                            video_height=VALUES(video_height),
+                            video_codec=VALUES(video_codec),
+                            audio_codec=VALUES(audio_codec),
+                            status=VALUES(status),
+                            updated_at=UTC_TIMESTAMP(3)
+                        ''',
+                        (
+                            item['recording_file_id'],
+                            recording_id,
+                            int(item.get('file_index') or 0),
+                            item.get('file_format') or 'UNKNOWN',
+                            item['tos_bucket'],
+                            item['tos_key'],
+                            item.get('duration_ms'),
+                            item.get('byte_size'),
+                            item.get('started_at'),
+                            item.get('ended_at'),
+                            item.get('video_width'),
+                            item.get('video_height'),
+                            item.get('video_codec'),
+                            item.get('audio_codec'),
+                            item.get('status') or 'uploaded',
+                        ),
+                    )
+            await connection.commit()
+
+    async def active_rtc_recording(self, robot_id):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    '''
+                    SELECT recording_id, robot_id, online_session_id,
+                           control_session_id, video_session_id, app_id,
+                           room_id, task_id, status, requested_at
+                    FROM robot_rtc_recording
+                    WHERE robot_id=%s
+                      AND status IN ('starting', 'recording', 'stopping',
+                                     'stop_failed')
+                    ORDER BY requested_at DESC
+                    LIMIT 1
+                    ''',
+                    (robot_id,),
+                )
+                return await cursor.fetchone()
+
+    async def rtc_recording_files(self, app_id, room_id, task_id):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    '''
+                    SELECT f.*
+                    FROM robot_rtc_recording_file f
+                    JOIN robot_rtc_recording r
+                      ON r.recording_id=f.recording_id
+                    WHERE r.app_id=%s AND r.room_id=%s AND r.task_id=%s
+                    ORDER BY f.file_index
+                    ''',
+                    (app_id, room_id, task_id),
+                )
+                return list(await cursor.fetchall())
 
     async def session_started(self, robot_id, session_id, connected_at,
                               remote_info=None, edge_version=None):
@@ -449,6 +730,18 @@ class ArchiveStore:
                     ),
                 )
             await connection.commit()
+
+    async def delete_incidents(self, robot_id):
+        await self.ensure()
+        async with self._pool.acquire() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    'DELETE FROM robot_incident WHERE robot_id=%s',
+                    (str(robot_id),),
+                )
+                deleted = cursor.rowcount
+            await connection.commit()
+        return int(deleted or 0)
 
     async def list_incidents(self, robot_id, limit=50, before_ms=None):
         await self.ensure()

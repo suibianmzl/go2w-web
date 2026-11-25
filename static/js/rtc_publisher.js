@@ -9,7 +9,12 @@ const canvasContext = canvas.getContext('2d', { alpha: false });
 const status = document.querySelector('#status');
 let engine = null, muxer = null, ws = null, config = null, pingTimer = null;
 const snapshotBusy = new Set();
-window.__go2wRtcState = { phase: 'starting', events: [] };
+window.__go2wRtcState = {
+  phase: 'starting',
+  events: [],
+  publishing: false,
+  source_connected: false,
+};
 
 function withRobot(value){
   const url = new URL(value, location.href);
@@ -20,6 +25,7 @@ function withRobot(value){
 async function captureSnapshot(incidentId){
   if (snapshotBusy.has(incidentId) || !canvas.width || !canvas.height) return;
   snapshotBusy.add(incidentId);
+  const capturedAt = Date.now();
   try {
     const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
     if (!blob) throw new Error('snapshot encode failed');
@@ -29,7 +35,10 @@ async function captureSnapshot(incidentId){
     );
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'image/jpeg' },
+      headers: {
+        'Content-Type': 'image/jpeg',
+        'X-Go2W-Captured-At': String(capturedAt),
+      },
       body: blob,
     });
     if (!response.ok) throw new Error(`snapshot HTTP ${response.status}`);
@@ -56,7 +65,12 @@ async function report(){
     if (!response.ok) return;
     const payload = await response.json();
     for (const request of payload.snapshot_requests || []){
-      if (request?.incident_id) captureSnapshot(request.incident_id);
+      if (
+        request?.incident_id
+        && (!request.expires_at || Date.now() < Number(request.expires_at))
+      ){
+        captureSnapshot(request.incident_id);
+      }
     }
   } catch {}
 }
@@ -144,6 +158,7 @@ async function startRtc(){
   });
   engine.setExternalVideoTrack(VERTC.StreamIndex.STREAM_INDEX_MAIN, track);
   await engine.publishStream(VERTC.MediaType.VIDEO);
+  window.__go2wRtcState.publishing = true;
   remember('publishing', { publisher: config.publisher_id, room: config.room_id });
 }
 
@@ -151,6 +166,7 @@ function connectCamera(){
   ws = new WebSocket(withRobot(wsUrl));
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
+    window.__go2wRtcState.source_connected = true;
     log(`camera connected ${wsUrl}`);
     ws.send(JSON.stringify({ t: 'sub', layers: [] }));
     ws.send(JSON.stringify({ t: 'cam', on: true }));
@@ -170,6 +186,7 @@ function connectCamera(){
     muxer.feed({ video: payload, duration: meta.dur || undefined });
   };
   ws.onclose = () => {
+    window.__go2wRtcState.source_connected = false;
     clearInterval(pingTimer);
     log('camera disconnected; retrying');
     setTimeout(connectCamera, 2000);
@@ -196,6 +213,7 @@ connectCamera();
 setInterval(report, 2000);
 startRtc().catch(error => {
   window.__go2wRtcState.phase = 'failed';
+  window.__go2wRtcState.publishing = false;
   window.__go2wRtcState.error = error?.stack || String(error);
   log(`RTC publisher failed: ${error?.stack || error}`);
   setTimeout(() => location.reload(), 5000);

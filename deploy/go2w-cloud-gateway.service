@@ -8,6 +8,7 @@ Type=simple
 WorkingDirectory=/opt/go2w-web/current
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/opt/go2w-web/etc/rtc.env
+EnvironmentFile=-/opt/go2w-web/etc/rtc-record.env
 EnvironmentFile=-/opt/go2w-web/etc/internal.env
 EnvironmentFile=-/opt/go2w-web/etc/archive.env
 EnvironmentFile=-/opt/go2w-web/etc/auth.env

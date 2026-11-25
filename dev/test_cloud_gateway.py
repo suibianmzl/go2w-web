@@ -8,6 +8,7 @@ import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiohttp import WSMsgType, WSServerHandshakeError, web
 from aiohttp.client import ClientSession
@@ -20,6 +21,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from cloud_gateway import CloudGateway, T_CAM, T_MAP  # noqa: E402
 from archive import ArchiveSettings, ArchiveSpool  # noqa: E402
 from rtc_token import PRIV_PUBLISH_STREAM, PRIV_SUBSCRIBE_STREAM, parse as parse_rtc_token  # noqa: E402
+from rtc_recorder import callback_signature  # noqa: E402
 import go2w_edge_gateway as edge  # noqa: E402
 from ssh_bindings import SSHBinding, row_to_binding  # noqa: E402
 
@@ -210,6 +212,42 @@ class FakeArchiveStore:
         self.incident_snapshots.append((robot_id, incident_id, bucket, key))
 
 
+class FakeRecorder:
+    enabled = True
+
+    def __init__(self):
+        self.config = SimpleNamespace(callback_secret='callback-secret')
+        self.events = []
+        self.publisher_states = []
+        self.sessions_ended = []
+        self.video_ended = []
+        self.camera_disabled_ids = []
+
+    def snapshot(self, robot_id):
+        return {'robot_id': robot_id, 'status': 'recording'}
+
+    def accept_callback(self, _event):
+        return True
+
+    async def handle_callback(self, event):
+        self.events.append(event)
+
+    async def on_publisher_status(self, robot_id, state):
+        self.publisher_states.append((robot_id, state))
+
+    async def session_ended(self, robot_id, session_id, reason):
+        self.sessions_ended.append((robot_id, session_id, reason))
+
+    def video_source_ended(self, robot_id):
+        self.video_ended.append(robot_id)
+
+    async def camera_disabled(self, robot_id):
+        self.camera_disabled_ids.append(robot_id)
+
+    async def close(self):
+        pass
+
+
 async def start_app(app):
     runner = web.AppRunner(app)
     await runner.setup()
@@ -364,6 +402,7 @@ async def test_cloud_gateway():
                     base + '/quadruped/api/robots/go2w-01/camera', json={'enabled': False})
                 assert disabled_response.status == 200
                 assert (await disabled_response.json())['video_upload_enabled'] is False
+                assert gateway.rtc_recording_session('go2w-01') is None
                 await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
                 notification = await browser_reader.text(lambda m: m.get('t') == 'camera_upload')
                 assert notification['enabled'] is False
@@ -376,6 +415,7 @@ async def test_cloud_gateway():
                 await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is True)
                 await video.send_bytes(bytes([T_CAM, 5, 6]))
                 assert await camera_reader.binary(T_CAM) == bytes([T_CAM, 5, 6])
+                assert gateway.rtc_recording_session('go2w-01') is not None
                 await camera.close()
                 await video_reader.text(lambda m: m.get('t') == 'cam' and m.get('on') is False)
                 await camera_reader.close()
@@ -627,6 +667,48 @@ async def test_browser_authentication():
             await runner.cleanup()
 
 
+async def test_rtc_recording_callbacks():
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
+        recorder = FakeRecorder()
+        gateway = CloudGateway(tmp, rtc_recorder=recorder)
+        runner, port = await start_app(gateway.app())
+        base = f'http://127.0.0.1:{port}'
+        try:
+            async with ClientSession() as session:
+                ping = await session.get(base + '/internal/v1/rtc/callback')
+                assert ping.status == 200
+                event = {
+                    'EventType': 'RecordStarted',
+                    'EventData': '{"RoomId":"go2w-01","TaskId":"task-1","Code":0}',
+                    'EventTime': '2026-11-20T03:30:00Z',
+                    'EventId': 'event-1',
+                    'AppId': '123456781234567812345678',
+                    'Version': '2020-12-01',
+                    'Nonce': 'AbCd',
+                }
+                unsigned = await session.post(
+                    base + '/internal/v1/rtc/callback', json=event)
+                assert unsigned.status == 403
+                event['Signature'] = callback_signature(
+                    event, 'callback-secret')
+                accepted = await session.post(
+                    base + '/internal/v1/rtc/callback', json=event)
+                assert accepted.status == 200
+                for _ in range(50):
+                    if recorder.events:
+                        break
+                    await asyncio.sleep(0.01)
+                assert recorder.events == [event]
+                status = await (
+                    await session.get(
+                        base + '/quadruped/api/recording/status?robot_id=go2w-01')
+                ).json()
+                assert status['status'] == 'recording'
+        finally:
+            await runner.cleanup()
+
+
 async def test_archive_gateway():
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, 'index.html').write_text('<h1>Go2W</h1>', encoding='utf-8')
@@ -663,11 +745,12 @@ async def test_archive_gateway():
                 await robot.send_str('{"t":"state","battery":88}')
                 await browser_reader.text(
                     lambda m: m.get('t') == 'state' and m.get('battery') == 88)
+                incident_ts = int(datetime.now().timestamp() * 1000)
                 await robot.send_str(json.dumps({
                     't': 'incident',
                     'item': {
                         'id': 'archive-incident',
-                        'ts': 1763445936033,
+                        'ts': incident_ts,
                         'ongoing': True,
                         'type': 'stuck',
                         'label': '长时受阻',
@@ -686,7 +769,10 @@ async def test_archive_gateway():
                 uploaded_snapshot = await session.post(
                     base + '/internal/v1/incidents/go2w-01/archive-incident/snapshot',
                     data=jpeg,
-                    headers={'Content-Type': 'image/jpeg'},
+                    headers={
+                        'Content-Type': 'image/jpeg',
+                        'X-Go2W-Captured-At': str(incident_ts),
+                    },
                 )
                 assert uploaded_snapshot.status == 200
                 snapshot_payload = await uploaded_snapshot.json()
@@ -1018,6 +1104,8 @@ async def main():
     print('PASS cloud gateway: concurrent robots, isolated data, routing, fleet API')
     await test_browser_authentication()
     print('PASS cloud gateway: browser token auth, machine route bypass, logout')
+    await test_rtc_recording_callbacks()
+    print('PASS cloud gateway: RTC callback signature and recording status')
     await test_archive_gateway()
     print('PASS cloud gateway: archive session, telemetry, binary and command ACK capture')
     await test_internal_ssh_bindings()

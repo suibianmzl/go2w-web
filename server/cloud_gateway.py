@@ -15,7 +15,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -23,6 +23,7 @@ from aiohttp import WSMsgType, web
 from pymysql.err import IntegrityError
 
 from archive import ArchiveSpool, ArchiveStore, iso_utc as archive_iso_utc, utc_now as archive_utc_now
+from rtc_recorder import RtcRecorder, RtcRecordingConfig, verify_callback
 from rtc_token import AccessToken, PRIV_PUBLISH_STREAM, PRIV_SUBSCRIBE_STREAM
 from ssh_bindings import SSHBinding, SSHBindingStore, parse_time
 from ssh_portbroker import PortBrokerClient
@@ -36,6 +37,16 @@ CACHE_TEXT = {'state', 'pose', 'task', 'routes', 'map_views', 'plan', 'inspectio
 TEXT_QUEUE_MAX = 500
 ROBOT_QUEUE_MAX = 500
 LOG = logging.getLogger('go2w_cloud')
+SNAPSHOT_CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Go2W-Captured-At',
+}
+SNAPSHOT_REQUEST_TTL_MS = 20_000
+SNAPSHOT_MAX_INCIDENT_AGE_MS = 15_000
+SNAPSHOT_CAPTURE_MAX_SKEW_MS = 30_000
+SNAPSHOT_MATCH_BEFORE_MS = 5_000
+SNAPSHOT_MATCH_AFTER_MS = 30_000
 
 
 @dataclass(eq=False)
@@ -104,6 +115,7 @@ class CloudGateway:
         ssh_registration=None,
         archive_spool=None,
         archive_store=None,
+        rtc_recorder=None,
         access_token=None,
         auth_session_ttl=12 * 60 * 60,
     ):
@@ -115,6 +127,7 @@ class CloudGateway:
         self.rtc_app_key = rtc_app_key
         self.rtc_room_id = rtc_room_id or 'go2w-01'
         self.rtc_ttl = int(rtc_ttl)
+        self.rtc_recording_config = RtcRecordingConfig.from_env(self.rtc_app_id)
         self.default_robot_id = self.clean_robot_id(
             default_robot_id or os.environ.get('GO2W_DEFAULT_ROBOT_ID') or 'go2w-01'
         )
@@ -135,10 +148,15 @@ class CloudGateway:
         self.archive_enabled = self.archive_spool.enabled
         if archive_store is not None:
             self.archive_store = archive_store
-        elif self.archive_enabled:
+        elif self.archive_enabled or self.rtc_recording_config.requested:
             self.archive_store = ArchiveStore.from_env()
         else:
             self.archive_store = ArchiveStore(None)
+        self.rtc_recorder = rtc_recorder or RtcRecorder(
+            self.rtc_recording_config,
+            self.archive_store,
+            session_provider=self.rtc_recording_session,
+        )
         self.clients = {}
         self.camera_clients = {}
         self.client_seq = 0
@@ -150,8 +168,11 @@ class CloudGateway:
         self.command_seq = 0
         self.incidents = {}
         self.incident_tasks = set()
+        self.recording_tasks = set()
         self.snapshot_requests = {}
         self.snapshot_dir = self.archive_spool.root / 'snapshots'
+        self.incident_clear_path = self.archive_spool.root / 'incident_clear.json'
+        self.incident_clears = self.load_incident_clears()
         if self.archive_enabled:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,6 +296,26 @@ class CloudGateway:
     def video_upload_enabled(self, robot_id):
         record = self.robot_records.get(robot_id, {})
         return record.get('video_upload_enabled', True) is not False
+
+    def rtc_recording_session(self, robot_id):
+        session = self.robots.get(robot_id)
+        if session is None or session.ws.closed:
+            return None
+        if not self.video_upload_enabled(robot_id):
+            return None
+        video_session = self.robot_video_sessions.get(robot_id)
+        if video_session is None or video_session.ws.closed:
+            return None
+        if not self.camera_clients_for(robot_id):
+            return None
+        last_frame = self.robot_records.get(robot_id, {}).get('camera_frame_at', 0)
+        if not last_frame or time.time() - last_frame > 15:
+            return None
+        return {
+            'online_session_id': session.session_id,
+            'control_session_id': session.session_id,
+            'video_session_id': video_session.session_id,
+        }
 
     # ---------- archive capture ----------
     def archive_seq(self, session):
@@ -482,13 +523,152 @@ class CloudGateway:
         incidents = self.incidents.get(client.robot_id)
         if incidents:
             self.send_browser(client, json.dumps({
-                't': 'incidents', 'items': incidents[:50],
+                't': 'incidents',
+                'items': [
+                    self.sanitize_incident(item, client.robot_id)
+                    for item in incidents[:50]
+                ],
             }, ensure_ascii=False, separators=(',', ':')), key='incidents')
 
     def archive_background(self, coroutine):
         task = asyncio.create_task(coroutine)
         self.incident_tasks.add(task)
         task.add_done_callback(self.incident_tasks.discard)
+
+    def recording_background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.recording_tasks.add(task)
+
+        def finished(done):
+            self.recording_tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                LOG.error('RTC recording task failed: %s', error)
+
+        task.add_done_callback(finished)
+
+    def load_incident_clears(self):
+        try:
+            payload = json.loads(self.incident_clear_path.read_text(encoding='utf-8'))
+        except (FileNotFoundError, ValueError, OSError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        clears = {}
+        for robot_id, value in payload.items():
+            try:
+                clears[self.clean_robot_id(robot_id)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return clears
+
+    def save_incident_clears(self):
+        self.incident_clear_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.incident_clear_path.with_suffix('.tmp')
+        temp.write_text(
+            json.dumps(self.incident_clears, ensure_ascii=False, separators=(',', ':')),
+            encoding='utf-8',
+        )
+        os.replace(temp, self.incident_clear_path)
+
+    def incident_after_clear(self, robot_id, item):
+        cutoff = self.incident_clears.get(robot_id)
+        if cutoff is None:
+            return True
+        try:
+            return int(item.get('ts') or 0) > int(cutoff)
+        except (TypeError, ValueError):
+            return False
+
+    async def clear_incidents(self, robot_id):
+        cutoff = int(time.time() * 1000)
+        self.incident_clears[robot_id] = cutoff
+        self.save_incident_clears()
+        self.incidents[robot_id] = []
+        self.snapshot_requests.pop(robot_id, None)
+        deleted = 0
+        if self.archive_enabled and self.archive_store.configured:
+            deleted = await self.archive_store.delete_incidents(robot_id)
+        self.broadcast_text(robot_id, json.dumps({
+            't': 'incidents', 'items': [],
+        }, ensure_ascii=False, separators=(',', ':')))
+        return cutoff, deleted
+
+    @staticmethod
+    def snapshot_captured_ms(item):
+        snapshot = item.get('snapshot') if isinstance(item, dict) else None
+        if not isinstance(snapshot, dict):
+            return None
+        value = snapshot.get('captured_ts')
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+        value = snapshot.get('captured_at')
+        if not value:
+            return None
+        try:
+            captured = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=timezone.utc)
+        return int(captured.timestamp() * 1000)
+
+    @classmethod
+    def incident_snapshot_matches(cls, item):
+        captured_ms = cls.snapshot_captured_ms(item)
+        try:
+            incident_ms = int(item.get('ts'))
+        except (TypeError, ValueError):
+            return False
+        return (
+            captured_ms is not None
+            and incident_ms - SNAPSHOT_MATCH_BEFORE_MS
+            <= captured_ms
+            <= incident_ms + SNAPSHOT_MATCH_AFTER_MS
+        )
+
+    @staticmethod
+    def make_snapshot_metadata(robot_id, incident_id, captured_ms):
+        return {
+            'state': 'saved',
+            'local_url': (
+                f'/quadruped/api/incidents/{robot_id}/'
+                f'{incident_id}/snapshot'
+            ),
+            'content_type': 'image/jpeg',
+            'captured_ts': int(captured_ms),
+            'captured_at': archive_iso_utc(
+                datetime.fromtimestamp(captured_ms / 1000, timezone.utc)),
+        }
+
+    def snapshot_from_file(self, robot_id, item):
+        incident_id = str(item.get('id') or '')
+        if not incident_id:
+            return None
+        path = self.incident_snapshot_path(robot_id, incident_id)
+        try:
+            captured_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            return None
+        snapshot = self.make_snapshot_metadata(robot_id, incident_id, captured_ms)
+        if not self.incident_snapshot_matches({'ts': item.get('ts'), 'snapshot': snapshot}):
+            return None
+        return snapshot
+
+    def sanitize_incident(self, item, robot_id=None):
+        clean = dict(item)
+        if clean.get('snapshot') and not self.incident_snapshot_matches(clean):
+            clean.pop('snapshot', None)
+        if not clean.get('snapshot') and robot_id:
+            recovered = self.snapshot_from_file(robot_id, clean)
+            if recovered:
+                clean['snapshot'] = recovered
+        return clean
 
     @staticmethod
     def normalize_incident(item, robot_id):
@@ -508,24 +688,46 @@ class CloudGateway:
         return normalized
 
     def update_incidents(self, robot_id, items, replace=False):
+        previous = {
+            str(item.get('id')): item
+            for item in self.incidents.get(robot_id, [])
+            if item.get('id')
+        }
         current = [] if replace else list(self.incidents.get(robot_id, []))
         by_id = {str(item.get('id')): item for item in current if item.get('id')}
         changed = []
         for raw in items:
             item = self.normalize_incident(raw, robot_id)
-            if item is None:
+            if item is None or not self.incident_after_clear(robot_id, item):
                 continue
-            existing = by_id.get(item['id'])
+            existing = by_id.get(item['id']) or previous.get(item['id'])
             if existing and existing.get('snapshot') and not item.get('snapshot'):
-                item['snapshot'] = existing['snapshot']
+                if self.incident_snapshot_matches(existing):
+                    item['snapshot'] = existing['snapshot']
+            if not item.get('snapshot'):
+                recovered = self.snapshot_from_file(robot_id, item)
+                if recovered:
+                    item['snapshot'] = recovered
             by_id[item['id']] = item
             changed.append(item)
         merged = sorted(by_id.values(), key=lambda item: int(item['ts']), reverse=True)[:1000]
         self.incidents[robot_id] = merged
-        for item in changed:
-            if not item.get('snapshot'):
-                requests = self.snapshot_requests.setdefault(robot_id, {})
-                requests.setdefault(item['id'], archive_iso_utc())
+        now_ms = int(time.time() * 1000)
+        if not replace:
+            requests = self.snapshot_requests.setdefault(robot_id, {})
+            for item in changed:
+                if item.get('snapshot') or item['id'] in requests:
+                    continue
+                try:
+                    incident_ms = int(item.get('ts'))
+                except (TypeError, ValueError):
+                    continue
+                age_ms = now_ms - incident_ms
+                if -SNAPSHOT_MATCH_BEFORE_MS <= age_ms <= SNAPSHOT_MAX_INCIDENT_AGE_MS:
+                    requests[item['id']] = {
+                        'requested_at': now_ms,
+                        'expires_at': now_ms + SNAPSHOT_REQUEST_TTL_MS,
+                    }
         if changed and self.archive_enabled:
             self.archive_background(self.persist_incidents(robot_id, changed))
         return changed
@@ -620,10 +822,15 @@ class CloudGateway:
         session.robot_id = robot_id
         old = self.robot_video_sessions.get(robot_id)
         self.robot_video_sessions[robot_id] = session
+        record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
+        record['camera_frame_at'] = 0
         self.touch_robot(session)
         if old is not None and old is not session and not old.ws.closed:
             await old.ws.close(code=4000, message=b'replaced by a new video connection')
         self.sync_camera(robot_id)
+        self.recording_background(
+            self.rtc_recorder.on_publisher_status(
+                robot_id, self.rtc_publisher_states.get(robot_id, {})))
         self.broadcast_robot_status(robot_id)
 
     async def clear_robot(self, session):
@@ -634,6 +841,9 @@ class CloudGateway:
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['online'] = False
             record['last_seen_at'] = time.time()
+            self.recording_background(
+                self.rtc_recorder.session_ended(
+                    robot_id, session.session_id, 'control disconnected'))
         for key, pending in list(session.ack_routes.items()):
             await self.archive_command_failed(
                 pending.command_id, 'disconnected', '机器狗连接已断开')
@@ -658,6 +868,8 @@ class CloudGateway:
             del self.robot_video_sessions[robot_id]
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['video_last_seen_at'] = time.time()
+            record['camera_frame_at'] = 0
+            self.rtc_recorder.video_source_ended(robot_id)
         if session.tx:
             session.tx.cancel()
             await asyncio.gather(session.tx, return_exceptions=True)
@@ -786,12 +998,16 @@ class CloudGateway:
         if session.channel == 'video':
             if kind != T_CAM or not self.video_upload_enabled(robot_id):
                 return
+            self.robot_records.setdefault(
+                robot_id, {'robot_id': robot_id})['camera_frame_at'] = time.time()
             for client in self.camera_clients_for(robot_id):
                 self.send_browser(client, data)
             return
         if kind == T_CAM:
             if not self.video_upload_enabled(robot_id):
                 return
+            self.robot_records.setdefault(
+                robot_id, {'robot_id': robot_id})['camera_frame_at'] = time.time()
             for client in self.camera_clients_for(robot_id):
                 self.send_browser(client, data)
             return
@@ -1399,8 +1615,20 @@ class CloudGateway:
                 item for item in self.incidents.get(robot_id, [])
                 if before is None or int(item.get('ts') or 0) < before
             ][:limit]
+        cleaned = []
+        recovered = []
+        for item in items:
+            if not self.incident_after_clear(robot_id, item):
+                continue
+            had_snapshot = bool(item.get('snapshot'))
+            clean = self.sanitize_incident(item, robot_id)
+            cleaned.append(clean)
+            if clean.get('snapshot') and not had_snapshot:
+                recovered.append(clean)
+        if recovered and self.archive_enabled:
+            self.archive_background(self.persist_incidents(robot_id, recovered))
         return web.json_response({
-            'items': items,
+            'items': cleaned,
         }, headers={'Access-Control-Allow-Origin': '*'})
 
     def incident_snapshot_path(self, robot_id, incident_id):
@@ -1409,10 +1637,49 @@ class CloudGateway:
         return self.snapshot_dir / safe_robot / f'{safe_incident}.jpg'
 
     async def incident_snapshot_upload(self, req):
+        if req.method == 'OPTIONS':
+            return web.Response(status=204, headers={
+                **SNAPSHOT_CORS,
+                'Access-Control-Max-Age': '600',
+            })
+        if req.method != 'POST':
+            raise web.HTTPMethodNotAllowed(req.method, ['POST', 'OPTIONS'])
         robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
         incident_id = str(req.match_info.get('incident_id'))
         if not robot_id or not incident_id:
             raise web.HTTPBadRequest(text='robot_id and incident_id are required')
+        now_ms = int(time.time() * 1000)
+        item = next(
+            (entry for entry in self.incidents.get(robot_id, [])
+             if str(entry.get('id')) == incident_id),
+            None,
+        )
+        request = self.snapshot_requests.get(robot_id, {}).get(incident_id)
+        if item is None or not isinstance(request, dict):
+            raise web.HTTPGone(
+                text='snapshot request expired or incident is not recent',
+                headers=SNAPSHOT_CORS,
+            )
+        if int(request.get('expires_at') or 0) <= now_ms:
+            self.snapshot_requests.get(robot_id, {}).pop(incident_id, None)
+            raise web.HTTPGone(text='snapshot request expired', headers=SNAPSHOT_CORS)
+        try:
+            captured_ms = int(req.headers.get('X-Go2W-Captured-At') or now_ms)
+        except (TypeError, ValueError):
+            raise web.HTTPBadRequest(text='invalid capture timestamp', headers=SNAPSHOT_CORS)
+        if abs(captured_ms - now_ms) > SNAPSHOT_CAPTURE_MAX_SKEW_MS:
+            raise web.HTTPBadRequest(text='stale snapshot capture', headers=SNAPSHOT_CORS)
+        try:
+            incident_ms = int(item.get('ts'))
+        except (TypeError, ValueError):
+            raise web.HTTPGone(text='invalid incident timestamp', headers=SNAPSHOT_CORS)
+        if not (
+            incident_ms - SNAPSHOT_MATCH_BEFORE_MS
+            <= captured_ms
+            <= incident_ms + SNAPSHOT_MATCH_AFTER_MS
+        ):
+            self.snapshot_requests.get(robot_id, {}).pop(incident_id, None)
+            raise web.HTTPGone(text='snapshot does not match incident time', headers=SNAPSHOT_CORS)
         length = req.content_length
         if length is not None and length > 8 * 1024 * 1024:
             raise web.HTTPRequestEntityTooLarge(max_size=8 * 1024 * 1024)
@@ -1429,27 +1696,16 @@ class CloudGateway:
             f'/quadruped/api/incidents/{robot_id}/'
             f'{incident_id}/snapshot'
         )
-        snapshot = {
-            'state': 'saved',
-            'local_url': local_url,
-            'content_type': 'image/jpeg',
-            'captured_at': archive_iso_utc(),
-        }
-        item = next(
-            (entry for entry in self.incidents.get(robot_id, [])
-             if str(entry.get('id')) == incident_id),
-            None,
-        )
-        if item is not None:
-            updated = {**item, 'snapshot': snapshot}
-            self.incidents[robot_id] = [
-                updated if str(entry.get('id')) == incident_id else entry
-                for entry in self.incidents[robot_id]
-            ]
-            self.broadcast_text(robot_id, json.dumps({
-                't': 'incident', 'item': updated,
-            }, ensure_ascii=False, separators=(',', ':')))
-            self.archive_background(self.persist_incidents(robot_id, [updated]))
+        snapshot = self.make_snapshot_metadata(robot_id, incident_id, captured_ms)
+        updated = {**item, 'snapshot': snapshot}
+        self.incidents[robot_id] = [
+            updated if str(entry.get('id')) == incident_id else entry
+            for entry in self.incidents[robot_id]
+        ]
+        self.broadcast_text(robot_id, json.dumps({
+            't': 'incident', 'item': updated,
+        }, ensure_ascii=False, separators=(',', ':')))
+        self.archive_background(self.persist_incidents(robot_id, [updated]))
 
         session = self.robots.get(robot_id)
         session_id = session.session_id if session is not None else f'snapshot-{incident_id}'
@@ -1463,7 +1719,22 @@ class CloudGateway:
         except Exception:
             LOG.exception('archive snapshot spool failed: %s/%s', robot_id, incident_id)
         self.snapshot_requests.get(robot_id, {}).pop(incident_id, None)
-        return web.json_response({'ok': True, 'url': local_url})
+        return web.json_response(
+            {'ok': True, 'url': local_url}, headers=SNAPSHOT_CORS)
+
+    async def incident_clear_api(self, req):
+        if req.method != 'POST':
+            raise web.HTTPMethodNotAllowed(req.method, ['POST'])
+        robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
+        if not robot_id:
+            raise web.HTTPBadRequest(text='robot_id is required')
+        cutoff, deleted = await self.clear_incidents(robot_id)
+        return web.json_response({
+            'ok': True,
+            'robot_id': robot_id,
+            'cutoff_ts': cutoff,
+            'deleted': deleted,
+        })
 
     async def incident_snapshot_get(self, req):
         robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
@@ -1471,7 +1742,10 @@ class CloudGateway:
         path = self.incident_snapshot_path(robot_id, incident_id)
         if not path.is_file():
             raise web.HTTPNotFound()
-        return web.FileResponse(path, headers={'Content-Type': 'image/jpeg'})
+        return web.FileResponse(path, headers={
+            'Content-Type': 'image/jpeg',
+            'Access-Control-Allow-Origin': '*',
+        })
 
     async def robot_camera_api(self, req):
         robot_id = self.clean_robot_id(req.match_info.get('robot_id'))
@@ -1487,6 +1761,9 @@ class CloudGateway:
             record = self.robot_records.setdefault(robot_id, {'robot_id': robot_id})
             record['video_upload_enabled'] = data['enabled']
             self.sync_camera(robot_id)
+            if not data['enabled']:
+                self.recording_background(
+                    self.rtc_recorder.camera_disabled(robot_id))
             self.broadcast_text(robot_id, json.dumps({
                 't': 'camera_upload',
                 'robot_id': robot_id,
@@ -1563,15 +1840,58 @@ class CloudGateway:
                 state['robot_id'] = robot_id
                 state['updated_at'] = int(time.time())
                 self.rtc_publisher_states[robot_id] = state
+                self.recording_background(
+                    self.rtc_recorder.on_publisher_status(robot_id, state))
         state = self.rtc_publisher_states.get(robot_id, {'robot_id': robot_id, 'state': 'unknown'})
         payload = dict(state)
-        payload['snapshot_requests'] = [
-            {'incident_id': incident_id, 'requested_at': requested_at}
-            for incident_id, requested_at in self.snapshot_requests.get(robot_id, {}).items()
-        ]
+        now_ms = int(time.time() * 1000)
+        requests = self.snapshot_requests.setdefault(robot_id, {})
+        active = []
+        for incident_id, request in list(requests.items()):
+            if not isinstance(request, dict) or int(request.get('expires_at') or 0) <= now_ms:
+                requests.pop(incident_id, None)
+                continue
+            active.append({
+                'incident_id': incident_id,
+                'requested_at': request.get('requested_at'),
+                'expires_at': request.get('expires_at'),
+            })
+        payload['snapshot_requests'] = active
         return web.json_response(payload, headers={'Access-Control-Allow-Origin': '*'})
 
+    async def rtc_callback(self, req):
+        if req.method == 'GET':
+            return web.Response(text='ok')
+        if req.method != 'POST':
+            raise web.HTTPMethodNotAllowed(req.method, ['GET', 'POST'])
+        if not self.rtc_recorder.enabled:
+            raise web.HTTPServiceUnavailable(text='RTC recording is not configured')
+        try:
+            event = await req.json()
+        except ValueError:
+            raise web.HTTPBadRequest(text='invalid JSON')
+        if not isinstance(event, dict):
+            raise web.HTTPBadRequest(text='invalid callback event')
+        secret = self.rtc_recorder.config.callback_secret
+        if not verify_callback(event, secret):
+            raise web.HTTPForbidden(text='invalid callback signature')
+        if not self.rtc_recorder.accept_callback(event):
+            return web.Response(text='duplicate')
+        self.recording_background(self.rtc_recorder.handle_callback(event))
+        return web.Response(text='ok')
+
+    async def rtc_recording_status_api(self, req):
+        robot_id = self.requested_robot_id(req)
+        return web.json_response(
+            self.rtc_recorder.snapshot(robot_id),
+            headers={'Access-Control-Allow-Origin': '*'},
+        )
+
     async def cleanup(self, _app):
+        if self.recording_tasks:
+            await asyncio.gather(
+                *list(self.recording_tasks), return_exceptions=True)
+        await self.rtc_recorder.close()
         self.archive_spool.close_all()
         if self.incident_tasks:
             await asyncio.gather(*list(self.incident_tasks), return_exceptions=True)
@@ -1611,18 +1931,26 @@ class CloudGateway:
             '/internal/v1/robots/{device_id}/ssh-binding', self.internal_robot_unbind)
         app.router.add_get('/quadruped/api/robots', self.robots_api)
         app.router.add_get('/quadruped/api/incidents', self.incidents_api)
+        app.router.add_post(
+            '/internal/v1/incidents/{robot_id}/clear',
+            self.incident_clear_api,
+        )
         app.router.add_get(
             '/quadruped/api/incidents/{robot_id}/{incident_id}/snapshot',
             self.incident_snapshot_get,
         )
-        app.router.add_post(
+        app.router.add_route(
+            '*',
             '/internal/v1/incidents/{robot_id}/{incident_id}/snapshot',
             self.incident_snapshot_upload,
         )
         app.router.add_route(
             '*', '/quadruped/api/robots/{robot_id}/camera', self.robot_camera_api)
+        app.router.add_get(
+            '/quadruped/api/recording/status', self.rtc_recording_status_api)
         app.router.add_get('/quadruped/rtc/config', self.rtc_config)
         app.router.add_route('*', '/quadruped/rtc/publisher-status', self.rtc_publisher_status)
+        app.router.add_route('*', '/internal/v1/rtc/callback', self.rtc_callback)
         app.router.add_get('/robot/ws', self.handle_robot)
         app.router.add_get('/quadruped/robot/ws', self.handle_robot)
         app.router.add_get('/quadruped/robot/video/ws', self.handle_robot_video)
@@ -1645,6 +1973,8 @@ class CloudGateway:
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    # RTC 页面会高频轮询状态接口，逐条访问日志会把系统盘快速写满。
+    logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')

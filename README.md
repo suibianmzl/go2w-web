@@ -37,6 +37,15 @@ static/rtc_publisher.html   RTC 视频发布页（默认由云端 Chrome 运行�
 `/quadruped/camera/ws`，云端 Chrome 以 1280×720、15 FPS 发布
 `go2w-01-camera` 到火山 RTC。
 
+RTC 显式云端录制由 `server/rtc_recorder.py` 调用火山 `StartRecord` /
+`StopRecord`。控制通道和视频通道都在线、视频上传开启时，云端才创建录制任务；
+一个控制连接会话可以对应多个录制任务，一次任务产生的所有 MP4 写入
+`tos://evox-fleet/go2w/video/<机器狗>/<录制开始毫秒时间戳>/`，并由 `robot_rtc_recording` 和
+`robot_rtc_recording_file` 保存与 `robot_session` 的关联。配置模板见
+`deploy/rtc-record.env.example`；RTC 控制台的自动录制应保持关闭，录制回调地址为
+`https://fleet.evoxrobot.com/internal/v1/rtc/callback`。回调密钥限 1–32 位，
+只能包含大小写字母和数字。
+
 界面只读 `js/store.js` 里的状态，两个数据源负责填它；操作统一经过 `js/actions.js` 做前置检查和确认。
 
 ## 和 go2w 主仓库的关系
