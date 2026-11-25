@@ -255,7 +255,15 @@ ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
 # NavigateThroughPoses（Nav2 一次规划经过这段所有站的连续路径），中间站不减速不停车；停留站 / 终点照常停稳。
 # 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
 # 网页离下一站不到 ROUTE_THROUGH_PASS 就算经过（和行为树里的半径一样）；Nav2 先划掉了也算
-ROUTE_THROUGH_PASS = 0.5
+# 11-25：0.5 → 1.0。0.9 m/s 时规划切内道，常从站点旁 0.6–1.2 m 擦过去，没进 0.5 m 就不划掉，
+# 下一次重新规划掉头回去找它（12:05 第 1 站抖 205 s、16:22 第 18 站 ~2 min、16:55 第 3 站 46 s）
+ROUTE_THROUGH_PASS = 1.0
+# 11-25「已越过」：没进 ROUTE_THROUGH_PASS，但狗已经过了这站、正往下一站走（沿 这站→下一站 方向超过站点
+# ROUTE_OVERTAKE_AHEAD，横向离这段路不到 ROUTE_OVERTAKE_LAT，离站点不到 ROUTE_OVERTAKE_MAX，车头朝下一站那边，
+# 且在拐角平分线的外侧）也算经过；Nav2 还没划掉它，所以从下一站起重新下发（新目标直接顶替旧的，不停车）
+ROUTE_OVERTAKE_AHEAD = 0.3
+ROUTE_OVERTAKE_LAT = 1.5
+ROUTE_OVERTAKE_MAX = 3.0
 # 11-25：一段的终点离狗不到这么远（goal checker xy 0.25 + 定位余量）就不能当这段的终点发，见 run_through
 ROUTE_THROUGH_NEAR_END = 0.6
 ROUTE_SEG_MAX = 30      # 一段最多几站（一直循环、没有停留站时也要分段）
@@ -390,6 +398,34 @@ RESULT = {GoalStatus.STATUS_SUCCEEDED: 'succeeded', GoalStatus.STATUS_CANCELED: 
 def wrap(a):
     """角度归到 (-π, π]。"""
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def overtaken(here, prev, pt, nxt):
+    """连续通过：狗 here=(x, y, yaw) 是否已越过站点 pt、正往 nxt 走（见 ROUTE_OVERTAKE_*）。
+    prev = 来的方向（上一站或这段出发时狗的位置），用来排除「还没到站，只是正好在下一段延长线上」（往返路线）。"""
+    ox, oy = nxt['x'] - pt['x'], nxt['y'] - pt['y']
+    out = math.hypot(ox, oy)
+    if out < 0.3:
+        return False
+    ux, uy = ox / out, oy / out
+    rx, ry = here[0] - pt['x'], here[1] - pt['y']
+    t, lat = rx * ux + ry * uy, abs(ux * ry - uy * rx)
+    if not (ROUTE_OVERTAKE_AHEAD <= t <= out) or lat > ROUTE_OVERTAKE_LAT or math.hypot(rx, ry) > ROUTE_OVERTAKE_MAX:
+        return False
+    if math.cos(here[2] - math.atan2(uy, ux)) <= 0:   # 车头背着下一站（还在往这站开）
+        return False
+    if prev is not None:
+        ix, iy = pt['x'] - prev[0], pt['y'] - prev[1]
+        inn = math.hypot(ix, iy)
+        if inn >= 0.3:
+            ix, iy = ix / inn, iy / inn
+            bx, by = ix + ux, iy + uy   # 拐角平分线方向：过了它才算过了这站
+            b = math.hypot(bx, by)
+            if b < 0.2:                 # 接近 180° 掉头：只认沿来的方向已经过了站点
+                bx, by, b = ix, iy, 1.0
+            if (rx * bx + ry * by) / b <= 0:
+                return False
+    return True
 
 
 def yaw_of(q):
@@ -3532,7 +3568,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                             f"{'，到了停留' if seg[-1][2] else ''}")
             stop = asyncio.create_task(route['stop'].wait())
             done = asyncio.create_task(self.aw(result, 120.0 + length / 0.1))
-            k, planned, left = 0, False, None
+            k, planned, left, resend = 0, False, None, False
+            start_xy = here[:2] if here and n.fixed == 'map' else None
             try:
                 while True:
                     await asyncio.wait((stop, done), timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
@@ -3555,9 +3592,20 @@ class Server(TaughtWeb, RT.RtabWeb):
                             break
                         self.through_passed(ws, route, seg, k)
                         k += 1
-                    if done.done():
+                    # 擦过去了（没进半径）但已经往下一站走了：算经过，从下一站重新下发，免得 Nav2 掉头回去找
+                    while k < len(seg) - 1 and here and n.fixed == 'map' and not done.done():
+                        prev = (seg[k - 1][1]['x'], seg[k - 1][1]['y']) if k else start_xy
+                        pt = seg[k][1]
+                        if not overtaken(here, prev, pt, seg[k + 1][1]):
+                            break
+                        d = math.hypot(here[0] - pt['x'], here[1] - pt['y'])
+                        n.event('INFO', f'第 {seg[k][0][0] + 1} 站从旁边 {d:.2f} m 擦过、已经往下一站走了，算经过')
+                        self.through_passed(ws, route, seg, k)
+                        k += 1
+                        resend = not (left is not None and len(seg) - left >= k)   # Nav2 也划掉了就不用重发
+                    if resend or done.done():
                         break
-                status = done.result().status
+                status = None if resend else done.result().status
             except asyncio.TimeoutError:
                 await self.aw(handle.cancel_goal_async(), 2.0)
                 raise RuntimeError('等待到点超时') from None
@@ -3573,6 +3621,13 @@ class Server(TaughtWeb, RT.RtabWeb):
                 await asyncio.gather(stop, done, return_exceptions=True)
             if route['stop'].is_set():
                 return 'stop'
+            if resend:   # 旧目标留给新目标顶替（Nav2 会 abort 它，标 passed 后不算失败），不先取消 = 不停车
+                with n.lock:
+                    if n.goal and n.goal['id'] == gid:
+                        n.goal['passed'] = True
+                n.event('INFO', f'从第 {seg[k][0][0] + 1} 站起重新下发，不回头')
+                state = seg[k][0]
+                continue
             if status == GoalStatus.STATUS_CANCELED:
                 self.finish_route(route, 'canceled', f'第 {route["index"] + 1} 点已取消')
                 return 'stop'

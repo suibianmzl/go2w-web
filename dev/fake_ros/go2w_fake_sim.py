@@ -57,7 +57,7 @@ START_DELAY = 3.0     # 档位启动到节点出现的时间（真机上 FAST-LI
 MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
-THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
+THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '1.0'))   # 多点导航：离途经点这么近就算经过
 GOAL_XY = float(os.environ.get('GO2W_FAKE_GOAL_XY', '0.25'))   # nav2.yaml goal checker xy_goal_tolerance
 
 
@@ -850,7 +850,14 @@ class Sim:
                 return 0.0, 0.0
             if g['through']:
                 path, start = [], (self.x, self.y)
-                for vx, vy in g['via']:
+                vias = g['via']
+                # 11-25 擦过站点：有 GO2W_FAKE_THROUGH_SKIP 文件（默认 /tmp/go2w_fake_through_skip）时，这次规划直接跳过
+                # 第一个途经点（真机上切内道从站旁 0.6–1.2 m 擦过去）。Nav2 不会划掉它，跑到头再掉头回去找（见下面）。用一次删掉
+                skip = os.environ.get('GO2W_FAKE_THROUGH_SKIP', '/tmp/go2w_fake_through_skip')
+                if len(vias) > 2 and os.path.exists(skip):
+                    os.remove(skip)
+                    vias = vias[1:]
+                for vx, vy in vias:
                     seg = self.plan(vx, vy, start)
                     if seg is None:
                         path = None
@@ -913,6 +920,18 @@ class Sim:
             if abs(err) > 0.5:
                 return 0.0, math.copysign(min(wmax*.7, abs(err)*1.5 + .1), err)   # RotationShim：先原地转向
             return min(vmax, 0.12 + (d if last else 1.0)*0.6), max(-wmax, min(wmax, 2.0*err))
+        if g['through'] and len(g['via']) > 1:   # 路径走完了、途经点还没划掉（擦过去了）：重新规划，掉头回去找
+            self.rosout(20, 'bt_navigator', 'fake nav: 途经点没经过，掉头回去')
+            path, start = [], (self.x, self.y)
+            for vx, vy in g['via']:
+                part = self.plan(vx, vy, start)
+                if part is None:
+                    self.finish(ABORTED)
+                    return 0.0, 0.0
+                path += part
+                start = (vx, vy)
+            g['path'], g['i'] = path, 0
+            return 0.0, 0.0
         err = wrap(g['th'] - self.th)        # 到点后对准目标朝向
         if abs(err) < 0.05:
             self.finish(SUCCEEDED)
