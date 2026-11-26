@@ -270,7 +270,9 @@ AUTOLOC_TIMEOUT = 60.0
 # 只搜几个圆（上次位置 / 停车点 / 任务站点，或者人在地图上画的圈）约 1.3 s，圆内结果和整图搜完全一样。
 AUTOLOC_HINT_R = 4.0          # m：自动猜的位置各搜这么大的圆
 # 自动猜的范围里找到的要更可信才用（整图是 0.75）；不够就退回整图搜。测试用的 GO2W_AUTOLOC_MIN_SCORE 更高时以它为准
-AUTOLOC_HINT_SCORE = max(0.80, float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75')))
+# 11-26 真机：小图上正确位置的分数常在 0.75–0.80（11-25 有 0.76 / 0.77 / 0.80），门槛 0.80 时附近找总被拒、
+# 再白搜一遍整图。改成和整图一样：圆内同样要「次优/最优 ≤ 0.80」，只是范围小
+AUTOLOC_HINT_SCORE = float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75'))
 AUTOLOC_HINT_MAX = 4          # 最多猜几处
 AUTOLOC_HINT_TIMEOUT = 20.0
 AUTOLOC_AREA_R = (1.0, 30.0)  # m：人画的圈半径范围
@@ -1043,7 +1045,13 @@ class Bridge(TaughtMeasurements, Node):
         for name in (self.map_loaded, param):
             if name and name in hits:
                 return name
-        return hits[0] if len(hits) == 1 else param
+        if len(hits) == 1:
+            return hits[0]
+        # 11-26：导航开着时网页切过图，再重启网页后端（装新版本）→ map_loaded 没了，参数还是启动时的小图，
+        # 实际发的却是大图，尺寸相同的大图又有好几张（编辑另存的）→ 以前这里返回参数，地图名和栅格对不上，
+        # 出发流程以为图对了不切图，拿小图的站点去大图上自动定位，60 s 超时。参数明显不对时宁可说「不知道」，
+        # 出发流程看到没有地图名会自己切到任务的图。没有任何文件对得上（hits 为空）时照旧用参数。
+        return param if not hits else None
 
     def on_odom(self, m):
         self.observe_taught_odom(m)

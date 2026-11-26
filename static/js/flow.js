@@ -236,7 +236,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       return;
     }
     if (!prep.runT) prep.runT = now;
-    if (!store.mapCurrent || !liveMap()) return;                // 刚起来：等 map_server 的地图名
+    if (!liveMap()) return;                                    // 刚起来：等 map_server 的地图
+    // 等地图名；4 s 还没有 = 后端认不出现在是哪张图（11-26 重启网页后端后发生过），直接切到任务的图
+    if (!store.mapCurrent && now - prep.runT < 4000) return;
     if (store.mapCurrent !== prep.map){
       if (!prep.loadT){ prep.loadT = now; exec(src.cmd.loadMap(prep.map)); return; }
       if (now - prep.loadT > 15000) prepFail('nav', `切换到地图 ${prep.map} 没有成功`);
