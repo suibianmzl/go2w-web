@@ -12,6 +12,8 @@
   - 心跳：网页每 0.5 s 发一次 ping。最近一个发过运动相关指令的网页是「控制方」；
     控制方心跳超过 --heartbeat 秒（默认 5.0）或连接断开，而底盘处于解锁或有导航目标时，
     取消导航并上锁。恢复后保持上锁，必须手动重新解锁。
+    例外（v1.5.1，11-25）：多点任务 / 单个导航目标正在自动跑时，网页断网不停车，只记 WARN + 异常 link_lost
+    （不存包），重新打开网页可以照常停止 / 急停；遥控（另有 0.3 s 超时）、爬台模式、自动定位移动仍然一断就停。
 
 WebSocket 协议
   浏览器 → 后端（JSON）：
@@ -69,6 +71,9 @@ from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 from recording import RecordingAPI
+from cpu_stats import CpuStats
+from robot_feedback import RobotFeedback
+from obstacles_critic import ObstaclesCriticAPI
 
 # 续建用的 slam_toolbox 接口。老镜像里没有这两个 srv 时不能整个后端起不来——建图档之外的功能
 # 和续建无关，所以缺失时只把续建这条路标成不可用
@@ -82,6 +87,7 @@ except ImportError:  # pragma: no cover
     SerializePoseGraph = None
 from geometry_msgs.msg import Pose2D
 
+import audio as AU
 import camera as C
 import incidents as INC
 import keepout as KO
@@ -176,23 +182,7 @@ INSPECT_DT = 0.5    # topic 查看器每条 topic 最多 2 Hz 刷新
 ROS_LEVEL = {20: 'INFO', 30: 'WARN', 40: 'ERROR', 50: 'ERROR'}
 BASE_FRAME = 'base_footprint'
 STALE = 3.0  # 秒；超过这么久没收到就当没有
-BAT_TOPIC = '/go2w/robot_lowstate'
-BAT_PERIOD = 5.0    # 秒；多久读一次 lowstate（电量 + 电机温度）
-BAT_STALE = 70.0    # 秒；超过这么久没读到电量，网页显示 --
-MOTOR_STALE = 20.0  # 秒；超过这么久没读到电机温度，网页显示 --
-# LowState 里 bms_state.soc 的位置：4 字节 CDR 头 + 1039（定长数组、按 CDR 对齐算出；11-16 录包验证 = 73%、29.9 V）
-BAT_SOC_OFFSET = 4 + 1039
-# motor_state[i].temperature（int8，℃）：motor_state 从 77 开始、每个 48 字节，temperature 在元素内 +31
-# （11-17 用 11-13/11-16 录包验证：关节角按 FR/FL/RR/RL × 髋/大腿/小腿 排列，12–15 是轮子，温度 23–81 ℃）
-MOTOR_TEMP_OFFSET, MOTOR_STRIDE, MOTOR_N = 4 + 108, 48, 16
-# motor_state[i].reserve[0]（uint32）当错误标志（同 app「狗腿信息 → 错误标志」），在元素内 +39 = temperature 后 8 字节。
-# 11-17 用 go2w-01_1116_172503 录包核对（14772 帧）：16 个电机全程 0（= 正常）；reserve[1] 一直 507/508，不是错误码
-MOTOR_ERR_OFFSET = MOTOR_TEMP_OFFSET + 8
-# motor_state[i].tau_est（float32，N·m，估计力矩）：元素内 q +0 / dq +4 / ddq +8 / tau_est +12 → temperature 前 16 字节。
-# 11-17 用 go2w-01_1116_172503 核对：站着时小腿约 +7、左右髋符号相反（±4~7），轮子 ±2 以内
-MOTOR_TAU_OFFSET = MOTOR_TEMP_OFFSET - 16
-# 网页打开「力矩」视图时 lowstate 改成每 MOTOR_FAST_PERIOD 秒读一次（= 状态推送 2 Hz），关掉后回到 BAT_PERIOD
-MOTOR_FAST_PERIOD = 0.5
+MOTOR_STALE = RobotFeedback.STALE
 # 建图自动保存（11-17，用户：「报错自动保存地图」「两分钟太长，三十秒」）：建图时每 AUTOSAVE_PERIOD 秒、
 # 停止建图前、雷达 / FAST-LIO / 里程计出问题时，把当前地图存成 data/maps/autosave_<建图开始时间>，
 # 同一次建图覆盖同一份。只在地图有变化时存；单次存图耗时超过周期的 1/10 就自动拉长间隔，免得拖慢 slam。
@@ -231,31 +221,35 @@ ROUTE_NEAR_START = 0.5
 # data/route_resume.json 记断点（到了第几站、第几圈、已完成几站、停在哪里）。网页 / 云端可以从断点接着跑完剩下的站，
 # 圈数接着算。断点只在人点「继续」时用，不会自己出发；超过这么久、或者任务的站点改过就作废
 ROUTE_RESUME_MAX_AGE = 24 * 3600   # s
-# 多点任务：Nav2 报未到达（差几厘米到 goal checker 0.15 m 判不过、收尾蹭不进去）时，
-# 机器人离该站不超过这么远就当作到了，继续下一站；更远才终止任务
-ROUTE_ARRIVE_TOL = 0.4
 # 11-20 到点卡顿：每站单独一个 NavigateToPose、带固定朝向 → 原地转到朝向、完全停下 ~1 s、再慢慢起步，每站多花 4–6 s。
 # 现在中间站（后面还有下一站的）不停车：朝向改成面向下一站，离站不到这么远就直接发下一站（Nav2 新目标顶替旧目标，
 # 控制器不停）。只有整条任务的最后一站才按自己的朝向停稳
 ROUTE_PASS_DIST = 0.6   # 实际取 min(0.6, 这段路长度的一半)
-# 11-20 晚：拐角大的站提前换目标会「开过点」——狗还在 0.4 m/s 往前冲，Nav2 换目标要 ~1 s，冲过去后倒车 ~1.5 s、
-# 再慢慢原地转，比停下来转还慢。所以只有拐角不超过这个角度（= RotationShim angular_dist_threshold 0.5 rad）
-# 的站才不停车经过；拐角大的站照常到点停下，但朝向仍面向下一站（只转一次，不会先转到站点朝向再转回来）
-# 11-24：0.5 rad 时 1–2 m 一站、拐角 37–46° 的小圈（lab_20261118_2，11 站）几乎每站都停，每站减速 + 原地转 + 再起步
-# ≈ 2.5 s，一圈多 18 s（DDS 黑匣子 16:47–16:57）。放宽到 1.05 rad（60°）；要配合把 RotationShim angular_dist_threshold
-# 调大（~0.9 rad，狗上 ~/nav_tune/shim_turn.sh），否则换成下一站的新路径偏角 > 0.5 rad 时 shim 照样原地转
-ROUTE_PASS_TURN = 1.05
 # 11-24：Nav2 报到达时离站点超过这么远就不算（xy 容差 0.25 + 余量）。提前换下一站后，Nav2 有时 0.7 s 就报新目标
 # 「到达」，狗其实离那站还有 ~0.9 m（4/6 趟第 10 站被这样跳过）。这时重新发这一站，最多 ROUTE_FAKE_RETRY 次
 ROUTE_FAKE_ARRIVE = 0.5
 ROUTE_FAKE_RETRY = 2
 ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
+ROUTE_AUDIO_MAX = 5      # 站点到站 / 离开前播报各最多几段（11-25）
+ROUTE_AUDIO_WAIT_EACH = 600   # s：每段播报前最多等多久（站点里手填，11-25）
+ROUTE_AUDIO_WAIT = 400.0 + ROUTE_AUDIO_MAX * ROUTE_AUDIO_WAIT_EACH   # s：离开前等播报播完最多等多久（5 段 × (60 s + 等待) + 传输，留余量）
 # 11-24 v1.1.11「连续通过」（任务运行参数 opts.through，默认开）：以停留站为界把路线切成几段，每段一个
-# NavigateThroughPoses（Nav2 一次规划经过这段所有站的连续路径），中间站不减速不停车；停留站 / 终点照常停稳。
+# NavigateThroughPoses；中间分段末点也按经过推进，停留点取消旧目标后计时，整条任务终点等待 Nav2 成功。
 # 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
 # 网页离下一站不到 ROUTE_THROUGH_PASS 就算经过（和行为树里的半径一样）；Nav2 先划掉了也算
-ROUTE_THROUGH_PASS = 0.5
-ROUTE_SEG_MAX = 30       # 一段最多几站（一直循环、没有停留站时也要分段）
+# 11-25：0.5 → 1.0。0.9 m/s 时规划切内道，常从站点旁 0.6–1.2 m 擦过去，没进 0.5 m 就不划掉，
+# 下一次重新规划掉头回去找它（12:05 第 1 站抖 205 s、16:22 第 18 站 ~2 min、16:55 第 3 站 46 s）
+ROUTE_THROUGH_PASS = 1.0
+# 11-25「已越过」：没进 ROUTE_THROUGH_PASS，但狗已经过了这站、正往下一站走（沿 这站→下一站 方向超过站点
+# ROUTE_OVERTAKE_AHEAD，横向离这段路不到 ROUTE_OVERTAKE_LAT，离站点不到 ROUTE_OVERTAKE_MAX，车头朝下一站那边，
+# 且在拐角平分线的外侧）也算经过；Nav2 还没划掉它，所以从下一站起重新下发（新目标直接顶替旧的，不停车）
+ROUTE_OVERTAKE_AHEAD = 0.3
+ROUTE_OVERTAKE_LAT = 1.5
+ROUTE_OVERTAKE_MAX = 3.0
+# 11-25：一段的终点离狗不到这么远（goal checker xy 0.25 + 定位余量）就不能当这段的终点发，见 run_through
+ROUTE_THROUGH_NEAR_END = 0.6
+ROUTE_SEG_MAX = 30      # 一段最多几站（一直循环、没有停留站时也要分段）
+ROUTE_CROSSING_SETTLE = 0.2  # s：三项跨越联动完成后，再下发下一段。
 THROUGH_BT = os.environ.get('GO2W_THROUGH_BT') or os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'bt', 'navigate_through_go2w.xml')
 ROUTE_NOTE_MAX = 200     # 站点备注最多几个字符
@@ -275,6 +269,18 @@ FINE_COV_XY, FINE_COV_YAW = 0.05 ** 2, math.radians(2) ** 2
 AUTOLOC_SCANS = 5
 AUTOLOC_STILL = (0.03, 0.05)   # 静止判定：|v| < 0.03 m/s 且 |wz| < 0.05 rad/s
 AUTOLOC_TIMEOUT = 60.0
+# 11-26 先在附近找：大图（lab_20261125，120×93 m）整图搜 11–18 s，低分时 55–60 s 甚至超时；
+# 只搜几个圆（上次位置 / 停车点 / 任务站点，或者人在地图上画的圈）约 1.3 s，圆内结果和整图搜完全一样。
+AUTOLOC_HINT_R = 4.0          # m：自动猜的位置各搜这么大的圆
+# 自动猜的范围里找到的要更可信才用（整图是 0.75）；不够就退回整图搜。测试用的 GO2W_AUTOLOC_MIN_SCORE 更高时以它为准
+# 11-26 真机：小图上正确位置的分数常在 0.75–0.80（11-25 有 0.76 / 0.77 / 0.80），门槛 0.80 时附近找总被拒、
+# 再白搜一遍整图。改成和整图一样：圆内同样要「次优/最优 ≤ 0.80」，只是范围小
+AUTOLOC_HINT_SCORE = float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75'))
+AUTOLOC_HINT_MAX = 4          # 最多猜几处
+AUTOLOC_HINT_TIMEOUT = 20.0
+AUTOLOC_AREA_R = (1.0, 30.0)  # m：人画的圈半径范围
+LAST_POSE_MOVE, LAST_POSE_EVERY = 0.5, 10.0   # 定位正常时，挪了 0.5 m 以上、且离上次写 ≥ 10 s 才写 data/last_pose.json
+LAST_POSE_MATCH = 60.0        # 匹配率 % 低于这个不记（可能定位错了）
 AUTOLOC_ON_START = os.environ.get('GO2W_AUTO_LOCALIZE', '1') != '0'
 # 刚站起来（策略刚接管）机身还在晃，雷达高度也和趴着时不一样：策略 ready 后再稳这么久，只用这之后的 scan
 AUTOLOC_SETTLE = 2.0
@@ -364,14 +370,12 @@ CTRL_WAIT = 3.0        # s：每一步切换（插值走完之后）最多等这
 CTRL_INTERP = 2.0      # s：FixStand 从趴姿插值到站姿的时间（config.yaml 的 ts 末项）
 POLICY_WAIT = 20.0     # s：切策略重启运控后，最多等这么久收到新进程的 Passive
 CTRL_RESEND = 0.5      # s：请求还没被接受就重发（运控 0.2 s 后作废没取走的请求，DDS 也可能丢）
-# 爬台模式（11-23）：融合策略（rough + climb）下网页开关，开着时 5 Hz 发 2101 续约（运控 1 s 没收到就回 rough）。
-# 开着最长这么久自动关，免得忘了关一直用 climb 策略走路
-CLIMB_MAX = float(os.environ.get('GO2W_CLIMB_MAX', '300'))
+# 爬台模式是持久选择；后台5Hz维持2101续约，不依赖页面或导航状态。
 # 网页站起来（或跑过任务）的机器狗，空闲这么久就原地趴下；0 = 不自动趴下
 IDLE_LIE = float(os.environ.get('GO2W_IDLE_LIE', '30'))
 # 电机过热自动趴下（11-18，用户：「有关节到 68 度就自动趴下」）：16 个电机（12 个腿关节 + 4 个轮子）任何一个
 # ≥ 这个温度，站着就趴下（先取消任务、上锁、等停稳，和手动趴下同一流程），不管是不是「保持站立」、有没有任务；
-# 还在这个温度以上时不让站起。温度每 BAT_PERIOD 秒读一次，超过 MOTOR_STALE 没读到就不判断。0 = 关掉
+# 还在这个温度以上时不让站起。温度直接来自域0反馈，超过 MOTOR_STALE 没读到就不判断。0 = 关掉
 MOTOR_HOT_LIE = float(os.environ.get('GO2W_MOTOR_HOT_LIE', '68'))
 MOTOR_HOT_RETRY = 5.0  # s：趴下失败（运控没响应等）隔这么久再试
 MOTOR_NAMES = [f'{leg}{j}' for leg in ('右前', '左前', '右后', '左后') for j in ('髋', '大腿', '小腿')] + \
@@ -387,6 +391,34 @@ RESULT = {GoalStatus.STATUS_SUCCEEDED: 'succeeded', GoalStatus.STATUS_CANCELED: 
 def wrap(a):
     """角度归到 (-π, π]。"""
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def overtaken(here, prev, pt, nxt):
+    """连续通过：狗 here=(x, y, yaw) 是否已越过站点 pt、正往 nxt 走（见 ROUTE_OVERTAKE_*）。
+    prev = 来的方向（上一站或这段出发时狗的位置），用来排除「还没到站，只是正好在下一段延长线上」（往返路线）。"""
+    ox, oy = nxt['x'] - pt['x'], nxt['y'] - pt['y']
+    out = math.hypot(ox, oy)
+    if out < 0.3:
+        return False
+    ux, uy = ox / out, oy / out
+    rx, ry = here[0] - pt['x'], here[1] - pt['y']
+    t, lat = rx * ux + ry * uy, abs(ux * ry - uy * rx)
+    if not (ROUTE_OVERTAKE_AHEAD <= t <= out) or lat > ROUTE_OVERTAKE_LAT or math.hypot(rx, ry) > ROUTE_OVERTAKE_MAX:
+        return False
+    if math.cos(here[2] - math.atan2(uy, ux)) <= 0:   # 车头背着下一站（还在往这站开）
+        return False
+    if prev is not None:
+        ix, iy = pt['x'] - prev[0], pt['y'] - prev[1]
+        inn = math.hypot(ix, iy)
+        if inn >= 0.3:
+            ix, iy = ix / inn, iy / inn
+            bx, by = ix + ux, iy + uy   # 拐角平分线方向：过了它才算过了这站
+            b = math.hypot(bx, by)
+            if b < 0.2:                 # 接近 180° 掉头：只认沿来的方向已经过了站点
+                bx, by, b = ix, iy, 1.0
+            if (rx * bx + ry * by) / b <= 0:
+                return False
+    return True
 
 
 def yaw_of(q):
@@ -507,7 +539,7 @@ class SpeedCheck:
 
 
 class SysStats:
-    """宿主机 CPU / 内存（容器用 host 网络，/proc/stat 和 /proc/meminfo 反映的是整机）。"""
+    """整机 CPU / 内存总量；进程明细另按当前 PID 命名空间统计。"""
 
     def __init__(self):
         self.prev = None
@@ -576,16 +608,12 @@ class Bridge(TaughtMeasurements, Node):
         self.inspect = {}        # topic → {'sub', 'text', 't', 'ver', 'rate'}；只在有网页查看时订阅
         self.ros_ops = deque()   # 要在 rclpy 线程里做的事（建 / 删订阅），由定时器执行
         self.create_timer(0.1, self.run_ros_ops)
-        # 电量：/go2w/robot_lowstate（unitree_go/LowState，约 230 Hz、每帧 1.2 KB）里的 bms_state.soc。
-        # 一直订阅太费 CPU（planar_odom 订同类消息吃 50%+），所以每 BAT_PERIOD 秒临时订一次，收到一帧就退订，
-        # 而且不反序列化，只按 CDR 偏移读 soc 那一个字节
-        self.battery, self.battery_t, self.bat_sub = None, 0.0, None
-        self.motor_temp, self.motor_temp_t = None, 0.0   # 16 个电机温度 ℃（顺序见 MOTOR_TEMP_OFFSET）
+        # 电量、温度和实测关节直接来自域0 /lowstate，不依赖planar_odom转发。
+        self.battery, self.battery_t = None, 0.0
+        self.motor_temp, self.motor_temp_t = None, 0.0   # FR/FL/RR/RL × 髋/大腿/小腿，后4个是轮子
         self.motor_info = None   # 同一帧的错误标志 / 力矩，和 motor_temp 一起更新、一起过期
-        self.motor_fast = False  # 有网页在看力矩：读得勤一点（WebApp 维护）
-        self.bat_poll_t = 0.0
-        self.create_timer(MOTOR_FAST_PERIOD, self.poll_tick)
-        self.poll_battery()
+        self.motor_fast = False  # 保留旧页面标志；现在统一raw限频采样5Hz
+        self.robot_feedback = RobotFeedback()
 
         self.map_blob, self.map_ver = None, 0
         self.map_file = None     # 网页上显示的是 data/maps 里直接读的哪张图（导航没开时）；None = 来自 /map
@@ -1020,7 +1048,13 @@ class Bridge(TaughtMeasurements, Node):
         for name in (self.map_loaded, param):
             if name and name in hits:
                 return name
-        return hits[0] if len(hits) == 1 else param
+        if len(hits) == 1:
+            return hits[0]
+        # 11-26：导航开着时网页切过图，再重启网页后端（装新版本）→ map_loaded 没了，参数还是启动时的小图，
+        # 实际发的却是大图，尺寸相同的大图又有好几张（编辑另存的）→ 以前这里返回参数，地图名和栅格对不上，
+        # 出发流程以为图对了不切图，拿小图的站点去大图上自动定位，60 s 超时。参数明显不对时宁可说「不知道」，
+        # 出发流程看到没有地图名会自己切到任务的图。没有任何文件对得上（hits 为空）时照旧用参数。
+        return param if not hits else None
 
     def on_odom(self, m):
         self.observe_taught_odom(m)
@@ -1054,44 +1088,12 @@ class Bridge(TaughtMeasurements, Node):
         self.rates['/odom_healthy'].tick()
         self.healthy, self.healthy_t = m.data, time.monotonic()
 
-    def poll_tick(self):
-        # 上一个临时订阅还在等第一帧（DDS 发现可能要几百 ms）就别重建，等满 BAT_PERIOD 还没收到才重订
-        due = time.monotonic() - self.bat_poll_t >= BAT_PERIOD - 0.01
-        if due or (self.motor_fast and self.bat_sub is None):
-            self.poll_battery()
-
-    def poll_battery(self):
-        self.bat_poll_t = time.monotonic()
-        if self.bat_sub is not None:
-            self.destroy_subscription(self.bat_sub)   # 上一轮没收到（话题不在），这轮重订
-            self.bat_sub = None
-        try:
-            self.bat_sub = self.create_subscription(get_message('unitree_go/msg/LowState'), BAT_TOPIC,
-                                                    self.on_lowstate_raw, qos_profile_sensor_data, raw=True)
-        except Exception as e:
-            self.get_logger().warn(f'订阅 {BAT_TOPIC} 失败，网页不显示电量和电机温度：{e}', once=True)
-
     def on_lowstate_raw(self, data):
-        if len(data) > BAT_SOC_OFFSET and data[1] == 1:   # 只认小端 CDR（00 01 ..）
-            soc = data[BAT_SOC_OFFSET]
-            if 0 < soc <= 100:   # 0 = BMS 还没报
-                self.battery, self.battery_t = soc, time.monotonic()
-            end = MOTOR_TEMP_OFFSET + MOTOR_STRIDE * (MOTOR_N - 1)
-            if len(data) > end:
-                t = [((data[MOTOR_TEMP_OFFSET + MOTOR_STRIDE*i] + 128) & 0xFF) - 128 for i in range(MOTOR_N)]   # int8
-                if any(t) and all(-30 <= v <= 150 for v in t):   # 全 0 = 电机还没上报
-                    self.motor_temp, self.motor_temp_t = t, time.monotonic()
-                    self.motor_info = self._parse_motor_info(data, self.motor_temp_t)
-        if self.bat_sub is not None:
-            self.destroy_subscription(self.bat_sub)
-            self.bat_sub = None
-
-    def _parse_motor_info(self, data, now):
-        if len(data) < MOTOR_ERR_OFFSET + 4 + MOTOR_STRIDE * (MOTOR_N - 1):
-            return None
-        tau = [struct.unpack_from('<f', data, MOTOR_TAU_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)]
-        return {'err': [struct.unpack_from('<I', data, MOTOR_ERR_OFFSET + MOTOR_STRIDE * i)[0] for i in range(MOTOR_N)],
-                'tau': [round(v, 2) if math.isfinite(v) else None for v in tau]}
+        if self.robot_feedback.update(data):
+            health = self.robot_feedback.view()
+            self.battery, self.battery_t = health['battery'], self.robot_feedback.received
+            self.motor_temp, self.motor_temp_t = health['motorTemp'], self.robot_feedback.received
+            self.motor_info = health['motorInfo']
 
     def on_armed(self, m):
         self.rates['/go2w_cmd_bridge/armed'].tick()
@@ -1371,9 +1373,7 @@ class Bridge(TaughtMeasurements, Node):
             'fixed': self.fixed,
             'odomOk': bool(self.healthy) and now - self.healthy_t < STALE,
             'armed': self.is_armed() if 'go2w_cmd_bridge' in names else None,
-            'battery': self.battery if now - self.battery_t < BAT_STALE else None,
-            'motorTemp': self.motor_temp if now - self.motor_temp_t < MOTOR_STALE else None,
-            'motorInfo': self.motor_info if now - self.motor_temp_t < MOTOR_STALE else None,
+            **self.robot_feedback.view(),
             'navReady': self.nav.server_is_ready(),
             'nodes': nodes, 'profiles': profiles, 'topics': topics,
             'hasMap': self.map_blob is not None,
@@ -1434,6 +1434,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         node.wants = self.wants   # 点云、粒子没人看就不算，省扩展坞的 CPU
         self.camera = C.Camera(pack, T_CAM, node.event)
         self.sys = SysStats()
+        self.cpu_details = CpuStats()
         rid, src = robot_id()
         node.get_logger().info(f'狗编号 {rid}（来自 {src}），录包名 = {rid}_MMDD_HHMMSS（异常自动保存）/ {rid}_trigger_MMDD_HHMMSS（手动录包、保存刚才 N 秒）')
         # P3：进程管理。本地调试（GO2W_FAKE_PROCS=1）换成假模拟器里的进程
@@ -1500,7 +1501,8 @@ class Server(TaughtWeb, RT.RtabWeb):
         except (OSError, ValueError, AttributeError):
             pass
         self.uploads_file = os.path.join(DATA, 'bag_uploads.json')
-        self.uploads = {}             # 包名 → {state: run/done/fail, pct, msg}；done 的存进 bag_uploads.json
+        self.uploads = {}             # 包名 → {state: queued/run/done/fail, pct, msg}；done 的存进 bag_uploads.json
+        self.bag_upload_slots = asyncio.Semaphore(2)
         self.restore_upload_receipts()
         self.recording_api = RecordingAPI(os.path.join(DATA, 'bags'), self.static_dir,
                                           uploads=self.uploads, on_change=self.bag_content_changed)
@@ -1518,6 +1520,11 @@ class Server(TaughtWeb, RT.RtabWeb):
             node.event('ERROR', f'无法读取导航任务 {self.routes_file}：{e}')
         self.route = None
         self.route_job = None
+        self.route_starting = False
+        self.crossing_dirty = False
+        self.obstacles_critic = ObstaclesCriticAPI(busy=lambda: self.route_running() and (
+            self.crossing_dirty or (self.route and any(p.get('forceCrossing') for p in self.route['record']['points']))),
+            on_enabled=lambda: setattr(self, 'crossing_dirty', False))
         self.goal_pending = False
         self.resume_file = os.path.join(DATA, 'route_resume.json')
         self.resumes = {}
@@ -1575,14 +1582,21 @@ class Server(TaughtWeb, RT.RtabWeb):
         self.autoloc_moves = 0     # 这一轮已经「移动后重试」了几次
         self.pose_set_t = 0.0   # 最近一次（手动或自动）设置初始位姿的时间；启动后自动定位前用户已经手动给了就不再覆盖
         # 运控：站起 / 趴下（robot_ctrl.py）
-        self.ctrl = None
-        if CTRL_ON:
-            try:
-                self.ctrl = R.CtrlLink(node, node.event, fake=self.simulated)
-            except Exception as e:
-                node.event('ERROR', f'无法连接运控状态（域 0）：{e!r}；站起 / 趴下不可用')
+        self.ctrl = self.robot_link = None
+        try:
+            self.robot_link = R.CtrlLink(node, node.event, fake=self.simulated,
+                                         on_lowstate=node.on_lowstate_raw, control=CTRL_ON)
+            self.ctrl = self.robot_link if CTRL_ON else None
+        except Exception as e:
+            node.event('ERROR', f'无法连接机器人状态（域 0）：{e!r}；电量和实际姿态不可用')
+        self.refresh_stand_targets()
+        # 播报（audio.py）：本体喇叭，挂在运控那个域 0 节点上
+        self.audio = AU.Audio(node.event, DATA, self.ctrl.ros if self.ctrl else None, self.push_audio, self.label_error,
+                              os.environ.get('GO2W_AUDIO_LOCAL_EDIT', '1' if self.simulated else '0') == '1',
+                              why='' if self.ctrl else '没连上域 0，喇叭不可用')
+        self.audio.used = self.audio_used
         self.ctrl_op = None        # 'up' / 'down' / 'policy'：正在站起 / 趴下 / 切策略
-        self.climb = None          # 爬台模式开着：{'ws': 开的网页, 'who': 来源, 't': 开的时间}
+        self.climb = None          # 选中的爬台模式：{'who': 来源, 't': 开启时间}，不绑定页面
         self.policies_cache = (-1e9, [])   # (列目录的时间, 可选策略)
         self.ctrl_abort = False    # 站起过程中被要求趴下
         self.ctrl_msg = ''         # 最近一次站起 / 趴下的结果
@@ -1660,6 +1674,15 @@ class Server(TaughtWeb, RT.RtabWeb):
     def remote(self, ws):
         return self.clients.get(ws, {}).get('remote', '?')
 
+    def cmd_source(self, ws, d):
+        """停车类指令的来源，写进日志：IP（127.0.0.1 = 本机云端网关转发）+ 网页说明的触发方式（why，如「取消按钮」「切到重定位」）。"""
+        ip = self.remote(ws)
+        src = f'云端网关 {ip}' if str(ip).startswith('127.0.0.1') else str(ip)
+        why = d.get('why')
+        if isinstance(why, str) and why.strip():
+            src += f'，{why.strip()[:24]}'
+        return src
+
     async def run_cmd(self, ws, d):
         try:
             ok, text, *data = await self.handle_cmd(ws, d)
@@ -1682,6 +1705,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return await self.handle_taught(ws, d)
             except (TeachingError, ValueError) as e:
                 return False, str(e)
+        if isinstance(op, str) and op.startswith('audio_'):   # 播报：不算运动操作，不抢控制权
+            return await self.audio.handle(d, self.remote(ws))
         if self._taught_job is not None and (op in ('goal', 'route_start', 'set_mode', 'load_map', 'autoloc_move')
                                             or (op == 'arm' and d.get('on'))):
             return False, '示教正在加载地图或定位自检，请保持静止并等待结果'
@@ -1691,9 +1716,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '另一个网页正在进行示教采集，请在原页面操作'
         if self.checking_route and op in ('goal', 'initial_pose', 'route_start', 'auto_localize', 'autoloc_move'):
             return False, '正在检查路线，请稍等'
-        if self.climb is not None and op in ('goal', 'route_start', 'auto_localize', 'autoloc_move', 'taught_start'):
-            return False, '爬台模式开着：先关掉爬台模式（切回 rough）再导航'
-        if self.route_running() and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
+        if (self.route_running() or getattr(self, 'route_starting', False)) and (op in ('goal', 'initial_pose', 'auto_localize', 'autoloc_move')
                                      or (op == 'arm' and d.get('on'))):
             return False, '多点任务进行中：请先取消任务'
         # 先让准备凭据失效，再进入可能await的停车分支；同一页面取消也必须中断站起。
@@ -1707,15 +1730,15 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'estop':
                 # 先停车，再记日志
                 self.estop, self.estop_t = True, time.monotonic()
-                self.climb_off(f'网页急停（{self.remote(ws)}）')
-                errors = await self.disarm_and_cancel(f'网页急停（{self.remote(ws)}）')
+                src = self.cmd_source(ws, d)
+                errors = await self.disarm_and_cancel(f'网页急停（{src}）')
                 if 'estop' not in self.inc_open:
-                    self.inc_open['estop'] = self.incident('estop', f'网页急停（{self.remote(ws)}）', ongoing=True)
+                    self.inc_open['estop'] = self.incident('estop', f'网页急停（{src}）', ongoing=True)
                 return (False, '急停已锁存，但：' + '；'.join(errors)) if errors else (True, '已急停：导航已取消，底盘已上锁')
             if op == 'release_estop':
                 self.estop = False
                 self.incident_close('estop')
-                n.event('INFO', '急停已解除（底盘仍上锁）')
+                n.event('INFO', f'急停已解除（底盘仍上锁）（{self.cmd_source(ws, d)}）')
                 return True, '急停已解除，底盘仍处于上锁'
             if op == 'initial_pose':
                 if 'amcl' not in n.get_node_names():
@@ -1730,7 +1753,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                 asyncio.ensure_future(self.clear_after_pose())
                 return True, '位置已修正' if fine else '初始位姿已发布'
             if op == 'auto_localize':
-                return await self.auto_localize(self.remote(ws))
+                area, hints = d.get('area'), d.get('hints')
+                if area is not None:
+                    area = self.autoloc_area(area)
+                    if isinstance(area, str):
+                        return False, area
+                return await self.auto_localize(self.remote(ws), area=area, hints=self.autoloc_hint_list(hints))
             if op == 'autoloc_move':
                 return await self.autoloc_move(ws)
             if op == 'stand_up':
@@ -1754,6 +1782,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'goal':
                 if self.estop:
                     return False, '急停中：先解除急停'
+                if getattr(self, 'crossing_dirty', False):
+                    return False, '强制跨越尚未退出（避障参数应恢复为 true），暂不能下发单点目标'
                 reason = self.ctrl_blocker()
                 if reason:
                     return False, reason
@@ -1787,10 +1817,13 @@ class Server(TaughtWeb, RT.RtabWeb):
             if op == 'cancel':
                 if cancelled_preparation:
                     return True, '已取消示教准备，不再继续后续站立或定位阶段'
-                await self.taught_interrupt('手动取消，示教草稿已保留')
+                src = self.cmd_source(ws, d)
+                await self.taught_interrupt(f'手动取消（{src}），示教草稿已保留')
                 self.motion_stops += 1
                 try:
-                    self.stop_route('手动取消')
+                    if not self.route_running():
+                        n.event('INFO', f'手动取消导航（{src}）')
+                    self.stop_route(f'手动取消（{src}）')
                     # 巡逻中只取消当前目标的话，patrol.py 会重试，机器人又走起来：要连巡逻一起停
                     if self.prof('patrol') != 'stop':
                         await self.procs.stop_patrol()
@@ -1810,19 +1843,21 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if on and self.estop:
                     return False, '急停中：先解除急停'
                 if not on and self.route_running():
-                    errors = await self.disarm_and_cancel('底盘上锁')
+                    errors = await self.disarm_and_cancel(f'底盘上锁（{self.cmd_source(ws, d)}）')
                     return (False, '；'.join(errors)) if errors else (True, '底盘已上锁，任务已取消')
                 if not n.arm_cli.service_is_ready():
                     return False, '速度桥没有运行（刚开机或刚切换档位时要等几秒）'
                 r = await self.aw(n.call_arm(on), 2.0)
                 if r.success:
                     n.armed, n.armed_t = on, time.monotonic()
-                n.event('WARN' if on else 'INFO', f"{'解锁' if on else '上锁'}：{r.message}（{self.remote(ws)}）")
+                n.event('WARN' if on else 'INFO', f"{'解锁' if on else '上锁'}：{r.message}（{self.cmd_source(ws, d)}）")
                 return r.success, r.message  # 以 cmd_bridge 的回复为准
             if op == 'set_param':
                 key = d.get('key')
                 if key not in PARAMS:
                     return False, f'不支持的参数：{key}'
+                if key == 'vmax' and (self.route_running() or getattr(self, 'route_starting', False)):
+                    return False, '任务执行中，最大 vx 由任务和站点限速共同约束，请先取消任务再调整'
                 if not n.pset_cli.service_is_ready():
                     return False, 'cmd_bridge 没有运行'
                 r = await self.aw(n.set_param(key, d['value']), 2.0)
@@ -1834,8 +1869,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return False, f'参数没有生效：{res.reason}'
             if op == 'set_mode':
                 return self.set_mode(d.get('mode'), d.get('map'))
-            if op in ('route_save', 'route_delete'):
-                result = self.save_route(d) if op == 'route_save' else self.delete_route(d.get('route_id'))
+            if op in ('route_save', 'route_delete', 'route_terminate'):
+                result = (self.save_route(d) if op == 'route_save' else
+                          self.delete_route(d.get('route_id')) if op == 'route_delete' else
+                          self.terminate_route(d.get('route_id')))
                 if result[0]:
                     await self.send_all(self.routes_message(), key='routes')
                 return result
@@ -1864,7 +1901,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                     return ok, msg, {'name': self.rollback_last, 'duration_s': bag.get('dur'), 'requested_s': ROLLBACK_SECONDS + ROLLBACK_AFTER}
                 return ok, msg, {'uncertain': '超时' in msg or '已提交' in msg}
             if op == 'bag_upload':
-                return await self.bag_upload(d.get('name'), self.remote(ws))
+                return await self.bag_upload(d.get('name'), self.remote(ws), verify=d.get('verify') is True)
             if op == 'bag_stop':
                 await self.bag_stop()
                 n.event('INFO', '录包已停止')
@@ -1937,6 +1974,58 @@ class Server(TaughtWeb, RT.RtabWeb):
     def ctrl_get(self):
         return self.ctrl.get(CTRL_STALE) if self.ctrl else (None, False, -1)
 
+    def refresh_stand_targets(self):
+        if self.simulated:
+            if self.node.robot_feedback.stand is None:
+                self.node.robot_feedback.set_targets([0.,.8,-1.5]*4, [0.,1.36,-2.65]*4)
+            return
+        self.node.robot_feedback.load_running_config(self.procs.groups)
+
+    def feedback_blocker(self):
+        feedback = self.node.robot_feedback.view()['robotFeedback']
+        state, ready, seq = self.ctrl_get()
+        token = (state, seq, self.node.robot_feedback.generation, getattr(self.ctrl, 'epoch', 0))
+        candidate = getattr(self, 'stand_candidate', None)
+        if candidate is None or candidate[0] != token:
+            self.stand_candidate = (token, time.monotonic())
+        if getattr(self, 'stand_verified', None) != token:
+            self.stand_verified = None
+        if not feedback['fresh']:
+            self.stand_verified = None
+            return '收不到新鲜的机器人反馈（/lowstate），无法确认实际姿态'
+        if not feedback['configured']:
+            self.stand_verified = None
+            return '无法读取当前运控的站姿配置，不能确认实际站起'
+        if not feedback['valid'] or feedback['posture'] == 'lying':
+            self.stand_verified = None
+            return '实测关节或机身姿态未确认站起，请检查电量和电机状态'
+        if ready and self.node.robot_feedback.confirmed(self.stand_candidate[1]):
+            self.stand_verified = token
+            return None
+        if state == 'Velocity' and ready and getattr(self, 'stand_verified', None) == token:
+            return None  # A verified walking policy need not stay at the static FixStand target.
+        return '实测关节尚未到达站姿，不能确认机器狗已站起'
+
+    def record_stand_confirmation(self, after):
+        state, ready, seq = self.ctrl_get()
+        if state == 'Velocity' and ready and self.node.robot_feedback.confirmed(after):
+            token = (state, seq, self.node.robot_feedback.generation, getattr(self.ctrl, 'epoch', 0))
+            self.stand_candidate = (token, after)
+            self.stand_verified = token
+
+    async def wait_standing(self, after, valid=None, expected=None):
+        deadline = time.monotonic() + CTRL_WAIT
+        while time.monotonic() < deadline:
+            if self.ctrl_abort or self.estop or (valid is not None and not valid()):
+                return '操作已取消，未继续启动策略'
+            state, ready, _ = self.ctrl_get()
+            if state not in ('FixStand', 'Velocity') or (expected is not None and state != expected):
+                return f'运控状态变成了 {state}，未确认站起'
+            if ready and self.node.robot_feedback.confirmed(after):
+                return None
+            await asyncio.sleep(.05)
+        return self.feedback_blocker() or '实测站姿尚未连续稳定，请检查电量和电机反馈'
+
     def ctrl_blocker(self):
         """导航能不能让机器狗动：要在策略（Velocity）里。没接运控（GO2W_CTRL=0）时不拦。"""
         if self.ctrl is None:
@@ -1945,8 +2034,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         if s is None:
             return '收不到运控状态（/go2w_ctrl/state），请检查运行容器的 control 组和域 0 通信'
         if s != 'Velocity' or not ready:
+            self.stand_verified = None
             return f'机器狗没有站起来（运控状态 {s}）'
-        return None
+        return self.feedback_blocker()
 
     def moving(self):
         n = self.node
@@ -1964,6 +2054,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return '发起页面已断开、准备已取消或控制权变化，已停止后续站立动作'
             if self.ctrl_abort and api != R.API_STANDDOWN:
                 return '被「趴下」打断'
+            if self.estop and api != R.API_STANDDOWN:
+                return '急停中，未继续发送站起或策略请求'
             s, ready, _ = self.ctrl_get()
             if s is None:
                 return '收不到运控状态'
@@ -1993,6 +2085,20 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '正在站起 / 趴下，请稍等'
         if self.estop:
             return False, '急停中：先解除急停'
+        await asyncio.to_thread(self.refresh_stand_targets)
+        if valid is not None and not valid():
+            return False, '准备已取消，未发送站起请求'
+        if self.ctrl_op:
+            return False, '正在站起 / 趴下，请稍等'
+        if self.estop:
+            return False, '急停中，未发送站起请求'
+        health = self.node.robot_feedback.view()
+        if not health['robotFeedback']['fresh']:
+            return False, '收不到新鲜的机器人反馈，未发送站起请求'
+        if not health['robotFeedback']['configured']:
+            return False, '无法读取当前运控站姿配置，未发送站起请求'
+        if health['battery'] == 0:
+            return False, '电量为 0%，未发送站起请求'
         s, ready, _ = self.ctrl_get()
         if s is None:
             return False, '收不到运控状态（/go2w_ctrl/state），请检查运行容器的 control 组和域 0 通信'
@@ -2001,10 +2107,15 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, f'{MOTOR_NAMES[hot[1]]} {hot[0]} ℃，电机过热（≥{MOTOR_HOT_LIE:.0f} ℃），降温后再站起'
         self.auto_lie, self.stand_hold, self.idle_since = True, False, None   # 网页站起来的：空闲了自动趴下
         if s == 'Velocity' and ready:
-            return True, '已经站好（策略运行中）'
+            after = time.monotonic()
+            err = await self.wait_standing(after, valid, expected='Velocity')
+            if not err:
+                self.record_stand_confirmation(after)
+            return self.ctrl_done(not err, err or '实测站姿已确认（策略运行中）')
         if s not in R.STATES:
             return False, f'运控状态 {s}，不能站起'
         self.ctrl_op, self.ctrl_abort, lying = 'up', False, s == 'Passive'
+        started = time.monotonic()
         try:
             n = self.node
             if lying:
@@ -2012,9 +2123,13 @@ class Server(TaughtWeb, RT.RtabWeb):
                 err = await self.ctrl_switch(R.API_STANDUP, ('Passive',), 'FixStand', CTRL_INTERP + CTRL_WAIT, valid=valid)
                 if err:
                     return self.ctrl_done(False, f'站起失败：{err}')
+            err = await self.wait_standing(started, valid)
+            if err:
+                return self.ctrl_done(False, f'站起未确认：{err}；请检查电量和电机状态')
             if self.estop:
                 return self.ctrl_done(False, '急停中：停在站立姿态，没有启动策略')
             s, ready, _ = self.ctrl_get()
+            policy_started = time.monotonic()
             if s != 'Velocity':
                 n.event('INFO', '启动策略：FixStand → Velocity')
                 # FixStand 没站稳时运控也接受 1002，会在半站的姿态下切进策略：ctrl_switch 等 ready 才发
@@ -2022,6 +2137,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                                              CTRL_WAIT + (0 if ready else CTRL_INTERP), valid=valid)
                 if err:
                     return self.ctrl_done(False, f'启动策略失败：{err}')
+            err = await self.wait_standing(policy_started, valid, expected='Velocity')
+            if err:
+                return self.ctrl_done(False, f'策略启动后站姿未确认：{err}')
+            self.record_stand_confirmation(policy_started)
             if lying:
                 self.stood_seq += 1
                 self.autoloc_reset()   # 雷达高度变了，趴着时的结果不算
@@ -2041,7 +2160,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             return True, '已经趴着'
         if self.ctrl_op == 'down':
             return False, '正在趴下'
-        self.climb_off(f'趴下（{who}）')
         self.ctrl_abort = True                 # 正在站起就打断
         while self.ctrl_op == 'up':
             await asyncio.sleep(0.05)
@@ -2237,64 +2355,31 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     # ---------- 爬台模式（融合策略 2101） ----------
     def set_climb(self, ws, on):
-        who = self.remote(ws)
-        if not on:
-            if self.climb is None:
-                return True, '爬台模式已经是关的'
-            self.climb_off(f'关闭爬台模式（{who}）')
-            return True, '已关闭爬台模式，运控切回 rough'
+        who = self.remote(ws) if ws is not None else '强制跨越任务'
         if self.ctrl is None:
-            return False, self.ctrl_blocker() or '运控接入已关闭（GO2W_CTRL=0）'
+            return False, '运控连接不可用'
+        if not on:
+            self.climb_off(f'关闭爬台模式（{who}）')
+            return True, '已选择 rough 模式'
         if self.estop:
             return False, '急停中：先解除急停'
-        if self.ctrl_op:
-            return False, '运控正在操作（站起 / 趴下 / 切策略），请稍等'
-        s, ready, _ = self.ctrl_get()
-        if s is None:
-            return False, '收不到运控状态（/go2w_ctrl/state）'
-        if s != 'Velocity' or not ready:
-            return False, f'只能站着（策略运行中）开爬台模式（现在：{s}）'
         if self.ctrl.get_dual(CTRL_STALE) is None:
             return False, '当前运控策略不是融合策略（rough + climb），没有爬台模式'
-        n = self.node
-        if (self.route_running() or self.goal_pending or n.nav_active() or self.taught_recording()
-                or self._taught_job is not None or self.prof('patrol') != 'stop'):
-            return False, '有导航任务在跑：先取消任务再开爬台模式（爬台用遥控或网页摇杆）'
-        if self.climb is not None:
-            self.climb['ws'] = ws
-            return True, '爬台模式已经开着'
-        self.climb = {'ws': ws, 'who': who, 't': time.monotonic()}
         self.ctrl.climb(True)
-        n.event('WARN', f'开启爬台模式（{who}）：切到 climb 策略，最长 {CLIMB_MAX:.0f} s 自动关')
-        return True, '爬台模式已开：速度 |vx|≤0.5、|vy|≤0.15、|wz|≤0.15 时切到 climb'
+        self.climb = {'who':who, 't':time.monotonic()}
+        self.node.event('INFO', f'已选择 climb 模式（{who}）')
+        return True, '已选择 climb 模式，导航和其他功能照常可用'
 
     def climb_off(self, reason):
-        if self.climb is None:
-            return
         self.climb = None
         if self.ctrl is not None:
             self.ctrl.climb(False)
             self.ctrl.climb(False)   # 发两帧防丢；真丢了运控 1 s 没续约也会自己回 rough
-        self.node.event('INFO', f'爬台模式已关：{reason}，运控切回 rough')
+        self.node.event('INFO', f'已选择 rough 模式：{reason}')
 
     def climb_tick(self):
-        """safety 循环 5 Hz：开着就续约；出状况就关。"""
-        c = self.climb
-        if c is None:
-            return
-        s, ready, _ = self.ctrl_get()
-        ws = c['ws']
-        gap = time.monotonic() - self.clients[ws]['last_ping'] if ws in self.clients else None
-        reason = ('急停' if self.estop
-                  else '开启爬台模式的网页断开了' if gap is None
-                  else f'开启爬台模式的网页心跳丢失 {gap:.1f} s' if gap > self.heartbeat
-                  else f'运控状态 {s or "离线"}，不在行走状态' if s != 'Velocity'
-                  else '运控状态里没有融合策略信息' if self.ctrl.get_dual(CTRL_STALE) is None
-                  else f'已开 {CLIMB_MAX:.0f} s，自动关闭' if time.monotonic() - c['t'] > CLIMB_MAX
-                  else None)
-        if reason:
-            self.climb_off(reason)
-        else:
+        """后台5Hz维持续约；页面、时长和其他功能不改变模式选择。"""
+        if self.climb is not None and self.ctrl is not None:
             self.ctrl.climb(True)
 
     def ctrl_busy(self):
@@ -2303,7 +2388,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         return bool(self.route_running() or self.goal_pending or n.nav_active() or self.teleop is not None
                     or self.taught_recording() or self._taught_job is not None
                     or self.checking_route or self.autoloc_busy or self.ctrl_op or self.busy or self.map_loading
-                    or self.stand_hold or self.climb is not None or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
+                    or self.stand_hold or time.monotonic() - self.prep_hold_t < PREP_HOLD_TTL
                     or self.prof('patrol') != 'stop' or self.moving())
 
     def idle_tick(self):
@@ -2433,16 +2518,24 @@ class Server(TaughtWeb, RT.RtabWeb):
         if self.ctrl is None:
             return {'on': CTRL_ON, 'state': None, 'ready': False, 'age': None}
         s, ready, seq = self.ctrl_get()
+        feedback = self.node.robot_feedback.view()['robotFeedback']
+        physical_ready = self.feedback_blocker() is None if s in ('FixStand', 'Velocity') else False
+        if s in ('FixStand', 'Velocity'):
+            ready = ready and physical_ready and not self.ctrl_op
+        else:
+            self.stand_verified = None
         left = None if self.idle_since is None else max(0.0, IDLE_LIE - (time.monotonic() - self.idle_since))
         rx = self.ctrl.last_rx()
         dual = self.ctrl.get_dual(CTRL_STALE)
         return {'on': True, 'state': s, 'ready': ready, 'seq': seq, 'op': self.ctrl_op, 'msg': self.ctrl_msg,
+                'feedback': feedback,
+                'physicalReady':physical_ready,
                 'age': None if rx is None else round(time.monotonic() - rx, 1),   # 距最后一次收到运控状态多少秒；从没收到 = None
                 'stood': self.stood_seq, 'auto': self.auto_lie and IDLE_LIE > 0, 'hold': self.stand_hold,
                 'lieIn': None if left is None else round(left, 1), 'hotLie': MOTOR_HOT_LIE,
                 'policy': self.policy_now()[0], 'policies': self.policies(),
                 'dual': None if dual is None else {'policy': dual[0], 'switching': dual[1], 'req': dual[2]},
-                'climb': None if self.climb is None else {'since': round(time.monotonic() - self.climb['t'], 1), 'max': CLIMB_MAX}}
+                'climb': None if self.climb is None else {'since': round(time.monotonic() - self.climb['t'], 1)}}
 
     # ---------- 多点导航 ----------
     @staticmethod
@@ -2493,7 +2586,45 @@ class Server(TaughtWeb, RT.RtabWeb):
                     'name': label.strip(), 'note': note.strip(), 'manualHeading': manual}
             if round(dwell) > 0:
                 item['dwell'] = int(round(dwell))
+            if 'vmax' in point:
+                speed = point['vmax']
+                if type(speed) not in (int, float) or not math.isfinite(speed) or not 0.1 <= speed <= 1.2:
+                    raise ValueError('站点限速需要在 0.1–1.2 m/s 之间')
+                item['vmax'] = float(speed)
+            crossing = point.get('forceCrossing', False)
+            if type(crossing) is not bool:
+                raise ValueError('强制跨越开关需要是布尔值')
+            if crossing:
+                item['forceCrossing'] = True
+            # 11-25：audio = 到站播的音频（audio.py 的 id），audioLeave = 离开前播的（播完再走）。
+            # 一段存字符串（和 v1.1.15 一样），多段（按顺序播，最多 ROUTE_AUDIO_MAX 段）存列表；没有 = 不播
+            for key, what in (('audio', '到站播报'), ('audioLeave', '离开前播报')):
+                raw = point.get(key)
+                if raw in (None, '', []):
+                    continue
+                got = raw if isinstance(raw, list) else [raw]
+                ok = []   # 每段：音频 id 字符串，或 {id, wait}（wait = 播这段前先等几秒，11-25）
+                for c in got:
+                    cid, wait = (c.get('id'), c.get('wait', 0)) if isinstance(c, dict) else (c, 0)
+                    if not isinstance(cid, str) or not re.fullmatch('[0-9a-f]{12}', cid):
+                        if strict:
+                            raise ValueError(f'站点{what}音频无效')
+                        continue
+                    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) \
+                            or not 0 <= wait <= ROUTE_AUDIO_WAIT_EACH:
+                        if strict:
+                            raise ValueError(f'站点{what}每段前的等待需要 0–{ROUTE_AUDIO_WAIT_EACH} 秒')
+                        wait = 0
+                    wait = int(round(wait))
+                    ok.append({'id': cid, 'wait': wait} if wait > 0 else cid)
+                if strict and len(ok) > ROUTE_AUDIO_MAX:
+                    raise ValueError(f'站点{what}最多 {ROUTE_AUDIO_MAX} 段')
+                ok = ok[:ROUTE_AUDIO_MAX]
+                if ok:
+                    item[key] = ok[0] if len(ok) == 1 and isinstance(ok[0], str) else ok
             clean.append(item)
+        if sum(p.get('forceCrossing', False) for p in clean) == 1:
+            raise ValueError('强制跨越需要至少选择两个点，或者全部不选')
         return {'id': route_id, 'name': name.strip(), 'map': map_name, 'points': clean,
                 'opts': Server.route_opts(d.get('opts'), strict)}
 
@@ -2512,9 +2643,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         checks = {'loop': lambda v: type(v) is bool, 'through': lambda v: type(v) is bool,
                   'loops': lambda v: type(v) is int and 0 <= v <= 1000,
                   'vmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.1 <= v <= 1.2,
-                  'wmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.2 <= v <= 1.5}
+                  'wmax': lambda v: type(v) in (int, float) and math.isfinite(v) and 0.2 <= v <= 2.0}
         msgs = {'loop': '循环开关无效', 'through': '连续通过开关无效', 'loops': '圈数需要 0–1000 的整数', 'vmax': '最大 vx 需要在 0.1–1.2 m/s 之间',
-                'wmax': '最大 wz 需要在 0.2–1.5 rad/s 之间'}
+                'wmax': '最大 wz 需要在 0.2–2 rad/s 之间'}
         for k, ok in checks.items():
             if k not in o:
                 continue
@@ -2535,6 +2666,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '找不到要更新的任务'
         route_id = route_id or uuid.uuid4().hex
         record = self.route_record(d, route_id)
+        for i, p in enumerate(record['points'], 1):
+            if any(c not in self.audio.items for key in ('audio', 'audioLeave') for c in self.point_clips(p, key)):
+                return False, f'第 {i} 站选的播报音频已经不在了，重新选一段或改成不播报'
         self.write_routes({**self.routes, route_id: record})
         return True, f"已保存任务：{record['name']}", record
 
@@ -2762,9 +2896,12 @@ class Server(TaughtWeb, RT.RtabWeb):
     # ---------- 任务接续（11-24） ----------
     @staticmethod
     def route_fp(record):
-        """站点指纹：只看坐标和朝向（站名、备注、速度改了不影响接续）。"""
+        """改变坐标、朝向或强制跨越区间后，旧断点不能继续使用。"""
         pts = [(round(p['x'], 3), round(p['y'], 3), round(p['th'], 3)) for p in record['points']]
-        return hashlib.sha1(json.dumps(pts).encode()).hexdigest()[:16]
+        crossing = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
+        # 字段名区分几何与配置，避免三个标记索引与一个坐标点混淆；旧路线保持原指纹。
+        payload = {'points': pts, 'forceCrossing': crossing} if crossing else pts
+        return hashlib.sha1(json.dumps(payload).encode()).hexdigest()[:16]
 
     def resume_valid(self, rid, cp, now=None):
         r = self.routes.get(rid)
@@ -2791,8 +2928,10 @@ class Server(TaughtWeb, RT.RtabWeb):
                 tmp = f.name
                 json.dump(self.resumes, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.resume_file)
+            return True
         except OSError as e:
             self.node.event('WARN', f'任务断点没能写盘：{e}')
+            return False
         finally:
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
@@ -2801,6 +2940,22 @@ class Server(TaughtWeb, RT.RtabWeb):
         msg = self.routes_message()
         for ws in list(self.clients):
             self.tx_put(ws, msg, 'routes')
+
+    def terminate_route(self, route_id):
+        """终止已停止任务的接续进度，保留路线和其他任务。"""
+        record = self.routes.get(route_id)
+        if record is None:
+            return False, '找不到这个导航任务'
+        if self.route_running() and self.route and self.route['record']['id'] == route_id:
+            return False, '任务正在执行，请先取消导航再终止接续'
+        checkpoint = self.resumes.pop(route_id, None)
+        if checkpoint is None:
+            return False, '这个任务没有待继续的进度'
+        if not self.write_resumes():
+            self.resumes[route_id] = checkpoint
+            return False, '任务进度未能清除，请检查后端日志后重试'
+        self.node.event('INFO', f"已终止任务「{record['name']}」的接续，已保存的路线保留")
+        return True, '任务已终止，已保存的路线保留'
 
     def resume_view(self, record):
         """推给网页 / 云端的断点。running 的任务（status = active）不给：只有停下来的才能接续。"""
@@ -2845,10 +3000,11 @@ class Server(TaughtWeb, RT.RtabWeb):
     def route_running(self):
         return self.route_job is not None and not self.route_job.done()
 
-    def route_blocker(self, ws, route):
+    def route_blocker(self, ws, route, link=False):
+        """link=True 只在出发 / 接续时用：发起的网页得在线。任务跑起来以后不再查网页连接（v1.5.1：断网不停车）。"""
         n = self.node
         client = self.clients.get(ws)
-        if client is None or ws.closed or time.monotonic() - client['last_ping'] > self.heartbeat:
+        if link and (client is None or ws.closed or time.monotonic() - client['last_ping'] > self.heartbeat):
             return '控制方网页连接已断开'
         if self.estop or not n.is_armed():
             return '急停或底盘未解锁'
@@ -2929,7 +3085,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.checking_route = False
 
-    def start_route(self, ws, route_id, round_trip=False, loops=1, resume=None):
+    def start_route(self, ws, route_id, round_trip=False, loops=1, resume=None, *, vmax=None):
         """resume：None = 从头出发；'continue' = 从断点那一站接着跑；'skip' = 跳过断点那一站，从下一站接着跑。
         接续时圈数、已完成站数都用断点里的，round_trip / loops 参数不看。"""
         route = self.routes.get(route_id)
@@ -2954,7 +3110,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         if (self.route_running() or self.goal_pending or self.node.nav_active()
                 or self.prof('patrol') != 'stop' or self.teleop is not None):
             return False, '请先结束当前导航、巡逻或遥控'
-        reason = self.route_blocker(ws, route)
+        reason = self.route_blocker(ws, route, link=True)
         if reason:
             return False, reason
         self.owner = ws
@@ -2965,7 +3121,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                       # 循环：loops 为 None 表示单程；done = 已到达的站数，用来算进度。一圈到 n 站（含回到起点）
                       'loops': loops if round_trip else None, 'loop': 1, 'back': False, 'done': 0,
                       'total': n if not round_trip else None if loops == 0 else 1 + loops * n,
-                      'target': route['points'][0], 'resume': None}
+                      'target': route['points'][0], 'resume': None,
+                      'vmax': self.route_opts(route.get('opts'))['vmax'] if vmax is None else vmax}
         how = '' if not round_trip else '，一直循环' if loops == 0 else f'，循环 {loops} 圈'
         if cp:
             i, loop, back = state
@@ -2985,10 +3142,24 @@ class Server(TaughtWeb, RT.RtabWeb):
         return True, f"开始任务：{route['name']}{how}"
 
     async def start_route_armed(self, ws, d):
+        if getattr(self, 'route_starting', False):
+            return False, '导航任务正在启动，请勿重复出发'
+        self.route_starting = True
+        try:
+            return await self._start_route_armed(ws, d)
+        finally:
+            self.route_starting = False
+
+    async def _start_route_armed(self, ws, d):
         """网页「出发」：先把这次的速度上限（vmax / wmax，导航没开时在网页上选好的）设给 cmd_bridge，
         arm=true 时再解锁出发；出发失败就把刚解的锁再上回去。"""
         n, armed_here = self.node, False
         record = self.routes.get(d.get('route_id'))
+        if record is None:
+            return False, '找不到这个导航任务'
+        if (self.route_running() or self.goal_pending or n.nav_active()
+                or self.prof('patrol') != 'stop' or self.teleop is not None):
+            return False, '请先结束当前导航、巡逻或遥控'
         ok, message = await self.check_ordinary_taught_binding(record['map'] if record else n.map_current)
         if not ok:
             return False, message
@@ -2996,10 +3167,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             why = self.keepout_blocker(record['map'], record['points'])
             if why:
                 return False, why
-        for key, top in (('vmax', 1.2), ('wmax', 1.5)):
-            v = d.get(key)
-            if v is None:
-                continue
+        opts = self.route_opts(record.get('opts'))
+        for key, top in (('vmax', 1.2), ('wmax', 2.0)):
+            v = d.get(key, opts[key])
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
                 return False, f'速度上限 {key} 需要在 0–{top} 之间'
             if n.params.get(key) is not None and abs(n.params[key] - v) < 1e-6:
@@ -3023,7 +3193,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not r.success:
                 return False, f'解锁失败：{r.message}'
             n.armed, n.armed_t, armed_here = True, time.monotonic(), True
-        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1), d.get('resume'))
+        result = self.start_route(ws, d.get('route_id'), d.get('round_trip', False), d.get('loops', 1), d.get('resume'),
+                                  vmax=float(d.get('vmax', opts['vmax'])))
         if armed_here and not result[0]:
             try:
                 r = await self.aw(n.call_arm(False), 2.0)
@@ -3038,6 +3209,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.incident('nav_fail', f"巡逻任务「{route['record']['name']}」{message}")   # 先记，任务信息还是执行中的
         route.update(status=status, message=message, ended=time.monotonic())
         route['stop'].set()
+        if status != 'succeeded':   # 取消 / 失败 / 急停：任务自己播的那段也停；正常跑完的让最后一站播完
+            self.background(self.audio.stop_tag(route, '任务停止'))
         try:
             self.resume_checkpoint(route, status, message)
         except Exception as e:   # 记断点出错不能影响停车
@@ -3062,8 +3235,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             n.event('WARN', f'设置位姿后清除代价地图没有完成：{e!r}')
 
     # ---------- 自动定位 ----------
-    async def auto_localize(self, who, on_start=False):
+    async def auto_localize(self, who, on_start=False, area=None, hints=None):
         """用最近几帧 scan 在整张地图上找机器人（globloc.py 子进程），可信就发给 AMCL。
+
+        area = (x, y, r)：人在地图上画的圈，只在圈里找（找不到不搜整图，让人画大点或点「自动定位」）。
+        没有 area 时先在「上次位置 / 停车点 / hints（网页带来的任务站点）」附近各找 AUTOLOC_HINT_R，
+        分数 ≥ AUTOLOC_HINT_SCORE 就用；不够再搜整张图（和以前一样）。
 
         返回 (ok, 提示, 结果)。不可信（分数低 / 有歧义）时不发位姿，只报告，让人手动给。
         机器人必须静止；导航目标执行中拒绝（定位跳变会让正在跑的规划失效）。
@@ -3079,7 +3256,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '还没有收到地图（或地图原点带旋转，暂不支持）'
         self.autoloc_busy = True
         self.autoloc = {'state': 'run', 'seq': self.autoloc['seq'], 'map': n.map_current}
-        path = None
         try:
             # 先等站稳、静止（11-12：站起来后立刻定位总报「机器人在动」，自检卡住）
             scans, why, w0 = None, '', time.monotonic()
@@ -3097,24 +3273,30 @@ class Server(TaughtWeb, RT.RtabWeb):
             map_name, map_ver = n.map_current, n.map_ver
             self.autoloc['map'] = map_name
             t0 = time.monotonic()
-            fd, path = tempfile.mkstemp(prefix='go2w_autoloc_', suffix='.npz')
-            os.close(fd)
-            np.savez(path, grid=grid, res=res, origin=np.array([ox, oy]), pts=np.concatenate(scans).astype(np.float32))
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
-            # nice：别和 FAST-LIO / AMCL 抢 CPU
-            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', sys.executable, script, path,
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), AUTOLOC_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise RuntimeError(f'{AUTOLOC_TIMEOUT:.0f} s 内没有算完')
-            if proc.returncode != 0:
-                lines = err.decode(errors='replace').strip().splitlines()
-                raise RuntimeError(lines[-1] if lines else f'退出码 {proc.returncode}')
-            r = json.loads(out.decode().strip().splitlines()[-1])
-            if 'error' in r:
-                raise RuntimeError(r['error'])
+            pts = np.concatenate(scans).astype(np.float32)
+            how, near = 'map', ''
+            if area is not None:
+                how = 'area'
+                r = await self.globloc_run(grid, res, ox, oy, pts, circles=[area])
+            else:
+                guesses = self.autoloc_guesses(map_name, hints)
+                r = None
+                if guesses:
+                    try:
+                        rh = await self.globloc_run(grid, res, ox, oy, pts, circles=[g[:3] for g in guesses],
+                                                    min_score=AUTOLOC_HINT_SCORE, timeout=AUTOLOC_HINT_TIMEOUT)
+                    except Exception as e:
+                        rh = {'error': str(e)}
+                    names = '、'.join(dict.fromkeys(g[3] for g in guesses))
+                    if rh.get('ok'):
+                        r, how = rh, 'hint'
+                        g = min(guesses, key=lambda g: math.hypot(g[0] - rh['x'], g[1] - rh['y']))
+                        near = g[3]
+                    else:
+                        why = rh.get('error') or f"分数 {rh.get('score', 0):.2f}，次优/最优 {rh.get('ratio', 1):.2f}"
+                        n.event('INFO', f'自动定位：{names}附近没有可信结果（{why}，{time.monotonic() - t0:.1f} s），改搜整张地图')
+                if r is None:
+                    r = await self.globloc_run(grid, res, ox, oy, pts)
         except Exception as e:
             msg = f'自动定位失败：{e}'
             self.autoloc = {'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'map': n.map_current, 'msg': msg}
@@ -3122,16 +3304,13 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, msg
         finally:
             self.autoloc_busy = False
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
         took = time.monotonic() - t0
         map_name = n.map_current or map_name
         where = f"({r['x']:.2f}, {r['y']:.2f}, {math.degrees(r['th']):.0f}°)"
-        quality = f"分数 {r['score']:.2f}，次优/最优 {r['ratio']:.2f}，{took:.1f} s"
+        scope = f"，在{near}附近找到" if how == 'hint' else f"，只搜了指定的半径 {area[2]:.1f} m 范围".replace('.0 m', ' m') if how == 'area' else ''
+        quality = f"分数 {r['score']:.2f}，次优/最优 {r['ratio']:.2f}，{took:.1f} s{scope}"
         res_ = {k: r[k] for k in ('x', 'y', 'th', 'score', 'ratio', 'second_pose')}
+        res_['how'] = how
         # 只看栅格本身：启动时地图名（map_current）比栅格晚几秒才拿到，map_server 也可能重发同一张图
         now_raw = n.map_raw
         if n.map_ver != map_ver and (now_raw is None or now_raw[1:] != (res, ox, oy) or not np.array_equal(now_raw[0], grid)):
@@ -3150,6 +3329,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             why = '有多个相似位置，分不清' if ambiguous else '匹配分数太低（不在这张地图上，或环境变化太大）'
             left = AUTOLOC_MOVE_MAX - self.autoloc_moves
             hint = '可以点「移动后重试」，或手动给初始位置' if left > 0 else '请手动给初始位置'
+            if how == 'area':
+                why = f'在指定范围里{why}'
+                hint = '狗可能不在圈里：把圈画大一点重新指定，或点「自动定位」搜整张地图'
             msg = f'自动定位不可信，没有使用：{why}。最佳 {where}，{quality}。{hint}'
             self.autoloc = {'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'map': map_name, 'msg': msg, **res_}
             n.event('WARN', msg)
@@ -3157,6 +3339,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         n.publish_initial_pose(r['x'], r['y'], r['th'], fine=True)
         self.pose_set_t = time.monotonic()
         self.autoloc_reset()
+        self.remember_last_pose(map_name, (r['x'], r['y'], r['th']), force=True)
         if pair is not None:
             prev, sep, turn, dd, dth = pair
             quality += (f"；和前一次（分数 {prev['score']:.2f}，次优/最优 {prev['ratio']:.2f}）相隔 {sep:.2f} m / "
@@ -3167,6 +3350,132 @@ class Server(TaughtWeb, RT.RtabWeb):
         n.event('INFO', f'{msg}（{who}）')
         asyncio.ensure_future(self.clear_after_pose())
         return True, msg, res_
+
+    async def globloc_run(self, grid, res, ox, oy, pts, circles=None, min_score=None, timeout=AUTOLOC_TIMEOUT):
+        """跑一次 globloc.py 子进程，返回它的结果 dict；出错 / 超时抛 RuntimeError。"""
+        fd, path = tempfile.mkstemp(prefix='go2w_autoloc_', suffix='.npz')
+        os.close(fd)
+        try:
+            extra = {}
+            if circles:
+                extra['circles'] = np.array(circles, np.float64).reshape(-1, 3)
+            if min_score is not None:
+                extra['min_score'] = np.float64(min_score)
+            np.savez(path, grid=grid, res=res, origin=np.array([ox, oy]), pts=pts, **extra)
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
+            # nice：别和 FAST-LIO / AMCL 抢 CPU
+            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', sys.executable, script, path,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError(f'{timeout:.0f} s 内没有算完')
+            if proc.returncode != 0:
+                lines = err.decode(errors='replace').strip().splitlines()
+                raise RuntimeError(lines[-1] if lines else f'退出码 {proc.returncode}')
+            r = json.loads(out.decode().strip().splitlines()[-1])
+            if 'error' in r:
+                raise RuntimeError(r['error'])
+            return r
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+    def autoloc_area(self, a):
+        """网页 / 云端传来的 area {x, y, r} → (x, y, r)；不合法返回错误提示。"""
+        if not isinstance(a, dict) or not all(self._num(a.get(k)) for k in ('x', 'y', 'r')):
+            return '指定范围的格式不对（要 {x, y, r}，单位 m）'
+        r = min(max(float(a['r']), AUTOLOC_AREA_R[0]), AUTOLOC_AREA_R[1])
+        return float(a['x']), float(a['y']), r
+
+    def autoloc_hint_list(self, hints):
+        """网页带来的「狗可能在这儿」：[{x, y, label}]，最多 AUTOLOC_HINT_MAX 个，不合法的丢掉。"""
+        out = []
+        for h in (hints if isinstance(hints, list) else [])[:AUTOLOC_HINT_MAX]:
+            if isinstance(h, dict) and self._num(h.get('x')) and self._num(h.get('y')):
+                label = h.get('label') if isinstance(h.get('label'), str) else '任务站点'
+                out.append((float(h['x']), float(h['y']), label.strip()[:12] or '任务站点'))
+        return out
+
+    def autoloc_guesses(self, map_name, hints):
+        """先找哪几处：上次位置、停车点、任务站点。离得近（< 2 m）的合并。返回 [(x, y, r, 说明)]。"""
+        cands = []
+        last = self.last_poses().get(map_name) if map_name else None
+        if last:
+            cands.append((last['pose'][0], last['pose'][1], '上次位置'))
+        park = self.parkings().get(map_name) if map_name else None
+        if park:
+            cands.append((park['pose'][0], park['pose'][1], '停车点'))
+        cands += list(hints or [])
+        out = []
+        for x, y, label in cands:
+            if all(math.hypot(x - g[0], y - g[1]) >= 2.0 for g in out):
+                out.append((x, y, AUTOLOC_HINT_R, label))
+            if len(out) >= AUTOLOC_HINT_MAX:
+                break
+        return out
+
+    LAST_POSE_FILE = 'last_pose.json'
+
+    def last_poses(self):
+        """data/last_pose.json：每张图上最后一次定位正常时的位置 {'<map>': {'pose': [x, y, yaw], 't': unix}}。"""
+        if getattr(self, '_last_poses', None) is None:
+            try:
+                with open(os.path.join(DATA, self.LAST_POSE_FILE), encoding='utf-8') as f:
+                    raw = json.load(f)
+            except (OSError, ValueError):
+                raw = {}
+            self._last_poses = {}
+            for name, rec in (raw if isinstance(raw, dict) else {}).items():
+                pose = (rec or {}).get('pose') if isinstance(rec, dict) else None
+                if (isinstance(name, str) and isinstance(pose, list) and len(pose) == 3 and all(self._num(v) for v in pose)):
+                    self._last_poses[name] = {'pose': [float(v) for v in pose], 't': rec.get('t', 0)}
+            self._last_pose_w = {}
+        return self._last_poses
+
+    def remember_last_pose(self, map_name, pose, force=False):
+        """记下这张图上的最新位置（内存里随时更新，文件按 LAST_POSE_MOVE / LAST_POSE_EVERY 节流写）。"""
+        if not map_name or pose is None:
+            return
+        poses, now = self.last_poses(), time.monotonic()
+        old = poses.get(map_name)
+        moved = old is None or math.hypot(pose[0] - old['pose'][0], pose[1] - old['pose'][1]) >= LAST_POSE_MOVE
+        if not force and (not moved or now - self._last_pose_w.get(map_name, -1e9) < LAST_POSE_EVERY):
+            return
+        poses[map_name] = {'pose': [round(float(v), 3) for v in pose], 't': round(time.time())}
+        self._last_pose_w[map_name] = now
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            path = os.path.join(DATA, self.LAST_POSE_FILE)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(poses, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.node.get_logger().warn(f'记不住上次位置：{e!r}')
+
+    def track_last_pose(self):
+        """定位 / 导航在跑、匹配率正常时，把狗的位置记成这张图的「上次位置」（下次自动定位先在这附近找）。"""
+        n = self.node
+        m = n.map_current
+        if not m or n.match is None or n.match < LAST_POSE_MATCH or self.autoloc_busy:
+            return
+        # 刚启动、还没定过位时 AMCL 的位置是猜的（默认在原点），不能记：这次启动后自动定位成功或手动给过位置才算
+        if self.pose_set_t <= getattr(self, 'loc_started_t', 0.0):
+            return
+        if self.prof('navigation') != 'run' and self.prof('localization') != 'run':
+            return
+        p = n.lookup(BASE_FRAME)
+        if p is None or n.fixed != 'map':
+            return
+        self.remember_last_pose(m, p)
 
     def autoloc_scans(self):
         """能用来自动定位的 scan：站稳 AUTOLOC_SETTLE 秒之后收到的、静止的、最近 2 s 内的，至少 3 帧。
@@ -3394,6 +3703,171 @@ class Server(TaughtWeb, RT.RtabWeb):
         await asyncio.sleep(COSTMAP_REFILL)
         n.event('INFO', '出发前已清除代价地图里的旧障碍标记')
 
+    # ---------- 站点播报（11-25） ----------
+    @staticmethod
+    def point_seq(p, key='audio'):
+        """站点 key（audio = 到站 / audioLeave = 离开前）要播的 [(音频 id, 播前等几秒)]：
+        存的是一段（字符串）或几段（列表，元素是 id 字符串或 {id, wait}）。"""
+        v = p.get(key)
+        v = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+        out = []
+        for c in v:
+            cid, wait = (c.get('id'), c.get('wait', 0)) if isinstance(c, dict) else (c, 0)
+            if isinstance(cid, str) and cid:
+                out.append((cid, wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) and wait > 0 else 0))
+        return out
+
+    @staticmethod
+    def point_clips(p, key='audio'):
+        return [c for c, _ in Server.point_seq(p, key)]
+
+    def audio_used(self, clip):
+        return [f"任务「{r['name']}」第 {i} 站" for r in self.routes.values()
+                for i, p in enumerate(r['points'], 1)
+                if clip in self.point_clips(p, 'audio') + self.point_clips(p, 'audioLeave')]
+
+    def route_audio(self, route, i, key='audio'):
+        """到 / 经过第 i 站（key = audio）或离开第 i 站前（key = audioLeave）：这站选了音频就按顺序播。
+        后台播，播不出来只记日志，不影响任务。一口气补记好几站（Nav2 一次划掉几站）时只播最后一个配了音频的站。"""
+        clips = self.point_seq(route['record']['points'][i], key)
+        if not clips:
+            return
+        mark = route['audio'] = (i, key, object())
+
+        async def go():
+            await asyncio.sleep(0)
+            if route['audio'] is not mark:
+                return
+            name = route['record']['points'][i].get('name') or f'第 {i + 1} 站'
+            try:
+                ok, msg = await self.audio.play(
+                    clips, f"任务 {name}{'（离开前）' if key == 'audioLeave' else ''}", tag=route,
+                    valid=lambda: route['status'] in ('active', 'succeeded') and route['audio'] is mark)
+            except Exception as e:
+                ok, msg = False, repr(e)
+            if not ok:
+                self.node.event('WARN', f'{name}播报没播：{msg}')
+        t = asyncio.create_task(go())
+        self.pending.add(t)
+        t.add_done_callback(self.pending.discard)
+        route['audio_go'] = t
+
+    async def route_audio_wait(self, ws, route):
+        """等这趟任务自己发起的播报播完。被取消 / 急停返回 False；阻断条件照常生效；最多等 ROUTE_AUDIO_WAIT s。"""
+        end = time.monotonic() + ROUTE_AUDIO_WAIT
+        while True:
+            if route['stop'].is_set():
+                return False
+            t = route.get('audio_go')
+            if (t is None or t.done()) and not self.audio.busy(route):
+                return True
+            if time.monotonic() > end:
+                self.node.event('WARN', f'播报 {ROUTE_AUDIO_WAIT:.0f} s 还没播完，不等了，继续任务')
+                return True
+            reason = self.route_blocker(ws, route['record'])
+            if reason:
+                raise RuntimeError(f'播报中：{reason}')
+            try:
+                await asyncio.wait_for(route['stop'].wait(), 0.2)
+                return False
+            except asyncio.TimeoutError:
+                pass
+
+    async def route_leave(self, ws, route, i):
+        """离开第 i 站前：配了「离开前播报」就先等到站那几段播完，再播离开前的，播完再走。被取消返回 False。
+        11-26：设了停留的站，停留结束时到站播报（含每段前的延时）还没播完，也等播完再走，不边走边播。"""
+        p = route['record']['points'][i]
+        leave = bool(self.point_clips(p, 'audioLeave'))
+        if not leave:
+            if not (p.get('dwell') and self.point_clips(p, 'audio')):
+                return True
+            go = route.get('audio_go')
+            if not (self.audio.busy(route) or (go is not None and not go.done())):
+                return True
+        if not leave:
+            self.node.event('INFO', f"{p.get('name') or f'第 {i + 1} 站'}停留结束，到站播报还没播完，播完再走")
+        route['speaking'] = True
+        try:
+            if not await self.route_audio_wait(ws, route):
+                return False
+            if not leave:
+                return True
+            self.route_audio(route, i, 'audioLeave')
+            return await self.route_audio_wait(ws, route)
+        finally:
+            route['speaking'] = False
+
+    def clip_names(self, p, key):
+        names = [(self.audio.items.get(c) or {}).get('name') for c in self.point_clips(p, key)]
+        return '、'.join(x for x in names if x) or None
+
+    async def route_climb_set(self, route, on):
+        if not on and not route.get('climb_touched'):
+            return
+        if on and (route['stop'].is_set() or self.estop):
+            raise RuntimeError('任务已停止，未切换爬台模式')
+        route['climb_touched'] = True
+        ok, message = self.set_climb(None,on)
+        if not ok:
+            raise RuntimeError(message)
+        if not on:
+            route['climb_touched'] = False
+
+    async def route_crossing_set(self, route, active):
+        critic_enabled = not active  # 强制跨越时关闭障碍评分，退出时恢复正常避障。
+        if active:
+            route['crossing_dirty'] = True  # 失败或超时仍可能已写入，退出时必须尝试恢复避障
+            self.crossing_dirty = True
+        try:
+            if active:
+                await self.route_climb_set(route, True)
+                if route['stop'].is_set() or self.estop:
+                    raise RuntimeError('任务已停止，未继续关闭避障评分')
+                await self.obstacles_critic.apply(False)
+            else:
+                results = await asyncio.gather(self.route_climb_set(route,False),
+                                               self.obstacles_critic.apply(True),return_exceptions=True)
+                errors = [r.text if isinstance(r,web.HTTPException) else str(r) for r in results if isinstance(r,Exception)]
+                if errors:
+                    raise RuntimeError('；'.join(errors))
+        except Exception as e:
+            detail = e.text if isinstance(e, web.HTTPException) else str(e)
+            raise RuntimeError(f'强制跨越{"开启" if active else "关闭"}失败：{detail}') from e
+        route['crossing_dirty'] = active
+        self.crossing_dirty = active
+        self.node.event('INFO', f'强制跨越{"开启" if active else "关闭"}：FollowPath.ObstaclesCritic.enabled='
+                               f'{str(critic_enabled).lower()}，voxel_layer.enabled={str(critic_enabled).lower()}（ROS 命令成功）')
+        try:
+            await asyncio.wait_for(route['stop'].wait(), ROUTE_CROSSING_SETTLE)
+        except asyncio.TimeoutError:
+            pass
+
+    async def route_crossing_arrived(self, route, state):
+        bounds = route.get('crossing')
+        if not bounds:
+            return
+        i, loop, back = state
+        if i == bounds[1]:
+            await self.route_crossing_set(route, False)
+        elif i == bounds[0] and self.route_next(len(route['record']['points']), route['loops'], state):
+            # 循环最后一次回到起点后任务结束，不再次开启。
+            await self.route_crossing_set(route, True)
+
+    async def cancel_route_goal(self, route):
+        handle = route.get('pending_goal')
+        if handle is None:
+            return
+        await self.aw(handle.cancel_goal_async(), 2.0)
+        result = route.get('pending_result')
+        if result is not None:
+            await self.aw(result, 2.0)
+        with self.node.lock:
+            goal = self.node.goal
+            if goal and goal['id'] == bytes(handle.goal_id.uuid) and goal.get('passed'):
+                goal.update(status='canceled', end=time.monotonic())
+        route.pop('pending_goal', None)
+        route.pop('pending_result', None)
+
     def through_passed(self, ws, route, seg, k):
         """连续通过：seg 里第 k 站经过了。记进度、写断点，下一站成为当前目标。"""
         n, points = self.node, route['record']['points']
@@ -3406,6 +3880,31 @@ class Server(TaughtWeb, RT.RtabWeb):
         reason = self.route_blocker(ws, route['record'])
         if reason:
             raise RuntimeError(reason)
+        self.route_audio(route, i)
+
+    @staticmethod
+    def route_leg_vmax(route, state):
+        points = route['record']['points']
+        ceiling = route.get('vmax', Server.route_opts(route['record'].get('opts'))['vmax'])
+        i, _, back = state
+        endpoints = [points[i]]
+        if i > 0:
+            endpoints.append(points[i - 1])
+        elif back:
+            endpoints.append(points[-1])
+        return min(ceiling, *(p.get('vmax', ceiling) for p in endpoints))
+
+    async def apply_route_vmax(self, speed):
+        n = self.node
+        if n.params.get('vmax') is not None and abs(n.params['vmax'] - speed) < 1e-6:
+            return
+        if not n.pset_cli.service_is_ready():
+            raise RuntimeError('cmd_bridge 不可用，站间限速未生效')
+        result = await self.aw(n.set_param('vmax', speed), 2.0)
+        if not result.results[0].successful:
+            raise RuntimeError(f'站间限速未生效：{result.results[0].reason}')
+        n.params['vmax'] = float(speed)
+        n.event('INFO', f'导航站间限速 = {speed:.2f} m/s')
 
     async def run_through(self, ws, route, state):
         """连续通过（v1.1.11）：从 state 起一段一段跑。返回 None = 全部跑完；'stop' = 被取消（已处理）；
@@ -3423,18 +3922,33 @@ class Server(TaughtWeb, RT.RtabWeb):
                 return 'stop'
             # 这一段：从 state 起，到停留站 / 终点 / ROUTE_SEG_MAX 站为止
             seg, s = [], state
+            speed = self.route_leg_vmax(route, state)
             while s:
+                if seg and abs(self.route_leg_vmax(route, s) - speed) > 1e-6:
+                    break  # 不同限速的站间段分别下发，低速段不等导航反馈才生效。
                 i, loop, back = s
                 nxt = self.route_next(total, loops, s)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0
                 seg.append((s, self.route_pose(points, i, back), dwell, nxt))
-                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX:
+                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX or i in (route.get('crossing') or ()) or points[i].get('audioLeave'):
                     break
                 s = nxt
+            # 这段的终点就在狗旁边（环线回到出发位置）：控制器的 goal checker 只看路径终点，一开始就满足，
+            # 同一拍报到达、中间站一个没走（11-25 bag go2w-01_1125_114120）。终点先拿掉，这段跑到它前一站，
+            # 拿掉的站下一段再单独发（那时狗已经走远了）
+            here = n.lookup(BASE_FRAME) if n.fixed == 'map' else None
+            if here and len(seg) > 1:
+                cut = seg[-1]
+                while len(seg) > 1 and math.hypot(here[0] - seg[-1][1]['x'], here[1] - seg[-1][1]['y']) <= ROUTE_THROUGH_NEAR_END:
+                    seg.pop()
+                if seg[-1] is not cut:
+                    d = math.hypot(here[0] - cut[1]['x'], here[1] - cut[1]['y'])
+                    n.event('INFO', f'这段的终点第 {cut[0][0] + 1} 站离狗只有 {d:.2f} m（Nav2 会当场判到达），'
+                                    f'先跑到第 {seg[-1][0][0] + 1} 站，后面的站再单独发')
             poses = []
             for k, (_, pt, dwell, nxt) in enumerate(seg):
                 last = k == len(seg) - 1
-                if last and (dwell or nxt is None):
+                if last and (dwell or nxt is None or seg[k][0][0] in (route.get('crossing') or ()) or points[seg[k][0][0]].get('audioLeave')):
                     th = pt['th']                       # 要停下来的站：站点自己的朝向
                 else:                                   # 途经点 / 分段处：面向下一站
                     q = seg[k + 1][1] if not last else self.route_pose(points, nxt[0], nxt[2])
@@ -3443,6 +3957,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             i, loop, back = state
             route.update(index=i, loop=loop, back=back, target=seg[0][1], goal=None)
             self.resume_checkpoint(route)
+            reason = self.route_blocker(ws, record)
+            if reason:
+                raise RuntimeError(reason)
+            await self.apply_route_vmax(speed)
+            if route['stop'].is_set():
+                return 'stop'
             reason = self.route_blocker(ws, record)
             if reason:
                 raise RuntimeError(reason)
@@ -3458,12 +3978,15 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not handle.accepted:
                 n.event('WARN', 'Nav2 拒绝多点目标，这次按一站一站走')
                 return state
+            route['pending_goal'] = handle
+            route['pending_result'] = None
             if route['stop'].is_set():
                 await self.aw(handle.cancel_goal_async(), 2.0)
                 return 'stop'
             end = poses[-1]
             gid = bytes(handle.goal_id.uuid)
             result = n.track_goal(handle, end, 'route')
+            route['pending_result'] = result
             route['goal'] = dict(zip(('x', 'y', 'th'), end))
             a, b = seg[0][0], seg[-1][0]
             span = f'{a[0] + 1}' if len(seg) == 1 else f'{a[0] + 1}–{b[0] + 1}'
@@ -3471,7 +3994,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                             f"{'，到了停留' if seg[-1][2] else ''}")
             stop = asyncio.create_task(route['stop'].wait())
             done = asyncio.create_task(self.aw(result, 120.0 + length / 0.1))
-            k, planned, left = 0, False, None
+            k, planned, left, resend, passed_end = 0, False, None, False, False
+            last_state, end_pt, dwell, nxt = seg[-1]
+            start_xy = here[:2] if here and n.fixed == 'map' else None
             try:
                 while True:
                     await asyncio.wait((stop, done), timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
@@ -3494,9 +4019,27 @@ class Server(TaughtWeb, RT.RtabWeb):
                             break
                         self.through_passed(ws, route, seg, k)
                         k += 1
-                    if done.done():
+                    # 擦过去了（没进半径）但已经往下一站走了：算经过，从下一站重新下发，免得 Nav2 掉头回去找
+                    while k < len(seg) - 1 and here and n.fixed == 'map' and not done.done():
+                        prev = (seg[k - 1][1]['x'], seg[k - 1][1]['y']) if k else start_xy
+                        pt = seg[k][1]
+                        if not overtaken(here, prev, pt, seg[k + 1][1]):
+                            break
+                        d = math.hypot(here[0] - pt['x'], here[1] - pt['y'])
+                        n.event('INFO', f'第 {seg[k][0][0] + 1} 站从旁边 {d:.2f} m 擦过、已经往下一站走了，算经过')
+                        self.through_passed(ws, route, seg, k)
+                        k += 1
+                        resend = not (left is not None and len(seg) - left >= k)   # Nav2 也划掉了就不用重发
+                    if nxt is not None and k == len(seg) - 1 and here and n.fixed == 'map':
+                        q = self.route_pose(points, nxt[0], nxt[2])
+                        prev = (seg[k - 1][1]['x'], seg[k - 1][1]['y']) if k else start_xy
+                        passed_end = (math.hypot(here[0] - end_pt['x'], here[1] - end_pt['y']) <= ROUTE_THROUGH_PASS
+                                      or overtaken(here, prev, end_pt, q))
+                        if done.done() and done.result().status == GoalStatus.STATUS_CANCELED:
+                            passed_end = False
+                    if passed_end or resend or done.done():
                         break
-                status = done.result().status
+                status = GoalStatus.STATUS_SUCCEEDED if passed_end else None if resend else done.result().status
             except asyncio.TimeoutError:
                 await self.aw(handle.cancel_goal_async(), 2.0)
                 raise RuntimeError('等待到点超时') from None
@@ -3512,6 +4055,21 @@ class Server(TaughtWeb, RT.RtabWeb):
                 await asyncio.gather(stop, done, return_exceptions=True)
             if route['stop'].is_set():
                 return 'stop'
+            if passed_end:
+                with n.lock:
+                    if n.goal and n.goal['id'] == gid:
+                        n.goal['passed'] = True
+                        n.goal.update(status='succeeded', end=time.monotonic())
+                n.event('INFO', f'经过分段末点第 {last_state[0] + 1} 站，不等待 Nav2 成功')
+            elif not resend:
+                route['pending_goal'] = None
+            if resend and not passed_end:   # 旧目标留给新目标顶替（Nav2 会 abort 它，标 passed 后不算失败），不先取消 = 不停车
+                with n.lock:
+                    if n.goal and n.goal['id'] == gid:
+                        n.goal['passed'] = True
+                n.event('INFO', f'从第 {seg[k][0][0] + 1} 站起重新下发，不回头')
+                state = seg[k][0]
+                continue
             if status == GoalStatus.STATUS_CANCELED:
                 self.finish_route(route, 'canceled', f'第 {route["index"] + 1} 点已取消')
                 return 'stop'
@@ -3519,12 +4077,13 @@ class Server(TaughtWeb, RT.RtabWeb):
                 # 一点反馈都没有就放弃了：多半是行为树没加载上（navigation.log 里有 BT 报错）
                 n.event('WARN', '多点导航一开始就失败（行为树没加载上？看 navigation.log），这次按一站一站走')
                 return seg[k][0]
-            last_state, end_pt, dwell, nxt = seg[-1]
             here = n.lookup(BASE_FRAME)
             off = math.hypot(here[0] - end[0], here[1] - end[1]) if here and n.fixed == 'map' else None
+            if last_state[0] in (route.get('crossing') or ()) and off is None:
+                raise RuntimeError('无法确认强制跨越边界点的实际位置')
             # Nav2 报整段到了，但中间还有站狗没经过、Nav2 也没划掉（剩余点数还多于 1）：中间站不能白送，按假到达处理
             skipped = status == GoalStatus.STATUS_SUCCEEDED and k < len(seg) - 1 and not (left is not None and left <= 1)
-            if status == GoalStatus.STATUS_SUCCEEDED and ((off is not None and off > ROUTE_FAKE_ARRIVE) or skipped):
+            if not passed_end and status == GoalStatus.STATUS_SUCCEEDED and ((off is not None and off > ROUTE_FAKE_ARRIVE) or skipped):
                 cur = seg[k][0]
                 fake = fake + 1 if fake_state == cur else 1
                 fake_state = cur
@@ -3535,13 +4094,19 @@ class Server(TaughtWeb, RT.RtabWeb):
                 state = cur
                 continue
             if status != GoalStatus.STATUS_SUCCEEDED:
-                if k < len(seg) - 1 or off is None or off > ROUTE_ARRIVE_TOL:
-                    raise RuntimeError('Nav2 未能到达' + (f'（离第 {last_state[0] + 1} 站 {off:.2f} m）' if off is not None else ''))
-                n.event('WARN', f'第 {last_state[0] + 1} 站未精确到达（偏差 {off:.2f} m），视为已到')
+                raise RuntimeError('Nav2 未能到达' + (f'（离第 {last_state[0] + 1} 站 {off:.2f} m）' if off is not None else ''))
             while k < len(seg) - 1:   # Nav2 到了终点：中间没来得及记的站都算经过
                 self.through_passed(ws, route, seg, k)
                 k += 1
+            await self.route_crossing_arrived(route, last_state)
+            if route['stop'].is_set():
+                return 'stop'
+            self.route_audio(route, last_state[0])
+            if passed_end and (dwell or points[last_state[0]].get('audioLeave')):
+                await self.cancel_route_goal(route)
             if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
+                return 'stop'
+            if not await self.route_leave(ws, route, last_state[0]):
                 return 'stop'
             route['done'] += 1
             state = nxt
@@ -3571,7 +4136,25 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     async def run_route(self, ws, route):
         n, record = self.node, route['record']
+        async def cancel_on_stop():
+            await route['stop'].wait()
+            handle = route.get('pending_goal')
+            if handle is not None:
+                try:
+                    await self.aw(handle.cancel_goal_async(), 2.0)
+                except Exception as e:
+                    n.event('ERROR', f'取消分段导航目标失败：{e}')
+        stop_watch = asyncio.create_task(cancel_on_stop())
+        selected = [i for i, p in enumerate(record['points']) if p.get('forceCrossing')]
+        route['crossing'] = (selected[0], selected[-1]) if selected else None
         try:
+            # 从头出发先恢复正常避障，断点所在区间在下方单独恢复。
+            if route['resume'] is None or getattr(self, 'crossing_dirty', False):
+                route['crossing_dirty'] = True
+                self.crossing_dirty = True
+                await self.route_crossing_set(route, False)
+                if route['stop'].is_set():
+                    return
             await self.clear_before_start()
             if route['stop'].is_set():
                 return
@@ -3581,11 +4164,21 @@ class Server(TaughtWeb, RT.RtabWeb):
             start = dict(zip(('x', 'y', 'th'), pos))
             points, loops = record['points'], route['loops']
             first = route['resume'] or (0, 1, False)
+            if route['resume'] and route['crossing'] and not first[2] and route['crossing'][0] < first[0] <= route['crossing'][1]:
+                await self.route_crossing_set(route, True)
+                if route['stop'].is_set():
+                    return
             near = math.hypot(start['x'] - points[0]['x'], start['y'] - points[0]['y'])
             if route['resume'] is None and near < ROUTE_NEAR_START:
-                if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
+                await self.route_crossing_arrived(route, first)
+                if route['stop'].is_set():
+                    return
+                self.route_audio(route, 0)
+                if points[0].get('dwell') or points[0].get('audioLeave'):   # 第 1 站要停留 / 离开前播报：人已经在这了，原地停够、播完再走
                     route.update(index=0, target=points[0])
-                    if not await self.route_dwell(ws, route, 0, points[0]['dwell']):
+                    if points[0].get('dwell') and not await self.route_dwell(ws, route, 0, points[0]['dwell']):
+                        return
+                    if not await self.route_leave(ws, route, 0):
                         return
                 first = self.route_next(len(points), loops, first)
                 route['done'] = 1
@@ -3601,6 +4194,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 else:
                     n.event('WARN', '导航没有多点导航服务（navigate_through_poses），这次按一站一站走')
             if state:
+                # 两个 action 服务不能互相顶替；回退前必须确认旧多点目标结束。
+                await self.cancel_route_goal(route)
                 route['through'] = False   # 退回一站一站走
             prev = None   # 上一站被不停车经过时它的 Nav2 目标：下一站没发出去就要取消它，免得狗自己走到那站
             fake, fake_state = 0, None   # 假到达重发次数（同一站连续计数）
@@ -3612,25 +4207,35 @@ class Server(TaughtWeb, RT.RtabWeb):
                 route.update(index=i, loop=loop, back=back, target=point, goal=None)
                 self.resume_checkpoint(route)   # 每站出发前写盘：网页服务突然停了也知道跑到哪了
                 reason = self.route_blocker(ws, record)
+                if not reason:
+                    try:
+                        await self.apply_route_vmax(self.route_leg_vmax(route, state))
+                    except Exception:
+                        if prev is not None:
+                            await self.aw(prev.cancel_goal_async(), 2.0)
+                        raise
+                    if route['stop'].is_set():
+                        return
+                    reason = self.route_blocker(ws, record)
                 if reason:
                     if prev is not None:
                         await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError(reason)
                 nxt = self.route_next(len(points), loops, state)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0   # 终点停不停留都一样
-                passing = nxt is not None and not dwell   # 后面还有站：不停车经过，朝向面向下一站；要停留的站照常停稳
+                leave = bool(points[i].get('audioLeave'))   # 离开前要播报：像停留站一样停下，播完再走（终点 / 回到起点也播）
+                passing = nxt is not None
                 if passing:
                     q = self.route_pose(points, nxt[0], nxt[2])
+                if (passing and not dwell and not leave and i not in (route['crossing'] or ()) and
+                        abs(self.route_leg_vmax(route, state) - self.route_leg_vmax(route, nxt)) < 1e-6):
                     pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
                 else:
                     pose = (point['x'], point['y'], point['th'])
                 here = n.lookup(BASE_FRAME)
                 # 提前量不超过这段路的一半：站挨得近时（< 1.2 m）不会一过上一站就把这一站也算过了
                 pass_dist = min(ROUTE_PASS_DIST, 0.5 * math.hypot(here[0] - pose[0], here[1] - pose[1])) if here else 0.0
-                if passing and here:   # 拐角 = 来的方向（当前位置 → 本站）和去的方向（本站 → 下一站）的夹角
-                    turn = pose[2] - math.atan2(pose[1] - here[1], pose[0] - here[0])
-                    if abs(math.atan2(math.sin(turn), math.cos(turn))) > ROUTE_PASS_TURN:
-                        passing = False   # 到点停下（朝向已经是面向下一站）
+                start_xy = here[:2] if here else None
                 request = n.send_goal(*pose)
                 try:
                     handle = await self.aw(request, 3.0)
@@ -3642,10 +4247,13 @@ class Server(TaughtWeb, RT.RtabWeb):
                         await self.aw(prev.cancel_goal_async(), 2.0)
                     raise RuntimeError('Nav2 拒绝目标')
                 prev = None
+                route['pending_goal'] = handle
+                route['pending_result'] = None
                 if route['stop'].is_set():
                     await self.aw(handle.cancel_goal_async(), 2.0)
                     return
                 result = n.track_goal(handle, pose, 'route')
+                route['pending_result'] = result
                 route['goal'] = dict(zip(('x', 'y', 'th'), pose))
                 stop = asyncio.create_task(route['stop'].wait())
                 done = asyncio.create_task(self.aw(result, 180.0))
@@ -3656,11 +4264,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                                            return_when=asyncio.FIRST_COMPLETED)
                         if route['stop'].is_set():
                             return
-                        if done.done():
-                            break
                         here = n.lookup(BASE_FRAME)
-                        if here and n.fixed == 'map' and math.hypot(here[0] - pose[0], here[1] - pose[1]) < pass_dist:
+                        if passing and here and n.fixed == 'map' and (math.hypot(here[0] - pose[0], here[1] - pose[1]) <= pass_dist
+                                or overtaken(here, start_xy, point, q)) and not (done.done() and done.result().status == GoalStatus.STATUS_CANCELED):
                             passed = True
+                            break
+                        if done.done():
                             break
                     if passed:   # passing 为 False 时不会走到这里
                         with n.lock:
@@ -3668,14 +4277,16 @@ class Server(TaughtWeb, RT.RtabWeb):
                             if g is not None and g['id'] == bytes(handle.goal_id.uuid):
                                 g['passed'] = True
                                 g['status'], g['end'] = 'succeeded', time.monotonic()
-                                t_leg = g['nav_time'] or (g['end'] - g['t0'])
+                                t_leg = g.get('nav_time') or (g['end'] - g.get('t0', g['end']))
                             else:
                                 t_leg = 0.0
-                        n.event('INFO', f"经过第 {i + 1} 站 ({pose[0]:.2f}, {pose[1]:.2f})，用时 {t_leg:.1f} s，不停车前往下一站")
+                        n.event('INFO', f"经过第 {i + 1} 站 ({pose[0]:.2f}, {pose[1]:.2f})，用时 {t_leg:.1f} s，"
+                                        f"{'准备停留' if dwell else '准备播报' if leave else '继续下一站'}")
                         status = GoalStatus.STATUS_SUCCEEDED
                         prev = handle
                     else:
                         status = done.result().status
+                        route['pending_goal'] = None
                 except asyncio.TimeoutError:
                     await self.aw(handle.cancel_goal_async(), 2.0)
                     raise RuntimeError('等待到点超时') from None
@@ -3691,6 +4302,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if status == GoalStatus.STATUS_SUCCEEDED and not passed:
                     here = n.lookup(BASE_FRAME)
                     off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
+                    if i in (route['crossing'] or ()) and off is None:
+                        raise RuntimeError('无法确认强制跨越边界点的实际位置')
                     if off is not None and off > ROUTE_FAKE_ARRIVE:
                         fake = fake + 1 if fake_state == state else 1
                         fake_state = state
@@ -3701,10 +4314,17 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if status != GoalStatus.STATUS_SUCCEEDED:
                     here = n.lookup(BASE_FRAME)
                     off = math.hypot(here[0] - pose[0], here[1] - pose[1]) if here and n.fixed == 'map' else None
-                    if off is None or off > ROUTE_ARRIVE_TOL:
-                        raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
-                    n.event('WARN', f'第 {i + 1} 站未精确到达（偏差 {off:.2f} m），视为已到，继续下一站')
+                    raise RuntimeError('Nav2 未能到达' + (f'（离目标 {off:.2f} m）' if off is not None else ''))
+                await self.route_crossing_arrived(route, state)
+                if route['stop'].is_set():
+                    return
+                self.route_audio(route, i)
+                if passed and (dwell or leave):
+                    await self.cancel_route_goal(route)
+                    prev = None
                 if dwell and not await self.route_dwell(ws, route, i, dwell):
+                    return
+                if not await self.route_leave(ws, route, i):
                     return
                 route['done'] += 1
                 state = self.route_next(len(points), loops, state)
@@ -3714,6 +4334,26 @@ class Server(TaughtWeb, RT.RtabWeb):
                 self.finish_route(route, 'aborted', f'第 {route["index"] + 1} 点失败：{e}')
             else:
                 n.event('ERROR', f'多点任务停止时出错：{e}')
+        finally:
+            if not route['stop'].is_set():
+                stop_watch.cancel()
+            await asyncio.gather(stop_watch, return_exceptions=True)
+            try:
+                await self.cancel_route_goal(route)
+            except Exception as e:
+                n.event('ERROR', f'分段衔接未完成，取消旧导航目标失败：{e}')
+            if route.get('crossing_dirty'):
+                try:
+                    await self.route_crossing_set(route, False)
+                except Exception as e:
+                    message = f'强制跨越恢复失败：{e}；请核对机器人参数后再出发'
+                    route['message'] = f'{route.get("message", "")}；{message}'
+                    n.event('ERROR', message)
+            if route['status'] == 'succeeded':
+                try:
+                    await self.apply_route_vmax(route.get('vmax', self.route_opts(record.get('opts'))['vmax']))
+                except Exception as e:
+                    n.event('WARN', f'任务结束后恢复最大 vx 失败：{e}')
 
     def task(self):
         goal, route = self.node.task(), self.route
@@ -3735,6 +4375,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             phase = 'checking' if route['checking'] else leg['phase'] if leg.get('status') == 'active' else 'plan'
             if route.get('dwell_until'):
                 phase = 'dwell'
+            elif route.get('speaking'):
+                phase = 'speak'   # 11-25 离开前播报中，播完再走
         n, loops = len(record['points']), route['loops']
         if status == 'succeeded':
             progress = 1.0
@@ -3755,6 +4397,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                 # 停留中：还剩几秒（11-24）；不在停留就是 null
                 'dwellLeft': max(0.0, route['dwell_until'] - time.monotonic()) if route.get('dwell_until') else None,
                 'pointDwell': record['points'][i].get('dwell', 0),
+                # 这站的播报音频名（几段用「、」连起来），没有 = null；pointAudioLeave = 离开前播的
+                'pointAudio': self.clip_names(record['points'][i], 'audio'),
+                'pointAudioLeave': self.clip_names(record['points'][i], 'audioLeave'),
                 'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------
@@ -3918,8 +4563,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             # 正在录的那个不能删：网页启动的记得名字；后端重启过或者不是网页启动的，保险起见最新的一个也不让删
             if name in self.recording_names():
                 return False, f'{name} 正在录制，先停止录包再删'
-        if self.uploads.get(name, {}).get('state') == 'run':
-            return False, f'{name} 正在上传，等上传完再删'
+        if self.uploads.get(name, {}).get('state') in ('queued', 'run'):
+            return False, f'{name} 已排队或正在上传，等上传完再删'
         path = os.path.join(bags_dir, name)
         if os.path.realpath(os.path.dirname(path)) != os.path.realpath(bags_dir):
             return False, '包名不对'
@@ -4197,10 +4842,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             await asyncio.sleep(1.0)
         for rid in p['ids']:
             L.set_bag(rid, 'saving')
-        labels = '、'.join(dict.fromkeys(r['label'] for r in map(L.get, p['ids']) if r))
+        records = [r for r in map(L.get, p['ids']) if r]
+        labels = '、'.join(dict.fromkeys(r['label'] for r in records))
         try:
             # 起点固定在第一条异常前 STUCK_BEFORE 秒；等手动保存多过去的秒数也算进去
-            ok, msg = await self.rollback_save(f'异常自动保存：{labels}', STUCK_BEFORE + time.monotonic() - p['t0'])
+            ok, msg = await self.rollback_save(f'异常自动保存：{labels}', STUCK_BEFORE + time.monotonic() - p['t0'],
+                                               incident_types={r['type'] for r in records})
         except Exception as e:
             ok, msg = False, f'{e!r}'
         name = self.rollback_last if ok else None
@@ -4235,8 +4882,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False),
                                  headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'})
 
-    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None, voice_seconds=None):
-        """trigger：人在网页上点「保存刚才 N 秒」→ 包名 狗编号_trigger_MMDD_HHMMSS；异常自动保存不带（11-24）。"""
+    async def rollback_save(self, who, seconds=ROLLBACK_SECONDS, trigger=False, after=0, request_id=None, voice_seconds=None, incident_types=()):
+        """手动包带 trigger；自动包按 incident_types 添加 longstop/navfail 原因标签。"""
         if not (self.procs_status or {}).get('rollback'):
             return False, '回溯录制没在运行：先打开回溯，并启动建图 / 定位 / 导航'
         if self.rollback_saving:
@@ -4248,7 +4895,9 @@ class Server(TaughtWeb, RT.RtabWeb):
         work = os.path.join(bags_dir, '.rollback')
         # 和分段录包同一个前缀，同一秒可能撞名：已有的包、正在录的段、正在存的回溯都避开，撞了加 _2
         rid = robot_id()[0]
-        base = time.strftime(f"{rid}{'_trigger' if trigger else ''}_%m%d_%H%M%S")
+        reasons = ''.join('_' + tag for typ, tag in (('stuck', 'longstop'), ('nav_fail', 'navfail'))
+                          if typ in incident_types)
+        base = time.strftime(f"{rid}{'_trigger' if trigger else reasons}_%m%d_%H%M%S")
         if after:
             base += '_r'  # 独立后缀避免收集后10秒期间与普通分段同名。
         def capture_name(suffix=''):
@@ -4318,6 +4967,20 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.rollback_saving = False
 
+    def bag_source_fingerprint(self, name):
+        root = os.path.join(DATA, 'bags', name)
+        files = []
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and not os.path.islink(os.path.join(folder, d))]
+            for filename in names:
+                path = os.path.join(folder, filename)
+                relative = os.path.relpath(path, root)
+                if filename.startswith('.') or relative == 'recording-link.json' or os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                files.append((relative, st.st_size, st.st_mtime_ns))
+        return hashlib.sha256(json.dumps(sorted(files)).encode()).hexdigest()
+
     def restore_upload_receipts(self):
         try:
             with open(self.uploads_file) as f:
@@ -4326,6 +4989,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if not isinstance(name, str) or not P.SAFE_NAME.fullmatch(name):
                     continue
                 bag = os.path.join(DATA, 'bags', name)
+                stale_reason = '录包关联信息已变化，请核对并补齐'
                 if isinstance(value, dict):
                     fingerprint = value.get('bundle_fingerprint')
                     try:
@@ -4334,21 +4998,32 @@ class Server(TaughtWeb, RT.RtabWeb):
                     except OSError:
                         current = None
                     done = bool(fingerprint and fingerprint == current)
+                    if value.get('upload_target') != UPLOAD_DEST:
+                        done = False
+                        stale_reason = '上传目标已变化或旧回执未记录目标，请核对当前服务器'
+                    if done:
+                        try:
+                            done = bool(value.get('source_fingerprint') and value['source_fingerprint'] == self.bag_source_fingerprint(name))
+                        except OSError:
+                            done = False
+                        if not done:
+                            stale_reason = '录包内容已变化或旧回执不完整，请重新核对'
                     msg = value.get('msg', '')
                 elif isinstance(value, str):
                     fingerprint, msg = None, value
-                    done = not any(os.path.exists(os.path.join(bag, fn)) for fn in ('voice-note.audio', 'voice-note.json', 'capture.json'))
-                    done = done and not os.path.exists(os.path.join(DATA, 'bags', '.captures', 'by-name', name + '.json'))
+                    done = False
+                    stale_reason = '旧上传回执未记录目标，请核对当前服务器'
                 else:
                     continue
                 self.uploads[name] = {'state': 'done' if done else 'stale', 'pct': 100 if done else 0,
-                                      'msg': msg if done else '旧上传回执未核对数据与录音，请重新上传整包',
-                                      **({'bundle_fingerprint': fingerprint} if fingerprint else {})}
+                                      'msg': msg if done else stale_reason,
+                                      **({'bundle_fingerprint': fingerprint} if fingerprint else {}),
+                                      **({key: value[key] for key in ('upload_target', 'source_fingerprint') if key in value} if isinstance(value, dict) else {})}
         except (OSError, ValueError, AttributeError):
             pass
 
     def save_upload_receipts(self):
-        done = {k: {'msg': u['msg'], 'bundle_fingerprint': u['bundle_fingerprint']} if u.get('bundle_fingerprint') else u['msg']
+        done = {k: {key: u[key] for key in ('msg', 'bundle_fingerprint', 'upload_target', 'source_fingerprint') if key in u} if u.get('bundle_fingerprint') else u['msg']
                 for k, u in self.uploads.items() if u['state'] == 'done'}
         try:
             with open(self.uploads_file, 'w') as f:
@@ -4358,11 +5033,11 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     def bag_content_changed(self, name):
         if self.uploads.get(name, {}).get('state') == 'done':
-            self.uploads[name] = {'state': 'stale', 'pct': 0, 'msg': '语音备注已更新，请重新上传整包'}
+            self.uploads[name] = {'state': 'stale', 'pct': 0, 'msg': '语音备注已更新，请核对并补齐录包'}
             self.save_upload_receipts()
 
-    async def bag_upload(self, name, who):
-        """rsync 把 data/bags/<name> 传到 166:~/go2w_bags/<name>。同一时间只传一个；进度和结果进网页日志。"""
+    async def bag_upload(self, name, who, *, verify=False):
+        """有效回执直接返回；显式核对时按原目录补齐，最多两个并行。"""
         if not name or not P.SAFE_NAME.match(name):
             return False, '包名不对'
         bags_dir = os.path.join(DATA, 'bags')
@@ -4373,15 +5048,30 @@ class Server(TaughtWeb, RT.RtabWeb):
         if self.prof('bag') != 'stop' or self.transitions.get('bag'):
             if name in self.recording_names():
                 return False, f'{name} 正在录制，先停止录包再上传'
-        busy = next((k for k, u in self.uploads.items() if u['state'] == 'run'), None)
-        if busy:
-            return False, f'正在上传 {busy}，等它传完'
+        if self.uploads.get(name, {}).get('state') in ('queued', 'run'):
+            return False, f'{name} 已排队或正在上传，请勿重复提交'
+        receipt = self.uploads.get(name, {})
+        if not verify and receipt.get('state') == 'done' and receipt.get('bundle_fingerprint') and receipt.get('upload_target') == UPLOAD_DEST:
+            try:
+                link = self.recording_api.bundle(name)
+                with open(os.path.join(bags_dir, name, 'recording-link.json'), 'rb') as stream:
+                    fingerprint = hashlib.sha256(stream.read()).hexdigest()
+                if (link is not None and fingerprint == receipt['bundle_fingerprint'] and
+                        receipt.get('source_fingerprint') == self.bag_source_fingerprint(name)):
+                    return True, f'{name} 已上传，无需重复上传'
+            except (OSError, web.HTTPException):
+                pass  # 回执不能证明当前整包仍一致时，按原流程重新核对。
         key = os.path.join(DATA, 'ssh', 'id_ed25519')
         if not os.path.exists(key) or not shutil.which('rsync') or not shutil.which('ssh'):
             return False, '扩展坞上缺上传工具：需要 data/ssh 密钥，以及镜像里的 rsync / ssh（重建 go2w-humble 镜像）'
-        self.uploads[name] = {'state': 'run', 'phase': 'waiting', 'pct': 0, 'msg': '等待语音备注后一起上传'}
-        asyncio.create_task(self.bag_upload_run(name, bag['size'], key, who))
-        return True, f'开始上传 {name} → {UPLOAD_LABEL}'
+        self.uploads[name] = {'state': 'queued', 'pct': 0, 'msg': '等待上传空位'}
+        asyncio.create_task(self.bag_upload_queued(name, bag['size'], key, who))
+        return True, f'已提交上传 {name} → {UPLOAD_LABEL}'
+
+    async def bag_upload_queued(self, name, size, key, who):
+        async with self.bag_upload_slots:
+            self.uploads[name] = {'state': 'run', 'phase': 'waiting', 'pct': 0, 'msg': '等待语音备注后一起上传'}
+            await self.bag_upload_run(name, size, key, who)
 
     async def bag_upload_run(self, name, size, key, who):
         n, t0 = self.node, time.monotonic()
@@ -4393,10 +5083,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             await self.recording_api.wait_bundle(name, BAG_VOICE_WAIT)
             with open(os.path.join(DATA, 'bags', name, 'recording-link.json'), 'rb') as f:
                 bundle_fingerprint = hashlib.sha256(f.read()).hexdigest()
+            source_fingerprint = self.bag_source_fingerprint(name)
             # 从此处到启动rsync之间不让语音文件再变动，避免目录扫描时漏掉后到的录音。
             self.uploads[name] = {'state': 'run', 'phase': 'sending', 'pct': 0, 'msg': '数据、录音与匹配信息一起上传'}
             p = await asyncio.create_subprocess_exec(
-                'rsync', '-rt', '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
+                'rsync', '-rt', '--compress', '--compress-choice=zstd', '--compress-level=1',
+                '--checksum', '--partial', '--info=progress2', '--no-inc-recursive', '-e', ssh,
                 os.path.join(DATA, 'bags', name), UPLOAD_DEST,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             buf = b''
@@ -4421,14 +5113,17 @@ class Server(TaughtWeb, RT.RtabWeb):
                     else:
                         tail.append(line)
             code = await p.wait()
+            if code == 0 and source_fingerprint != self.bag_source_fingerprint(name):
+                raise RuntimeError('同步期间录包内容发生变化，请重新核对')
         except Exception as e:
             code, tail = -1, deque([getattr(e, 'text', None) or str(e) or repr(e)])
         dt = time.monotonic() - t0
         if code == 0:
             msg = time.strftime('%m-%d %H:%M')
-            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg, 'bundle_fingerprint': bundle_fingerprint}
+            self.uploads[name] = {'state': 'done', 'pct': 100, 'msg': msg, 'bundle_fingerprint': bundle_fingerprint,
+                                  'upload_target': UPLOAD_DEST, 'source_fingerprint': source_fingerprint}
             self.save_upload_receipts()
-            n.event('INFO', f'已上传录包 {name} → {UPLOAD_LABEL}/{name}（{size:.0f} MB，用时 {dt:.0f} s）')
+            n.event('INFO', f'已上传录包 {name} → {UPLOAD_LABEL}/{name}（包总大小 {size:.0f} MB，同步用时 {dt:.1f} s）')
         else:
             why = ' | '.join(tail) or f'rsync 退出码 {code}'
             self.uploads[name] = {'state': 'fail', 'pct': last_pct, 'msg': why[-200:]}
@@ -5335,20 +6030,23 @@ class Server(TaughtWeb, RT.RtabWeb):
                 note += f'；{len(self.keepouts[name])} 个禁行区已带到新图'
             except (ValueError, OSError) as e:
                 note += f'；禁行区没能带到新图（{e}）'
+        # 11-25：原来是把原图的任务「改到」新图（原图上的任务就没了）。另存为是复制一份新图，
+        # 原图和它的任务都不该动 → 改成复制：新图得到一份新 id 的副本，原图任务原样保留
         if d.get('routes'):
-            if self.route_running():
-                note = '；有任务正在执行，路线没有改到新图'
-            else:
-                routes = {k: (dict(r, map=name) if r.get('map') == source else r) for k, r in self.routes.items()}
-                moved = sum(1 for k in routes if routes[k].get('map') != self.routes[k].get('map'))
-                if moved:
-                    try:
-                        self.write_routes(routes)
-                        await self.send_all(self.routes_message(), key='routes')
-                    except OSError as e:
-                        moved, note = 0, f'；路线没能改到新图（{e}）'
-        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务改到新图" if moved else ""}；{who}）')
-        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已改到新图' if moved else '') + note
+            copies = {}
+            for r in self.routes.values():
+                if r.get('map') == source:
+                    rid = uuid.uuid4().hex
+                    copies[rid] = dict(r, id=rid, map=name)
+            if copies:
+                try:
+                    self.write_routes({**self.routes, **copies})
+                    moved = len(copies)
+                    await self.send_all(self.routes_message(), key='routes')
+                except OSError as e:
+                    note = f'；任务没能复制到新图（{e}）'
+        self.node.event('INFO', f'地图编辑已保存：{name}（从 {source} 改了 {changed} 格{f"，{moved} 条任务复制到新图（原图任务保留）" if moved else ""}；{who}）')
+        return True, f'已保存 {name}：改了 {changed} 格' + (f'，{moved} 条任务已复制到新图（原图任务保留）' if moved else '') + note
 
     # ---------- 删除地图（11-18） ----------
     # 不是真删：<名字>.* 整套文件挪进 data/maps/.trash/<时间>_<名字>/，绑在这张图上的任务（routes.json）
@@ -5507,6 +6205,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.map_loading = False
         await self.keepout_apply(name, '切换地图')
+        self.loc_started_t = time.monotonic()   # 换图后要重新定过位才记「上次位置」
         n.event('WARN', f'已切换到地图 {name}：请重新设置初始位姿')
         return True, f'已切换到 {name}，请重新设置初始位姿'
 
@@ -5574,6 +6273,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if self.procs_status is not None or k == 1:
                     n.get_logger().warn(f'查不到进程状态（{e!r}），运行档位只按节点判断')
                 self.procs_status = None
+            await asyncio.to_thread(self.refresh_stand_targets)
             try:
                 await self.rollback_tick()
             except Exception as e:
@@ -5596,6 +6296,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if all(x in names for x in MODE_NODES[m]):
                     self.starting.pop(m); self.transitions.pop(m, None)
                     n.event('INFO', f'{self.MODE_NAME[m]}已启动')
+                    if m in ('localization', 'navigation'):
+                        self.loc_started_t = time.monotonic()   # 这之后定过位（pose_set_t 更新）才记「上次位置」
                     if AUTOLOC_ON_START and m in ('localization', 'navigation'):
                         self.background(self.auto_localize_on_start(m))
                 elif self.procs_status is not None and not self.procs_status.get(m) and age > 4:
@@ -5629,7 +6331,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             refuse = '示教正在定位自检，请保持静止'
         elif self.taught_open() and self.taught_owner is not None and self.taught_owner is not ws:
             refuse = '另一个网页正在进行示教采集'
-        elif self.route_running() or self.checking_route:
+        elif self.route_running() or getattr(self, 'route_starting', False) or self.checking_route:
             refuse = '多点任务或路线检查进行中，请先结束'
         else:
             refuse = '急停中' if self.estop else '底盘锁定中，先解锁' if not n.is_armed() else None
@@ -5686,6 +6388,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.tx_put(ws, self.labels_message(), 'labels')
             self.tx_put(ws, self.keepout_message(), 'keepout')
             self.tx_put(ws, self.incidents_message(), 'incidents')
+            self.tx_put(ws, self.audio.message(), 'audio')
             taught_map = (self._taught_capture or {}).get('map') or self.shown_map()
             if taught_map:
                 c['taught_map'] = taught_map
@@ -5736,8 +6439,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             self.clients.pop(ws, None)
             self.node.motor_fast = any(c.get('mfast') for c in self.clients.values())
             self.node.get_logger().info(f'client gone: {remote} ({len(self.clients)})')
-            if self.climb is not None and self.climb['ws'] is ws:
-                self.climb_off(f'开启爬台模式的网页断开（{remote}）')
             if ws is self.owner:
                 self.owner = None
                 await self.lose_owner(f'控制方网页断开（{remote}）', owner=ws)
@@ -5747,6 +6448,17 @@ class Server(TaughtWeb, RT.RtabWeb):
 
     async def lose_owner(self, reason, owner=None):
         n = self.node
+        auto = ((self.route_running() and self.route and self.route.get('status') == 'active') or n.nav_active())
+        # v1.6.1：爬台模式在 v1.6.0 起不绑定页面（强制跨越路段自动开），不再作为断网停车的理由
+        if (auto and not self.estop and self.teleop is None
+                and not self.autoloc_busy and self.ctrl_op != 'down'):
+            # v1.5.1：自动导航中网页断网不停车（11-25 手机 Wi-Fi 断 5 s 把巡逻叫停）。只记一笔，要停就重新打开网页点停止 / 急停
+            msg = f'{reason}：自动导航继续，不停车（重新打开网页可停止 / 急停）'
+            n.event('WARN', msg)
+            self.incident('link_lost', msg, task=self.incident_task(), bag=False)
+            if owner is not None:
+                await self.taught_owner_lost(owner, reason)
+            return
         if self.route_running() or n.is_armed() or n.nav_active():
             task = self.incident_task()      # 停车会结束任务：先取任务信息
             await self.disarm_and_cancel(reason)
@@ -5862,6 +6574,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                     self.incident('safety_stop', '急停期间底盘被别处解锁，已重新上锁')
                 if k % 50 == 0:
                     n.fetch_params()
+                if k % 20 == 7:
+                    self.track_last_pose()
             except Exception as e:  # 安全检查不能因为一次异常停掉
                 n.get_logger().error(f'safety: {e!r}')
 
@@ -5879,6 +6593,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             if not self.clients:
                 n.events.clear()
                 continue
+            if k % 10 == 0:
+                # 基础状态独立于地图、TF、Nav2和整包导航状态的生成。
+                sys_stats = self.sys.read()
+                await self.send_all(json.dumps({'t':'system', 'sys':sys_stats, **n.robot_feedback.view()}), key='system')
             try:
                 await self.send_all(json.dumps(n.pose()), key='pose')
                 if k % 2 == 0 and n.scan_ver != scan_ver:  # scan 最多 10 Hz
@@ -5901,7 +6619,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                         items.append(n.events.popleft())
                     await self.send_all(json.dumps({'t': 'logs', 'items': items}))
                 if k % 10 == 0:  # 状态 2 Hz
-                    st = n.state(self.sys.read(), self.procs_status, self.transitions)
+                    st = n.state(sys_stats, self.procs_status, self.transitions)
                     # mapCurrent = 网页上显示的地图（导航没开时是文件地图）；mapLive = 它来自 map_server，可以定位 / 规划
                     st.update(mapCurrent=self.shown_map(), mapLive=n.map_file is None and n.map_current is not None)
                     st.update(estop=self.estop, busy=self.busy, mapBusy=self.map_busy, maps=self.maps, bags=self.bags, uploads=self.uploads, mapChoice=self.map_choice,
@@ -5930,6 +6648,29 @@ class Server(TaughtWeb, RT.RtabWeb):
             except Exception as e:  # 别让一次异常停掉推送
                 n.get_logger().warn(f'broadcast: {e!r}')
 
+    async def push_audio(self, text):
+        await self.send_all(text, key='audio')
+
+    async def api_audio(self, req):
+        """上传一段音频（网页已转成 16 kHz 单声道 WAV）。要求自定义头：别的网站的表单 / 跨域请求带不上。"""
+        def bad(msg, status=400):
+            return web.json_response({'ok': False, 'msg': msg}, status=status)
+        remote = client_ip(req)
+        if req.headers.get('X-Go2w') != '1' or not self.audio.editable(remote):
+            return bad('这个入口不能上传音频', 403)
+        raw = bytearray()
+        async for chunk in req.content.iter_chunked(65536):
+            raw += chunk
+            if len(raw) > AU.BODY_MAX:
+                return bad(f'音频太长：最多 {AU.DUR_MAX:.0f} s', 413)
+        try:
+            x = await self.audio.add(req.query.get('name', ''), bytes(raw), remote)
+        except AU.AudioError as e:
+            return bad(str(e))
+        except OSError as e:
+            return bad(f'保存音频失败：{e.strerror or e}', 500)
+        return web.json_response({'ok': True, 'msg': f'已上传「{x["name"]}」', 'item': x})
+
     def app(self):
         @web.middleware
         async def no_cache(req, handler):  # 开发期改完前端直接刷新就生效
@@ -5942,8 +6683,11 @@ class Server(TaughtWeb, RT.RtabWeb):
         app.router.add_get('/version.json', lambda _r: web.FileResponse(os.path.join(self.static_dir, 'version.json')))
         app.router.add_get('/ws', self.ws)
         self.recording_api.routes(app)
+        self.cpu_details.routes(app)
+        self.obstacles_critic.routes(app)
         self.taught_routes(app)
         app.router.add_get('/api/incidents', self.api_incidents)
+        app.router.add_post('/api/audio', self.api_audio)
         for sub in ('css', 'js', 'img'):   # img/：机器人照片（可选，见 static/img/README.md）
             if os.path.isdir(os.path.join(self.static_dir, sub)):
                 app.router.add_static(f'/{sub}/', os.path.join(self.static_dir, sub))
@@ -5954,8 +6698,10 @@ class Server(TaughtWeb, RT.RtabWeb):
             a['tasks'] = [asyncio.create_task(self.broadcast()), asyncio.create_task(self.safety()),
                           asyncio.create_task(self.procs_poll()), asyncio.create_task(self.camera.monitor()),
                           asyncio.create_task(self.taught_loop())]
+            await self.audio.start()
 
         async def stop(a):
+            await self.audio.close()      # 正在播就退出喊话；要在 ctrl.close() 之前
             if self.taught_recording():
                 await self.disarm_and_cancel('网页服务关闭，示教草稿已保留')
             if self.route_running():
@@ -5968,8 +6714,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.to_thread(self.captures.close)
             await self.procs.close()
-            if self.ctrl is not None:
-                self.ctrl.close()
+            if self.robot_link is not None:
+                self.robot_link.close()
 
         async def close_clients(_a):
             # 停服时先主动关掉网页连接：aiohttp 优雅退出要等所有请求处理完（默认最多 60 s），

@@ -24,6 +24,7 @@ BAGS = os.path.join(os.environ.get('GO2W_DATA', '/go2w/data'), 'bags')
 SAFE_TOPIC = re.compile(r'^/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*$')
 SAFE_PREFIX = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,29}$')
 KEEP_DISTINCT = {'/tf_static': 8}   # 可能有多个发布者，各留一份；其余只发一次的 topic 留最新一条
+MCAP_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcap_writer.yaml')
 
 
 class Ring:
@@ -73,7 +74,8 @@ class Ring:
 
 def write_bag(path, records, types, writer_cls, storage_options, converter_options, topic_metadata):
     writer = writer_cls()
-    writer.open(storage_options(uri=path, storage_id='mcap'), converter_options('cdr', 'cdr'))
+    writer.open(storage_options(uri=path, storage_id='mcap', storage_config_uri=MCAP_CONFIG),
+                converter_options('cdr', 'cdr'))
     for topic in sorted({r[1] for r in records}):
         writer.create_topic(topic_metadata(topic, types[topic], 'cdr'))
     for t, topic, data in records:

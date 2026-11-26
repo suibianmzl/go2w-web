@@ -55,6 +55,22 @@ class RecordingAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outside.read_text(), 'original')
         self.assertFalse((self.bag/'voice-note.audio').exists())
 
+    async def test_missing_voice_reports_its_recorded_reason_and_cannot_play(self):
+        import json
+        (self.bag/'capture.json').write_text(json.dumps({'name':'go2w-test','voice':{
+            'state':'unavailable','reason':'HTTP access cannot use microphone'}}))
+        item=(await (await self.client.get('/api/recordings')).json())['items'][0]
+        self.assertIsNone(item['audio'])
+        self.assertEqual(item['voice_reason'],'HTTP access cannot use microphone')
+        self.assertEqual((await self.client.get('/api/recordings/go2w-test/audio')).status,404)
+
+    async def test_saved_voice_supports_browser_range_requests(self):
+        self.assertEqual((await self.upload()).status,201)
+        response=await self.client.get('/api/recordings/go2w-test/audio',headers={'Range':'bytes=4-19'})
+        self.assertEqual(response.status,206)
+        self.assertEqual(await response.read(),self.audio[4:20])
+        self.assertEqual(response.content_type,'audio/webm')
+
     async def test_request_id_finds_only_its_completed_bag(self):
         import json
         manifests = self.root/'bags/.captures'

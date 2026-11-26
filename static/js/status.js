@@ -1,6 +1,6 @@
 // 地图右上角的运行状态牌：一眼看出机器狗现在在干什么（11-12）。
 // 只从已有状态推出来（任务、出发流程、运控、各档位、急停、遥控），不需要后端额外数据。
-// 同时满足几个时取最上面的：急停 > 出发失败 > 准备出发 > 任务（恢复中 / 暂停 / 运行中）> 已到达 / 任务失败
+// 同时满足几个时取最上面的：急停 > 出发失败 > 准备出发 > 任务（暂停 / 运行中；Nav2 恢复动作也算运行中）> 已到达 / 任务失败
 //   > 遥控 > 建图 / 重定位 > 档位启停 > 待命 / 未就绪。
 // 颜色和地图上的小车一致：运行琥珀、到达绿、故障红。
 import { $, mapTitle } from './util.js';
@@ -43,7 +43,6 @@ export function setupRunState(store, actions, mapView){
         : T.type === 'external' ? '外部目标' : '单点导航';
       if (T.phase === 'checking') return ['run', '准备出发', '清除旧障碍…', true];
       if (T.paused) return ['warn', '已暂停', where];
-      if (T.phase === 'recover') return ['warn', '恢复中', `${where} · 后退 / 原地转`];
       if (!store.armed) return ['warn', '运行中', `${where} · 等待解锁`];
       return ['run', '运行中', where];
     }

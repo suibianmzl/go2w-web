@@ -35,9 +35,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   };
   const busyMsg = () => store.mapSaving || store.mapBusy ? '地图正在保存，请稍等' : store.busy ? '上一个启停还没完成，稍等几秒' : '';
   // 停车：取消任务 + 上锁（导航栈不动）
-  async function park(){
-    if (routeActive() || store.task.type !== 'idle') await exec(src.cmd.cancel());
-    if (store.armed) await exec(src.cmd.arm(false));
+  async function park(why){
+    if (routeActive() || store.task.type !== 'idle') await exec(src.cmd.cancel(why));
+    if (store.armed) await exec(src.cmd.arm(false, why));
   }
 
   function startStack(mode, title, body, uiTask){
@@ -64,7 +64,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     if (t === 'taught'){
       const go = async () => {
         if (up('mapping')){ const r = await exec(src.cmd.setMode(null)); if (r?.ok === false) return; }
-        await park(); setTool('pan'); resetPrep(); store.uiTask = 'taught'; taught.enter(); render();
+        await park('切到示教'); setTool('pan'); resetPrep(); store.uiTask = 'taught'; taught.enter(); render();
       };
       if (up('mapping')) return formBox({title:'切换到示教采集',body:'将停止建图，使用已保存的地图记录参考轨迹。',warn:leavingMapWarn(),ok:'停止建图并切换',danger:!store.mapSavedAt,onOk:go});
       if (routeActive()) return formBox({title:'切换到示教采集',body:'当前导航任务会取消，底盘会上锁。选择地图并完成定位自检后，再明确开始采集。',ok:'取消任务并切换',danger:true,onOk:go});
@@ -87,7 +87,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     }
     if (t === 'reloc'){
       if (run('navigation')){
-        const go = async () => { store.uiTask = 'reloc'; resetPrep(); render(); await park(); toast('导航栈保持运行，底盘已上锁', 'warn'); };
+        const go = async () => { store.uiTask = 'reloc'; resetPrep(); render(); await park('切到重定位'); toast('导航栈保持运行，底盘已上锁', 'warn'); };
         if (routeActive()) return formBox({ title: '切换到重定位', body: '当前多站任务会被取消，底盘会上锁。导航栈保持运行，改完位置可以直接回到导航。', ok: '取消任务并切换', danger: true, onOk: go });
         return go();
       }
@@ -116,7 +116,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   // 重定位 / 建图
   $('#relocInit').onclick = () => setTool('init');
   // 自动定位：按钮手动触发；导航 / 定位启动后后端也会自动跑一次。成功（state.autoLoc.seq 变了且 ok）就算定位完成
-  $('#navAutoBtn').onclick = $('#relocAuto').onclick = () => actions.autoLocalize();
+  $('#navAutoBtn').onclick = $('#relocAuto').onclick = () => actions.autoLocalize(prepHints());
+  // 11-26 指定大概位置：在地图上点一下 / 拖出一个圈，只在圈里找（大图上整图搜要 10 s 以上）
+  $('#navAreaBtn').onclick = $('#relocArea').onclick = () => setTool('area');
   // 自动定位失败后：机器狗小范围挪一次再定位（要确认）
   $('#navMoveBtn').onclick = $('#relocMove').onclick = () => actions.autolocMove();
   let autoSeq = null;
@@ -159,6 +161,15 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     if (src.can('prepHold')) src.cmd.prepHold();
   }
   function prepFail(k, msg, soft = false){ prep.fail = { k, msg, soft }; }
+  // 出发流程里自动定位：先在任务第 1 站 / 断点站附近找（后端还会加上次位置、停车点），找不到后端再搜整张图
+  function prepHints(){
+    if (!prep.on) return {};
+    const route = store.routes.find(r => r.id === prep.route), pts = route?.points || [];
+    const out = [], add = (i, label) => { const p = pts[i]; if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) out.push({ x: p.x, y: p.y, label }); };
+    if (prep.resume && route?.resume){ const k = (prep.resume === 'skip' ? route.resume.skipPoint : route.resume.point) - 1; add(k, `第 ${k + 1} 站`); }
+    add(0, '第 1 站');
+    return out.length ? { hints: out } : {};
+  }
 
   // routes.js 的「出发」按钮调这个（参数没保存的已经先保存好了）。
   // resume（11-24 任务接续）：'continue' / 'skip'，流程一样（站立 → 导航 → 定位），最后下发时带上，后端从断点接着跑
@@ -225,7 +236,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
       return;
     }
     if (!prep.runT) prep.runT = now;
-    if (!store.mapCurrent || !liveMap()) return;                // 刚起来：等 map_server 的地图名
+    if (!liveMap()) return;                                    // 刚起来：等 map_server 的地图
+    // 等地图名；4 s 还没有 = 后端认不出现在是哪张图（11-26 重启网页后端后发生过），直接切到任务的图
+    if (!store.mapCurrent && now - prep.runT < 4000) return;
     if (store.mapCurrent !== prep.map){
       if (!prep.loadT){ prep.loadT = now; exec(src.cmd.loadMap(prep.map)); return; }
       if (now - prep.loadT > 15000) prepFail('nav', `切换到地图 ${prep.map} 没有成功`);
@@ -244,7 +257,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
         prep.autoT = now;
         const t0 = prep.t0, seq = a?.seq ?? -1;
         // 后端没开始就拒绝了（不会更新 autoLoc.seq）：直接显示原因，别干等
-        actions.autoLocalize().then(r => {
+        actions.autoLocalize(prepHints()).then(r => {
           if (prep.on && prep.t0 === t0 && r?.ok === false && (store.autoLoc?.seq ?? -1) <= seq && !store.initPose){
             prepFail('loc', r.msg || '自动定位失败', true); render();
           }

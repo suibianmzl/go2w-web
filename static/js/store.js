@@ -40,6 +40,7 @@ export function createStore(){
     mapViews: {},
     mapLabels: {},   // 地图名 → 显示名（可中文）
     keepouts: {},    // 禁行区（v1.1.8）：地图名 → [{ kind: line/zone, pts, name? }]（世界坐标）
+    audio: null,     // 播报：后端 {t:'audio'} 的内容 + rx（收到时间 performance.now()）；null = 后端没有播报功能
     keepoutState: null, // 导航里的禁行层：{ ready（有 filter_mask_server）, live（加载的是哪张图）, loading }
     mapSaving: false,
     mapBusy: false,
@@ -62,5 +63,6 @@ export function createStore(){
     bagLive: [], bagSegment: null,  // 正在写的包（列表里的名字）；分段录包的段长（秒）
     maps: [], bags: [], uploads: {},   // uploads：包名 → { state: run/done/fail, pct, msg }
     odo: null, battery: null, motorTemp: null, motorInfo: null,
+    robotFeedback: { fresh:false, posture:'unknown' },
   };
 }

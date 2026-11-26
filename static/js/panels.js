@@ -1,4 +1,6 @@
 import { setupRouteEditor } from './routes.js';
+import { setupBagVoice } from './bag-voice.js';
+import { setupCpuDetails } from './cpu-details.js';
 // 左右两栏、顶栏、HUD 和底部抽屉：全部从 store 读，操作交给 actions
 import { $, $$, clamp, deg, fmt, fmtDur, tstr, ACC, TRAJ, MOTOR_LEGS, MOTOR_LEG_CN, MOTOR_JOINTS, MOTOR_WARN, MOTOR_CRIT, MOTOR_VIEWS, motorIdx, motorName, motorLevel, motorErrCount, mapTitle, mapOptText } from './util.js';
 import { LAYERS, L } from './layers.js';
@@ -8,6 +10,7 @@ import { MODES, MODE_PKG } from './actions.js';
 const setHTML = (sel, html) => { const el = $(sel); if (el._html !== html){ el._html = html; el.innerHTML = html; } };
 
 export function createPanels(store, src, actions, mapView, bus, setTool){
+  setupCpuDetails(src);
   const ros = src.name === 'ros';
   const run = id => store.profiles[id] === 'run';
   const now = () => src.now();
@@ -145,7 +148,6 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     else if (T.phase==='arrived' || T.status==='succeeded'){ st = 'ok'; label = '已完成'; }
     else if (store.estop){ st = 'crit'; label = '急停'; }
     else if (T.paused){ st = 'warn'; label = '已暂停'; }
-    else if (T.phase==='recover'){ st = 'warn'; label = '恢复中'; }
     else if (!actions.canMove() && T.phase!=='plan'){ st = 'warn'; label = !store.armed ? '等待解锁' : '底盘不可用'; }
     const pill = $('#taskPill'); pill.dataset.s = st; pill.textContent = label;
     $('#btnPause').disabled = idle || done || !src.can('pause') || T.type === 'route'; $('#btnPause').textContent = T.paused ? '继续' : '暂停';
@@ -157,11 +159,12 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const lap = !T.roundTrip ? '' : `${T.loops ? `第 ${T.loop} / ${T.loops} 圈` : `第 ${T.loop} 圈（一直循环）`}${T.back ? ' · 回到起点' : ''} · `;
       $('#taskSub').textContent = T.message || (T.phase === 'checking' ? '出发前清除旧障碍标记'
         : T.phase === 'dwell' && T.dwellLeft != null ? `${lap}第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''} 停留中 · 还剩 ${Math.ceil(T.dwellLeft)} s`
+        : T.phase === 'speak' ? `${lap}第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''} 播报中 · 播完再走`
         : `${lap}正在前往第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''}`);
     }
     else if (T.type==='external'){ $('#taskTitle').textContent = '外部导航目标'; $('#taskSub').textContent = 'RViz 或命令行发出的目标 ·「取消」同样有效'; }
     else { const g = T.goal; $('#taskTitle').textContent = '单点导航'; $('#taskSub').textContent = `目标 (${g.x.toFixed(2)}, ${g.y.toFixed(2)}) · ${deg(g.th).toFixed(0)}°`; }
-    const ph = ['dwell','arrived'].includes(T.phase) || T.status==='succeeded' ? 'arrive' : T.phase, rem = T.remaining;
+    const ph = ['dwell','speak','arrived'].includes(T.phase) || T.status==='succeeded' ? 'arrive' : T.phase, rem = T.remaining;
     $('#progBar').style.width = T.type === 'route'
       ? `${(T.status === 'succeeded' ? 1 : T.progress ?? (T.point - 1) / T.count) * 100}%`
       : rem!=null && T.total ? (100*clamp(1 - rem/T.total, 0, 1)).toFixed(1)+'%' : '0%';
@@ -187,7 +190,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#estopBanner').hidden = !store.estop;
   }
   $('#armBtn').onclick = () => actions.arm();
-  $('#estopBtn').onclick = () => actions.estop();
+  $('#estopBtn').onclick = () => actions.estop('急停按钮');
   $('#estopRelease').onclick = () => actions.releaseEstop();
   // 「导航任务」卡片上的临时调速 + 调试区的指令超时：滑条平时跟着实际参数走（真机上来自 cmd_bridge）；
   // 拖动中不打断，松手后立即设给 cmd_bridge，只影响这次运行（任务里保存的参数不变），失败就弹回实际值。
@@ -200,6 +203,10 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     const push = () => { busy = true; held = false; Promise.resolve(actions.setParam(key, +el.value)).finally(() => { busy = false; }); };
     el.onchange = () => { if (bridgeUp()) push(); else { held = true; busy = false; } };
     return () => {
+      const routeManaged = key === 'vmax' && store.task.type === 'route' && store.task.status === 'active';
+      el.disabled = routeManaged;
+      el.title = routeManaged ? '任务执行中，最大 vx 由任务和站点限速共同约束' : '';
+      if (routeManaged) held = false;
       if (held){ if (bridgeUp() && !busy) push(); return; }
       if (!busy && store.params[key] != null && +el.value !== store.params[key]){ el.value = store.params[key]; show(el.value); }
     };
@@ -209,7 +216,7 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   /* ---------- 顶栏 / HUD / 机器人卡片 ---------- */
   function chip(id, s, txt){ const c = $(id); c.dataset.s = s; c.querySelector('b').textContent = txt; }
   // 运控姿态（store.ctrl，后端 ctrl_view）：顶栏「姿态」+ 机器人卡片上的站起 / 趴下 / 保持站立
-  const POSE = { Passive: '趴着', FixStand: '站立', Velocity: '行走' };
+  const POSE = { Passive: '趴着', FixStand: '站立', Velocity: '已站起' };
   $('#poseUp').onclick = () => actions.standUp();
   $('#poseDown').onclick = () => actions.lieDown();
   $('#poseHold').onclick = () => actions.standHold(!store.ctrl?.hold);
@@ -223,15 +230,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     if (!on) $('#policyRow').hidden = $('#climbRow').hidden = true;
     if (!on) return;
     const name = C.state == null ? '运控离线' : POSE[C.state] || String(C.state).replace(/[<>&"]/g, '');
-    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…' : C.state === 'FixStand' && !C.ready ? '站起中…'
+    const physical = ros ? store.robotFeedback : { fresh:true, posture:C.state === 'Passive' ? 'lying' : 'standing' };
+    const unconfirmed = ['FixStand','Velocity'].includes(C.state) && physical?.posture !== 'standing';
+    const dynamic = C.state === 'Velocity' && C.physicalReady && physical?.fresh && physical?.valid && physical.posture === 'unknown';
+    const txt = C.op === 'up' ? '站起中…' : C.op === 'down' ? '趴下中…' : C.op === 'policy' ? '切换策略中…'
+      : dynamic ? '策略运行' : unconfirmed ? '未确认站起' : C.state === 'Passive' && physical?.posture !== 'lying' ? '姿态未确认' : C.state === 'FixStand' && !C.ready ? '站起中…'
       : C.lieIn != null ? `${Math.ceil(C.lieIn)} s 后趴下` : name;
-    chip('#chPose', C.state == null ? 'crit' : C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
+    chip('#chPose', C.state == null ? 'crit' : unconfirmed || !physical?.fresh || C.op || C.lieIn != null ? 'warn' : C.state === 'Velocity' ? 'ok' : '', txt);
     renderPolicy(C);
     renderClimb(C);
     const pt = $('#poseTxt');
     pt.className = 'pose-txt' + (C.lieIn != null ? ' warn' : '');
     pt.innerHTML = C.op === 'policy' ? '姿态 <b>切换策略中…</b> · 运控重启'
       : C.state == null ? '<b class="crit">运控离线</b> · 收不到运控状态'
+      : dynamic ? '策略运行 · 当前关节处于变化姿态'
+      : unconfirmed ? '<b class="warn">未确认站起</b> · 请检查电量和实测关节反馈'
       : C.lieIn != null ? `空闲 · <b>${Math.ceil(C.lieIn)} s 后原地趴下</b>`
       : `姿态 <b>${txt}</b>${C.hold ? ' · 保持站立' : ''}`;
     const busy = !!C.op || C.state == null;
@@ -245,22 +258,21 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   // 爬台模式：后端 ctrl.dual = 运控回报的 {policy, switching, req}，ctrl.climb = 网页开着爬台模式 {since, max}
   function renderClimb(C){
     const D = C.dual, row = $('#climbRow');
-    row.hidden = !D;
-    if (!D) return;
-    const on = !!C.climb, climbing = D.policy === 'climb';
-    const st = D.switching ? (climbing ? '切到 climb 中…' : '切回 rough 中…')
-      : D.req && !climbing ? '等速度降下来再切（vx≤0.5 vy≤0.15 wz≤0.15）'
-      : climbing ? (on ? 'climb（爬台中）' : 'climb（遥控器 RB）')
+    row.hidden = !D && !C.climb;
+    if (row.hidden) return;
+    const on = !!C.climb, climbing = D?.policy === 'climb';
+    const st = !D ? '已选 climb，等待运控反馈' : D.switching ? (climbing ? '切到 climb 中…' : '切回 rough 中…')
+      : D.req && !climbing ? '已请求，等待策略切换…'
+      : climbing ? (on ? 'climb（爬台中）' : 'climb（外部请求）')
       : on ? '已请求，等运控切换…' : 'rough';
-    const left = on && C.climb.max ? ` · 剩 ${Math.max(0, Math.ceil((C.climb.max - C.climb.since) / 60))} 分钟` : '';
     const t = $('#climbTxt');
     t.className = 'pose-txt' + (climbing || on ? ' warn' : '');
-    t.innerHTML = `爬台 <b>${st}</b>${left}`;
+    t.innerHTML = `爬台 <b>${st}</b>`;
     const b = $('#climbBtn');
     b.textContent = on ? '关爬台模式' : '开爬台模式';
     b.classList.toggle('danger', on);
-    b.disabled = !on && (!(C.state === 'Velocity' && C.ready) || !!C.op || store.estop);
-    setAttr(b, 'title', on ? '切回 rough' : '切到 climb 策略（只能站着时开）');
+    b.disabled = false;
+    setAttr(b, 'title', on ? '切回 rough 模式' : '切到 climb 模式，导航和其他功能照常可用');
   }
   function renderPolicy(C){
     const sel = $('#policySel'), list = C.policies || [];
@@ -400,6 +412,23 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   }
 
   /* ---------- 录包 ---------- */
+  const bagVoice = setupBagVoice(store, { mock:!ros, onChange:() => renderMaps() });
+  const bagChosen = new Set();
+  const bagUploading = name => ['queued', 'run'].includes(store.uploads[name]?.state);
+  const bagSelectable = () => store.bags.filter(b => !bagUploading(b.name) && store.uploads[b.name]?.state !== 'done' && !(store.profiles.bag !== 'stop' && (store.bagLive || []).includes(b.name)));
+  function syncBagSelection(){
+    const eligible = bagSelectable(), names = new Set(eligible.map(b => b.name));
+    for (const name of bagChosen) if (!names.has(name)) bagChosen.delete(name);
+    const all = $('#bagUploadAll');
+    all.disabled = !eligible.length;
+    all.checked = !!eligible.length && bagChosen.size === eligible.length;
+    all.indeterminate = bagChosen.size > 0 && bagChosen.size < eligible.length;
+    $('#bagUploadSelected').disabled = !bagChosen.size || !store.link.ok;
+    $('#bagUploadSelected').textContent = bagChosen.size ? `上传所选（${bagChosen.size}）` : '上传所选';
+    const active = Object.values(store.uploads).filter(u => u.state === 'run').length;
+    const queued = Object.values(store.uploads).filter(u => u.state === 'queued').length;
+    $('#bagUploadSummary').textContent = active || queued ? `上传中 ${active} · 排队 ${queued}` : '可同时上传 2 个包，其余排队';
+  }
   function renderMaps(){
     // 录包进行中（或正在启停）时最新的一个就是正在录的，不能删
     const bs = store.profiles.bag, recording = bs !== 'stop';
@@ -412,14 +441,17 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     $('#rbSave').title = `Shift+Enter：保存点击前 ${rb.seconds} 秒和后 ${rb.after ?? 10} 秒`;
     $('#rbSave').disabled = !store.link.ok || !rb.run || rb.saving || actions.rollbackCapture.state.busy || !!actions.rollbackCapture.state.pending;
     $('#bagCount').textContent = store.bags.length;
-    setHTML('#bagList', store.bags.length ? store.bags.map((b,i) => {
-      const live = b.name === liveBag, u = store.uploads[b.name] || {}, upping = u.state === 'run', waiting = upping && u.phase === 'waiting';
-      const anyUp = Object.values(store.uploads).some(x => x.state === 'run');
-      const upTitle = live ? '正在录制，先停止录包' : waiting ? '等待本次语音保存，再一起上传数据、录音和匹配信息' : upping ? `整包上传中 ${u.pct}%` : anyUp ? '正在上传别的包' : u.state === 'done' ? `已于 ${u.msg} 上传到 166:~/go2w_bags，点击重新上传` : u.state === 'fail' ? `上次上传失败：${u.msg}，点击重试` : u.state === 'stale' ? u.msg : `上传 ${b.name} 到 166:~/go2w_bags（含录音与匹配信息）`;
-      const up = `<button class="ib bag-up ${u.state || ''}" data-up="${i}" ${live || anyUp ? 'disabled' : ''} title="${upTitle.replace(/"/g, '&quot;')}" aria-label="上传录包 ${b.name}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${u.state === 'done' ? '<path d="M5 12.5l4.5 4.5L19 7.5"/>' : '<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>'}</svg></button>`;
-      const st = upping ? `<span class="mm bag-st run">${waiting ? '等语音' : `上传 ${u.pct}%`}</span>` : u.state === 'fail' ? `<span class="mm bag-st fail" title="${(u.msg || '').replace(/"/g, '&quot;')}">上传失败</span>` : u.state === 'stale' ? '<span class="mm bag-st fail">待重传</span>' : u.state === 'done' ? '<span class="mm bag-st done">已上传</span>' : '<span class="mm"></span>';
-      const del = `<button class="ib bag-del" data-del="${i}" ${live || upping ? `disabled title="${live ? '正在录制，先停止录包' : '正在上传，等传完再删'}"` : `title="删除 ${b.name}"`} aria-label="删除录包 ${b.name}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`;
-      return `<div class="mrow bag"><span class="mn">${b.name}</span><span class="mm">${live ? '录制中' : fmtDur(b.dur)}</span><span class="mm">${b.size>1024?(b.size/1024).toFixed(1)+' GB':b.size.toFixed(0)+' MB'}</span>${st}${up}${del}</div>`; }).join('')
+    syncBagSelection();
+    setHTML('#bagList', store.bags.length ? store.bags.map(b => {
+      const live = b.name === liveBag, u = store.uploads[b.name] || {}, upping = u.state === 'run', queued = u.state === 'queued', busy = upping || queued, waiting = upping && u.phase === 'waiting';
+      const upTitle = live ? '正在录制，先停止录包' : queued ? '已排队，等待上传空位' : waiting ? '等待本次语音保存，再一起上传数据、录音和匹配信息' : upping ? `整包上传中 ${u.pct}%` : u.state === 'done' ? `已于 ${u.msg} 上传到 166:~/go2w_bags，无需重复上传；点击核对并补齐` : u.state === 'fail' ? `上次上传失败：${u.msg}，点击重试` : u.state === 'stale' ? u.msg : `上传 ${b.name} 到 166:~/go2w_bags（含录音与匹配信息）`;
+      const up = `<button class="ib bag-up ${u.state || ''}" data-up="${esc(b.name)}" ${live || busy ? 'disabled' : ''} title="${esc(upTitle)}" aria-label="${u.state === 'done' ? '核对已上传录包' : '上传录包'} ${esc(b.name)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${u.state === 'done' ? '<path d="M5 12.5l4.5 4.5L19 7.5"/>' : '<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>'}</svg></button>`;
+      const st = queued ? '<span class="mm bag-st queued">排队中</span>' : upping ? `<span class="mm bag-st run" title="${esc(u.msg || '')}">${waiting ? '等语音' : `上传 ${u.pct}%`}</span>` : u.state === 'fail' ? `<span class="mm bag-st fail" title="${esc(u.msg || '')}">上传失败</span>` : u.state === 'stale' ? '<span class="mm bag-st fail">待核对</span>' : u.state === 'done' ? '<span class="mm bag-st done">已上传</span>' : '';
+      const del = `<button class="ib bag-del" data-del="${esc(b.name)}" ${live || busy ? `disabled title="${live ? '正在录制，先停止录包' : '已排队或正在上传，等传完再删'}"` : `title="删除 ${esc(b.name)}"`} aria-label="删除录包 ${esc(b.name)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`;
+      const select = `<label class="bag-check"><input type="checkbox" data-bag-select="${esc(b.name)}" aria-label="选择录包 ${esc(b.name)}" ${bagChosen.has(b.name) ? 'checked' : ''} ${live || busy || u.state === 'done' ? 'disabled' : ''}></label>`;
+      const voice = bagVoice.info(b.name), playing = bagVoice.isPlaying(b.name);
+      const play = `<button class="ib bag-voice" data-voice="${esc(b.name)}" ${!voice.ready ? 'disabled' : ''} title="${esc(voice.title)}" aria-label="${playing ? '暂停' : '播放'}录音 ${esc(b.name)}" aria-pressed="${playing}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">${playing ? '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>' : '<path d="M7 4v16l14-8z"/>'}</svg></button>`;
+      return `<div class="mrow bag">${select}<span class="mn" title="${esc(b.name)}">${esc(b.name)}</span><span class="bag-meta"><span class="mm">${live ? '录制中' : fmtDur(b.dur)}</span><span class="mm">${b.size>1024?(b.size/1024).toFixed(1)+' GB':b.size.toFixed(0)+' MB'}</span><span class="mm bag-voice-state" title="${esc(voice.title)}">${voice.label}</span>${st}</span>${play}${up}${del}</div>`; }).join('')
       : `<div class="empty">还没有录包</div>`);
     $('#bagBtn').textContent = bs==='run' ? '停止录制' : bs==='stop' ? '开始持续录制' : bs==='starting' ? '启动中…' : '停止中…';
     $('#bagBtn').dataset.state = bs;
@@ -650,10 +682,26 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
   $('#rbOn').onchange = e => actions.setRollback(e.target.checked);
   $('#taughtNavOn').onchange = e => { const on = e.target.checked; Promise.resolve(actions.setTaughtNav(on)).then(r => { if (r?.ok === false) e.target.checked = !on; renderTaughtNav(); }); };
   $('#rbSave').onclick = () => actions.saveRollback();
+  $('#bagList').onchange = e => {
+    const name = e.target.dataset.bagSelect; if (name == null) return;
+    e.target.checked ? bagChosen.add(name) : bagChosen.delete(name);
+    renderMaps();
+  };
+  $('#bagUploadAll').onchange = e => {
+    bagSelectable().forEach(b => e.target.checked ? bagChosen.add(b.name) : bagChosen.delete(b.name));
+    renderMaps();
+  };
+  $('#bagUploadSelected').onclick = () => {
+    actions.uploadBags(bagSelectable().filter(b => bagChosen.has(b.name)));
+    renderMaps();
+  };
   $('#bagList').onclick = e => {
+    const play = e.target.closest('[data-voice]');
+    if (play){ if (!play.disabled) bagVoice.play(play.dataset.voice); return; }
     const b = e.target.closest('[data-del],[data-up]'); if (!b || b.disabled) return;
-    const bag = store.bags[+(b.dataset.del ?? b.dataset.up)]; if (!bag) return;
+    const bag = store.bags.find(bag => bag.name === (b.dataset.del ?? b.dataset.up)); if (!bag) return;
     b.dataset.del != null ? actions.deleteBag(bag) : actions.uploadBag(bag);
+    renderMaps();
   };
 
   /* ---------- 曲线 ---------- */

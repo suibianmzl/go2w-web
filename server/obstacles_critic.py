@@ -1,0 +1,81 @@
+"""HTTP controls for Nav2's FollowPath.ObstaclesCritic parameter."""
+import asyncio
+from urllib.parse import urlsplit
+
+from aiohttp import web
+
+
+class ObstaclesCriticAPI:
+    PARAMETERS = (
+        ('/controller_server', 'FollowPath.ObstaclesCritic.enabled'),
+        ('/global_costmap/global_costmap', 'voxel_layer.enabled'),
+    )
+    TIMEOUT = 10.0
+
+    def __init__(self, busy=lambda: False, on_enabled=lambda: None):
+        self.lock = asyncio.Lock()
+        self.busy = busy
+        self.on_enabled = on_enabled
+
+    def routes(self, app):
+        app.router.add_post('/api/obstacles-critic/true', self.set_from_true)
+        app.router.add_post('/api/obstacles-critic/false', self.set_from_false)
+
+    @staticmethod
+    def same_origin(req):
+        origin = req.headers.get('Origin')
+        return not origin or urlsplit(origin).netloc == req.host
+
+    async def set_from_true(self, req):
+        return await self.set_enabled(req, True)
+
+    async def set_from_false(self, req):
+        return await self.set_enabled(req, False)
+
+    async def set_enabled(self, req, enabled):
+        if not self.same_origin(req):
+            raise web.HTTPForbidden(text='只接受当前网页发起的请求')
+        async with self.lock:
+            if self.busy():
+                raise web.HTTPConflict(text='导航任务正在控制强制跨越参数，请先结束任务')
+            output = await self._apply(enabled)
+        return web.json_response({'ok': True, 'requested': req.path.rsplit('/', 1)[-1],
+                                  'enabled': enabled, 'parameters': output})
+
+    async def apply(self, enabled):
+        """HTTP路由和后端任务共用设置入口，等待命令完成后才允许下一次设置。"""
+        async with self.lock:
+            return await self._apply(enabled)
+
+    async def _apply(self, enabled):
+        value = 'true' if enabled else 'false'
+        outputs = []
+        for node, parameter in self.PARAMETERS:
+            outputs.append(await self._set_parameter(node, parameter, value))
+        if enabled:
+            self.on_enabled()
+        return outputs
+
+    async def _set_parameter(self, node, parameter, value):
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'ros2', 'param', 'set', node, parameter, value,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.communicate()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise web.HTTPGatewayTimeout(text=f'设置 ROS 参数 {node} {parameter} 超时')
+        except OSError as e:
+            raise web.HTTPBadGateway(text=f'无法执行 ros2：{e.strerror or e}')
+        output = b'\n'.join(part for part in (stdout, stderr) if part).decode('utf-8', errors='replace').strip()
+        # Humble 的 ros2param 在节点拒绝修改时仍可能以 0 退出。
+        rejected = any(line.strip().startswith('Setting parameter failed') for line in output.splitlines())
+        if proc.returncode != 0 or rejected:
+            detail = output or f'命令失败（退出码 {proc.returncode}）'
+            raise web.HTTPBadGateway(text=f'设置 ROS 参数 {node} {parameter} 失败：{detail}')
+        return {'node': node, 'parameter': parameter, 'enabled': value == 'true', 'output': output}

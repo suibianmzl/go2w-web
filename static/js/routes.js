@@ -5,11 +5,12 @@ import { confirmBox } from './ui.js';
 export function setupRouteEditor(store, actions, setTool){
   const select = $('#routeSelect'), name = $('#routeName'), list = $('#routePoints');
   const save = $('#routeSave'), run = $('#routeRun'), hint = $('#routeHint'), remove = $('#routeDelete');
+  const crossingHint = $('#routeCrossingHint');
   const confirm = $('#routeConfirm'), saveRow = $('#routeSaveRow');
   const runHint = $('#routeRunHint'), round = $('#routeRound'), loops = $('#routeLoops');
   const optsBox = $('#routeOpts'), optsDirtyTag = $('#routeOptsDirty'), revert = $('#routeRevert');
   const rtV = $('#rtV'), rtW = $('#rtW');
-  let lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false;
+  let lastAudio = '', lastRoutes, lastMap, lastDraft, lastReplace = null, lastInsert = null, savedDraft = store.routeDraft, saving = false, terminating = false;
   const selected = () => store.routes.find(route => route.id === select.value);
 
   // ---------- 运行参数（11-12 起跟任务一起保存）：循环、圈数、最大 vx / wz ----------
@@ -42,7 +43,8 @@ export function setupRouteEditor(store, actions, setTool){
   round.onchange = () => { loops.disabled = !round.checked; lastDraft = null; render(); };
   loops.oninput = render;
   loops.onchange = () => { loops.value = readLoops(); render(); };
-  rtV.oninput = rtW.oninput = () => { showOpts(); render(); };
+  rtV.oninput = () => { showOpts(); lastDraft = null; render(); };
+  rtW.oninput = () => { showOpts(); render(); };
   through.onchange = render;
   revert.onclick = () => { setOpts(optsOf(selected())); render(); };
 
@@ -64,10 +66,20 @@ export function setupRouteEditor(store, actions, setTool){
     render();
   };
   // 任务接续（11-24）：后端在 routes 消息里给每个任务带 resume（断点，没有就是 null）
-  const resumeBox = $('#routeResume'), resumeGo = $('#routeResumeGo'), resumeSkip = $('#routeResumeSkip');
+  const resumeBox = $('#routeResume'), resumeGo = $('#routeResumeGo'), resumeSkip = $('#routeResumeSkip'), resumeTerminate = $('#routeResumeTerminate');
   const resumeStart = how => { if (!resumeGo.disabled) { store.startGo?.(selected(), how); render(); } };
   resumeGo.onclick = () => resumeStart('continue');
   resumeSkip.onclick = () => resumeStart('skip');
+  resumeTerminate.onclick = () => {
+    const route = selected();
+    if (!route?.resume || resumeTerminate.disabled) return;
+    confirmBox({ title:'终止任务', body:`终止「${route.name}」会清除这次未完成任务的断点，之后不能从这里继续。已保存的路线和运行参数会保留，仍可从头出发。`,
+      ok:'终止任务', danger:true, onOk: async () => {
+        terminating = true; render();
+        try { await actions.terminateRoute(route.id); }
+        finally { terminating = false; render(); }
+      } });
+  };
   const WHY = { aborted:'失败', canceled:'取消', interrupted:'中断' };
   function renderResume(route, show, blocked){
     const R = show ? route?.resume : null;
@@ -92,6 +104,9 @@ export function setupRouteEditor(store, actions, setTool){
     resumeGo.title = resumeSkip.title = blocked || '';
     resumeSkip.hidden = !R.canSkip;
     resumeSkip.textContent = R.canSkip ? `跳过，从第 ${R.skipPoint} 站继续` : '';
+    resumeTerminate.disabled = terminating || !store.link.ok;
+    resumeTerminate.title = !store.link.ok ? '等待连接后端' : '';
+    resumeTerminate.textContent = terminating ? '正在终止…' : '终止任务';
   }
   remove.onclick = () => {
     const route = selected();
@@ -216,6 +231,9 @@ export function setupRouteEditor(store, actions, setTool){
     }
     if (store.routeReplace != null && !(store.routeReplace < draft.points.length)) store.routeReplace = null;
     if (store.routeInsert != null && !(store.routeInsert >= 1 && store.routeInsert < draft.points.length)) store.routeInsert = null;
+    // 音频列表变了（上传 / 改名 / 删除）也要重画站点里的下拉框；播放状态变化不算
+    const audioKey = store.audio ? JSON.stringify(store.audio.items.map(x => [x.id, x.name, x.dur])) : '';
+    if (audioKey !== lastAudio){ lastAudio = audioKey; lastDraft = null; }
     if (draft !== lastDraft || store.routeReplace !== lastReplace || store.routeInsert !== lastInsert){
       lastDraft = draft; lastReplace = store.routeReplace; lastInsert = store.routeInsert;
       list.replaceChildren(...draft.points.map((p, i) => {
@@ -224,8 +242,12 @@ export function setupRouteEditor(store, actions, setTool){
         const angle = `${Math.round(deg(p.th))}°`;
         const heading = p.manualHeading === false ? (draft.confirmed ? `自动 ${angle}` : '自动朝向') : angle;
         const stay = p.dwell > 0 && !(end && !round.checked) ? `停 ${p.dwell} s · ` : '';
-        label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${stay}${heading}`;
-        label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading}`;
+        const pointSummary = () => {
+          const point = store.routeDraft.points[i], speed = point.vmax ?? +rtV.value;
+          label.textContent = `${end ? (round.checked ? '回到 1 · ' : '终点 · ') : ''}${stay}${heading} · vx≤${speed.toFixed(2)}${point.vmax == null ? '（继承）' : ''}`;
+          label.title = `第 ${i + 1} 站${end ? (round.checked ? '（之后回到 1 号点）' : '（终点）') : ''} · 坐标 (${p.x.toFixed(2)}, ${p.y.toFixed(2)}) · ${heading} · 最大 vx ${speed.toFixed(2)} m/s${point.vmax == null ? '（继承任务上限）' : ''}`;
+        };
+        pointSummary();
         label.classList.toggle('route-end', end);
         label.classList.toggle('route-stay', !!stay);   // 设了停留：和地图上一样用橙色
         li.classList.toggle('route-replacing', store.routeReplace === i);
@@ -253,6 +275,36 @@ export function setupRouteEditor(store, actions, setTool){
           'name', 'route-point-name', 40, `第 ${i + 1} 站名称（可选）`);
         const pointNote = textField(Object.assign(document.createElement('textarea'), { rows:2 }),
           'note', 'route-point-note', 200, `第 ${i + 1} 站备注（可选）`);
+        const speedRow = document.createElement('label'), speedError = document.createElement('span');
+        speedRow.className = 'route-point-speed';
+        const speed = Object.assign(document.createElement('input'), { type:'number', min:0.1, max:1.2, step:'any', inputMode:'decimal',
+          value:p.vmax == null ? '' : String(p.vmax), placeholder:`继承 ${(+rtV.value).toFixed(2)}` });
+        speed.setAttribute('aria-label', `第 ${i + 1} 站最大 vx`);
+        speed.setAttribute('aria-describedby', `routePointSpeedError${i}`);
+        speed.title = '留空时继承任务最大 vx；本段使用任务和两端站点限速中的较小值';
+        speedError.id = `routePointSpeedError${i}`;
+        speedError.className = 'route-point-speed-error';
+        speedError.setAttribute('aria-live', 'polite');
+        speed.oninput = () => {
+          const valid = speed.validity.valid && (speed.value === '' || Number.isFinite(speed.valueAsNumber));
+          speed.setAttribute('aria-invalid', String(!valid));
+          speedError.textContent = valid ? '' : '请输入 0.1–1.2 m/s，或留空继承';
+          if (valid){
+            const current = store.routeDraft;
+            const points = current.points.map((point, j) => {
+              if (j !== i) return point;
+              const { vmax: _, ...rest } = point;
+              return speed.value === '' ? rest : { ...rest, vmax:speed.valueAsNumber };
+            });
+            const edited = { ...current, points };
+            store.routeDraft = edited;
+            if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+            if (lastDraft === current) lastDraft = edited;
+            pointSummary();
+          }
+          render();
+        };
+        speedRow.append('最大 vx', speed, 'm/s', speedError);
         // 停留（11-24）：到这一站停稳后原地等几秒再走；0 / 空 = 不停留，不停车经过（拐角小的话）。终点（单程）不需要
         const dwellRow = document.createElement('label');
         dwellRow.className = 'route-point-dwell';
@@ -274,10 +326,125 @@ export function setupRouteEditor(store, actions, setTool){
           store.routeDraft = edited;
           if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
           if (lastDraft === current) lastDraft = edited;
+          showTip();
           render();
         };
         dwell.onchange = () => { const v = Math.round(+dwell.value); dwell.value = v > 0 ? String(Math.min(3600, v)) : ''; };
         dwellRow.append('停留', dwell, '秒');
+        const crossingRow = document.createElement('label');
+        crossingRow.className = 'route-point-crossing';
+        const crossing = Object.assign(document.createElement('input'), { type:'checkbox', checked:p.forceCrossing === true });
+        crossing.setAttribute('aria-label', `第 ${i + 1} 站强制跨越`);
+        crossing.setAttribute('aria-describedby', 'routeCrossingHint');
+        crossing.onchange = () => {
+          const current = store.routeDraft;
+          const points = current.points.map((point, j) => {
+            if (j !== i) return point;
+            const { forceCrossing: _, ...rest } = point;
+            return crossing.checked ? { ...rest, forceCrossing:true } : rest;
+          });
+          const edited = { ...current, points };
+          store.routeDraft = edited;
+          if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+          render();
+          list.querySelectorAll('.route-point-crossing input')[i]?.focus({ preventScroll:true });
+        };
+        crossingRow.append(crossing, '强制跨越');
+        // 播报（11-25）：到这一站在狗的喇叭上播哪几段音频，列表来自底部「播报」标签里上传的。
+        // audio = 到站播（按顺序），audioLeave = 离开前播（停留结束后播，播完狗才走）。
+        // 存法：一段 = 音频 id 字符串；几段 = 数组，元素是 id 或 {id, wait}（wait = 播这段前先等几秒，手填）
+        const clips = store.audio?.items || [], AUDIO_MAX = 5, WAIT_MAX = 600;
+        const segs = v => (typeof v === 'string' ? [v] : Array.isArray(v) ? v : [])
+          .map(x => typeof x === 'string' ? { id:x, wait:0 } : x && typeof x.id === 'string' ? { id:x.id, wait:+x.wait > 0 ? Math.round(+x.wait) : 0 } : null)
+          .filter(x => x && x.id);
+        const pack = list => { const out = list.map(x => x.wait > 0 ? { id:x.id, wait:x.wait } : x.id); return out.length === 1 && typeof out[0] === 'string' ? out[0] : out; };
+        // 11-26：每段除了音频本身，还有传给狗 + 播完后退出喊话（audio.py TAIL 1.5 s）约 2 s，按实测估进去
+        const SEG_OVERHEAD = 2;
+        const durOf = list => list.reduce((t, x) => t + x.wait + (clips.find(c => c.id === x.id)?.dur || 0) + SEG_OVERHEAD, 0);
+        const clipLabel = x => `${x.name}（${x.dur < 10 ? x.dur.toFixed(1) : Math.round(x.dur)} s）`;
+        const audioRows = [];
+        const audioRow = (key, title, aria, tipFor) => {
+          const row = document.createElement('div'), list = document.createElement('div'), tip = document.createElement('span');
+          row.className = 'route-point-audio';
+          row.hidden = !store.audio && !segs(p.audio).length && !segs(p.audioLeave).length;   // 后端还没有播报功能
+          list.className = 'route-audio-list';
+          tip.className = 'route-audio-tip';
+          // rebuild = false：只改了等待秒数，输入框不重建（不然打字时焦点会丢），只刷新提示
+          const set = (next, rebuild = true) => {
+            const current = store.routeDraft;
+            const points = current.points.map((point, j) => {
+              if (j !== i) return point;
+              const { [key]: _, ...rest } = point;
+              return next.length ? { ...rest, [key]: pack(next) } : rest;
+            });
+            const edited = { ...current, points };
+            store.routeDraft = edited;
+            if (store.routeCheck?.draft === current) store.routeCheck.draft = edited;
+            if (lastDraft === current) lastDraft = edited;
+            audioRows.forEach(r => r.refresh(r === row && !rebuild));
+            render();
+          };
+          const refresh = (tipOnly = false) => {
+            const q = store.routeDraft.points[i] || {}, cur = segs(q[key]);
+            row.classList.toggle('on', cur.length > 0);
+            tip.textContent = cur.length ? tipFor(q, cur) : '';
+            // 11-26：停留比到站播报（连每段前的等待）短时标黄：狗会多停一会儿等播完
+            tip.classList.toggle('warn', key === 'audio' && cur.length > 0 && q.dwell > 0 && !terminal() && q.dwell < durOf(cur));
+            if (tipOnly) return;
+            list.replaceChildren();
+            cur.forEach((x, k) => {
+              const line = document.createElement('div'), sel = document.createElement('select');
+              line.className = 'route-audio-seg';
+              sel.setAttribute('aria-label', `第 ${i + 1} 站${aria}第 ${k + 1} 段`);
+              sel.append(new Option('× 去掉这段', ''), ...clips.map(c => new Option(clipLabel(c), c.id)));
+              if (!clips.some(c => c.id === x.id)) sel.append(new Option('音频已删除，请重选', x.id));
+              sel.value = x.id;
+              sel.onchange = () => { const next = segs(store.routeDraft.points[i]?.[key]); if (sel.value) next[k].id = sel.value; else next.splice(k, 1); set(next); };
+              const wait = Object.assign(document.createElement('input'), { type:'number', min:0, max:WAIT_MAX, step:1, inputMode:'numeric',
+                value: x.wait > 0 ? String(x.wait) : '', placeholder:'0' });
+              wait.setAttribute('aria-label', `第 ${i + 1} 站${aria}第 ${k + 1} 段播之前等几秒`);
+              wait.title = '播这段之前先等几秒，0 = 紧接着播';
+              wait.oninput = () => {
+                const v = Math.round(+wait.value), next = segs(store.routeDraft.points[i]?.[key]);
+                next[k].wait = Number.isFinite(v) ? Math.min(WAIT_MAX, Math.max(0, v)) : 0;
+                set(next, false);
+              };
+              wait.onchange = () => { const v = Math.round(+wait.value); wait.value = v > 0 ? String(Math.min(WAIT_MAX, v)) : ''; };
+              line.append(sel, '前等', wait, '秒');
+              list.append(line);
+            });
+            if (cur.length < AUDIO_MAX && (clips.length || !cur.length)){
+              const add = document.createElement('select');
+              add.className = 'add';
+              add.setAttribute('aria-label', `第 ${i + 1} 站${aria}${cur.length ? '再加一段' : ''}`);
+              add.append(new Option(!cur.length ? (clips.length ? '不播报' : '不播报（先在底部「播报」里上传音频）') : '＋ 再加一段', ''),
+                ...clips.map(c => new Option(clipLabel(c), c.id)));
+              add.value = '';
+              add.onchange = () => { if (add.value) set([...segs(store.routeDraft.points[i]?.[key]), { id:add.value, wait:0 }]); };
+              list.append(add);
+            }
+          };
+          row.append(Object.assign(document.createElement('span'), { className:'t', textContent:title }), list, tip);
+          row.refresh = refresh;
+          audioRows.push(row);
+          return row;
+        };
+        const terminal = () => end && !round.checked;
+        const arriveRow = audioRow('audio', '到站播', '到站播报', (q, cur) => {
+          const gone = cur.some(x => !clips.some(c => c.id === x.id)), dur = durOf(cur), leave = segs(q.audioLeave).length > 0;
+          const order = cur.length > 1 || cur[0].wait ? `${cur.length > 1 ? `按顺序播 ${cur.length} 段` : '等一下再播'}，` : '';
+          return gone ? '有音频已删除，出发后这站不会播' : terminal() ? order + '到终点停下后播'
+            : !(q.dwell > 0) ? (leave ? order + '停下后播' : order + '经过时播，边走边播')
+            : q.dwell < dur ? order + `播报约 ${dur.toFixed(0)} s，比停留 ${q.dwell} s 长，会等播完${leave ? '、再播离开前的' : ''}再走`
+            : order + `停下后播，播报约 ${dur.toFixed(0)} s，停留 ${q.dwell} s 够`;
+        });
+        const leaveRow = audioRow('audioLeave', '离开前', '离开前播报', (q, cur) => {
+          const gone = cur.some(x => !clips.some(c => c.id === x.id));
+          return gone ? '有音频已删除，出发后不会播' : terminal() ? '到终点、到站的播完后播'
+            : q.dwell > 0 ? '停留结束后播，播完再走（会在这站停下）' : '到站停下，播完再走';
+        });
+        const showTip = () => audioRows.forEach(r => r.refresh());
+        showTip();
         const button = (text, title, action, disabled = false) => {
           const b = document.createElement('button');
           b.className = 'btn sm'; b.textContent = text; b.title = title;
@@ -342,23 +509,30 @@ export function setupRouteEditor(store, actions, setTool){
         const head = document.createElement('div');
         head.className = 'route-head';
         head.append(grip, order, label);
-        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, dwellRow, pointNote);
+        li.append(head, ins, place, button('×', '删除第 ' + (i + 1) + ' 点', points => points.splice(i, 1)), pointName, speedRow, dwellRow, crossingRow, arriveRow, leaveRow, pointNote);
         return li;
       }));
     }
     const preview = store.routeCheck?.draft === draft ? store.routeCheck : null;
+    const marked = draft.points.flatMap((p, i) => p.forceCrossing ? [i + 1] : []);
+    const crossingInvalid = marked.length === 1;
+    crossingHint.textContent = crossingInvalid ? '强制跨越需要至少选择两个点，或者全部不选。'
+      : marked.length ? `强制跨越：到达第 ${marked[0]} 站后开始跨越并开启爬台，到达第 ${marked.at(-1)} 站后恢复正常避障并关闭爬台，其间未选中的站点也在区间内。取消或失败时也尝试恢复。`
+      : '强制跨越可不选；启用时至少选择两个点，区间内自动开启爬台模式。';
+    crossingHint.classList.toggle('route-crossing-error', crossingInvalid);
     const pointsDirty = draft !== savedDraft;
     const matching = draft.map && draft.map === store.mapCurrent;
     const running = store.task.type !== 'idle' && store.task.status === 'active';
     const route = selected();
+    const invalidSpeed = [...list.querySelectorAll('.route-point-speed input')].some(input => !input.validity.valid);
     const pDirty = optsDirty(), saveNeeded = needSave();
     remove.hidden = !route;
     remove.disabled = saving || (running && store.task.routeId === route?.id);
     confirm.hidden = draft.confirmed;
-    confirm.disabled = !matching || draft.points.length < 2;
+    confirm.disabled = crossingInvalid || !matching || draft.points.length < 2;
     saveRow.hidden = optsBox.hidden = !draft.confirmed;
     optsDirtyTag.hidden = revert.hidden = !pDirty;
-    save.disabled = saving || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
+    save.disabled = crossingInvalid || saving || invalidSpeed || !matching || !draft.confirmed || !name.value.trim() || (!pointsDirty && !saveNeeded && !!route);
     save.textContent = route && draft.id === route.id ? '保存修改' : '保存任务';
     // 出发按钮
     const going = store.prep?.();
@@ -369,7 +543,7 @@ export function setupRouteEditor(store, actions, setTool){
     else if (pointsDirty && draft.points.length) runMessage = draft.confirmed ? '路线改过了：先保存任务。' : '请先确认并保存当前路线。';
     else if (!runMessage && saveNeeded) runMessage = '参数改过还没保存：点「保存并出发」会先保存。';
     if (going && !going.fail) runMessage = '';
-    run.disabled = runningSelected || saving || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
+    run.disabled = crossingInvalid || runningSelected || saving || invalidSpeed || !!going || (!!runMessage && !(saveNeeded && !actions.routeGoBlocker(route)));
     const resumable = !!route?.resume && !runningSelected && !pointsDirty && !saving && !(going && !going.fail);
     renderResume(route, resumable, actions.routeGoBlocker(route) || (going && !going.fail ? '正在出发' : ''));
     const runText = runningSelected ? '导航任务执行中' : going && !going.fail ? `出发中 · ${going.name}…` : going?.fail ? '出发失败'

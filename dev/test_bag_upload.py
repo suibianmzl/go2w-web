@@ -2,7 +2,10 @@
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace as NS
@@ -27,6 +30,7 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         (self.bag/'capture.json').write_text(json.dumps({'request_id':'request-one','name':'test-bag',
             'before_s':20,'after_s':10,'voice':{'state':'pending','requested_s':20}}))
         self.remote=self.root/'remote';self.remote.mkdir()
+        self.destination=str(self.remote)
         self.audio=b'\x1aE\xdf\xa3'+b'voice-data'*10
         self.server=W.Server.__new__(W.Server)
         self.server.node=NS(event=lambda *args:None)
@@ -40,7 +44,13 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         async def local_rsync(*args,**kwargs):
             self.calls.append(args)
             self.assertEqual(args[0],'rsync');self.assertEqual(args[-1],W.UPLOAD_DEST)
-            return await real_spawn(*args[:-1],str(self.remote),**kwargs)
+            self.assertIn('--compress',args)
+            self.assertIn('--compress-choice=zstd',args)
+            self.assertIn('--compress-level=1',args)
+            command=list(args[:-1])
+            if self.destination.startswith('rsync://'):
+                shell=command.index('-e');del command[shell:shell+2]
+            return await real_spawn(*command,self.destination,**kwargs)
         self.redirect=patch.object(W.asyncio,'create_subprocess_exec',side_effect=local_rsync)
         self.redirect.start();self.data=patch.object(W,'DATA',str(self.root));self.data.start()
 
@@ -57,6 +67,7 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls,[],'语音尚未完成时不开始传数据')
         self.assertEqual((await self.upload_voice()).status,201)
         await asyncio.wait_for(job,5)
+        self.assertEqual(self.server.uploads['test-bag']['state'],'done',self.server.uploads['test-bag'])
         dest=self.remote/'test-bag'
         self.assertEqual((dest/'test-bag_0.mcap').read_bytes(),b'original-robot-data')
         self.assertEqual((dest/'voice-note.audio').read_bytes(),self.audio)
@@ -70,6 +81,36 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(link['audio']['sha256'],hashlib.sha256(self.audio).hexdigest())
         self.assertTrue((dest/'capture.json').is_file())
         self.assertEqual(self.server.uploads['test-bag']['state'],'done')
+
+    async def test_zstd_wire_transfer_preserves_data_voice_and_manifest(self):
+        # Local rsync copies skip wire compression; use a loopback-only receiver.
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        config=self.root/'rsyncd.conf'
+        identity='uid = 0\ngid = 0\n' if os.geteuid()==0 else ''
+        config.write_text('use chroot = no\n'+identity+
+            f'pid file = {self.root}/rsync.pid\nlock file = {self.root}/rsync.lock\n'
+            f'log file = {self.root}/rsync.log\n[bags]\npath = {self.remote}\nread only = no\n')
+        daemon=subprocess.Popen(['rsync','--daemon','--no-detach','--address=127.0.0.1',
+            f'--port={port}',f'--config={config}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                self.assertIsNone(daemon.poll(),'rsync receiver exited')
+                try:
+                    with socket.create_connection(('127.0.0.1',port),timeout=.1):break
+                except OSError:await asyncio.sleep(.02)
+            else:self.fail('rsync receiver did not start')
+            self.destination=f'rsync://127.0.0.1:{port}/bags'
+            payload=(b'point-cloud-sample\x00'*4096)*64
+            (self.bag/'test-bag_0.mcap').write_bytes(payload)
+            self.assertEqual((await self.upload_voice()).status,201)
+            await asyncio.wait_for(self.server.bag_upload_run('test-bag',len(payload)/1024**2,
+                '/unused-test-key','loopback-zstd'),10)
+            self.assertEqual(self.server.uploads['test-bag']['state'],'done',self.server.uploads['test-bag'])
+            self.assertEqual({p.name:p.read_bytes() for p in self.bag.iterdir() if p.is_file()},
+                {p.name:p.read_bytes() for p in (self.remote/'test-bag').iterdir() if p.is_file()})
+        finally:
+            daemon.terminate();daemon.wait(timeout=5)
 
     async def test_pending_voice_timeout_never_marks_data_only_upload_done(self):
         with patch.object(W,'BAG_VOICE_WAIT',0):
@@ -153,6 +194,206 @@ class BagUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status,409)
         capture=json.loads((self.bag/'capture.json').read_text())
         self.assertEqual(capture['voice']['state'],'pending')
+
+    def prepare_queue(self, names):
+        self.server.uploads.clear()
+        self.server.prof=lambda _: 'stop'
+        self.server.transitions={}
+        self.server.bag_upload_slots=asyncio.Semaphore(2)
+        (self.root/'ssh').mkdir()
+        (self.root/'ssh/id_ed25519').write_text('local test placeholder')
+        for name in names:
+            bag=self.root/'bags'/name
+            bag.mkdir(exist_ok=True)
+            (bag/'metadata.yaml').write_text('duration:\n  nanoseconds: 30000000000\n')
+            (bag/f'{name}_0.mcap').write_bytes(name.encode())
+            (bag/'capture.json').unlink(missing_ok=True)
+
+    async def wait_upload_state(self, name, state):
+        async def wait():
+            while self.server.uploads.get(name,{}).get('state')!=state:
+                await asyncio.sleep(.01)
+        await asyncio.wait_for(wait(),5)
+
+    async def test_verified_upload_receipt_skips_repeated_submission(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        self.server.uploads.clear();self.server.restore_upload_receipts()
+        calls=len(self.calls)
+        ok,msg=await self.server.bag_upload('test-bag','repeat')
+        self.assertTrue(ok,msg)
+        self.assertIn('无需重复上传',msg)
+        self.assertEqual(self.server.uploads['test-bag']['state'],'done')
+        await asyncio.sleep(.02)
+        self.assertEqual(len(self.calls),calls,'重复请求不再启动rsync')
+        self.assertEqual([p.name for p in self.remote.iterdir()],['test-bag'])
+
+    async def test_receipt_from_another_upload_target_is_not_reused(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        calls=len(self.calls)
+        with patch.object(W,'UPLOAD_DEST','different-host:'):
+            self.server.uploads.clear();self.server.restore_upload_receipts()
+            self.assertEqual(self.server.uploads['test-bag']['state'],'stale')
+            self.assertTrue((await self.server.bag_upload('test-bag','new-target'))[0])
+            await self.wait_upload_state('test-bag','done')
+            self.assertEqual(len(self.calls),calls+1)
+            self.assertEqual(self.server.uploads['test-bag']['upload_target'],'different-host:')
+
+    async def test_changed_data_under_same_bag_name_is_uploaded_again(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        calls=len(self.calls)
+        (self.bag/'test-bag_0.mcap').write_bytes(b'updated-data-under-the-same-name')
+        self.assertTrue((await self.server.bag_upload('test-bag','updated-data'))[0])
+        await self.wait_upload_state('test-bag','done')
+        self.assertEqual(len(self.calls),calls+1)
+        self.assertEqual((self.remote/'test-bag/test-bag_0.mcap').read_bytes(),b'updated-data-under-the-same-name')
+
+    async def test_old_receipt_without_target_requires_one_verification(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        receipts=json.loads(Path(self.server.uploads_file).read_text())
+        receipts['test-bag'].pop('upload_target',None)
+        Path(self.server.uploads_file).write_text(json.dumps(receipts))
+        self.server.uploads.clear();self.server.restore_upload_receipts()
+        self.assertEqual(self.server.uploads['test-bag']['state'],'stale')
+
+    async def test_data_changed_during_transfer_does_not_get_a_done_receipt(self):
+        self.prepare_queue(['test-bag'])
+        spawn=W.asyncio.create_subprocess_exec
+        async def mutate_after_copy(*args,**kwargs):
+            process=await spawn(*args,**kwargs)
+            await process.wait()
+            (self.bag/'test-bag_0.mcap').write_bytes(b'changed-after-transfer')
+            return process
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=mutate_after_copy):
+            self.assertTrue((await self.server.bag_upload('test-bag','changing-data'))[0])
+            await self.wait_upload_state('test-bag','fail')
+        self.assertIn('同步期间录包内容发生变化',self.server.uploads['test-bag']['msg'])
+
+    async def test_same_size_data_replaced_within_one_second_is_not_skipped_by_rsync(self):
+        self.prepare_queue(['test-bag'])
+        data=self.bag/'test-bag_0.mcap'
+        second=data.stat().st_mtime_ns//1_000_000_000*1_000_000_000
+        os.utime(data,ns=(second+100_000_000,second+100_000_000))
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        self.assertEqual(data.stat().st_size,len(b'new-data'))
+        data.write_bytes(b'new-data')
+        os.utime(data,ns=(second+900_000_000,second+900_000_000))
+        self.assertTrue((await self.server.bag_upload('test-bag','same-second-update'))[0])
+        await self.wait_upload_state('test-bag','done')
+        self.assertEqual((self.remote/'test-bag/test-bag_0.mcap').read_bytes(),b'new-data')
+
+    async def test_explicit_verification_repairs_same_directory_without_duplicates(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        target=self.remote/'test-bag/test-bag_0.mcap';target.unlink()
+        ok,msg=await self.server.bag_upload('test-bag','verify',verify=True)
+        self.assertTrue(ok,msg)
+        await self.wait_upload_state('test-bag','done')
+        self.assertEqual(target.read_bytes(),(self.bag/'test-bag_0.mcap').read_bytes())
+        self.assertEqual([p.name for p in self.remote.iterdir()],['test-bag'])
+
+    async def test_new_voice_cannot_be_skipped_as_an_already_uploaded_bag(self):
+        self.prepare_queue(['test-bag'])
+        self.assertTrue((await self.server.bag_upload('test-bag','first'))[0])
+        await self.wait_upload_state('test-bag','done')
+        calls=len(self.calls)
+        (self.bag/'capture.json').write_text(json.dumps({'name':'test-bag','request_id':'request-one'}))
+        self.assertEqual((await self.upload_voice()).status,201)
+        self.assertEqual(self.server.uploads['test-bag']['state'],'stale')
+        self.assertTrue((await self.server.bag_upload('test-bag','with-voice'))[0])
+        await self.wait_upload_state('test-bag','done')
+        self.assertEqual(len(self.calls),calls+1)
+        self.assertEqual((self.remote/'test-bag/voice-note.audio').read_bytes(),self.audio)
+
+    async def test_two_transfers_run_while_extra_bags_queue_and_reject_duplicate_or_delete(self):
+        self.prepare_queue(['test-bag','second-bag','third-bag'])
+        release=asyncio.Event();started=[]
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            started.append(Path(args[-2]).name)
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['test-bag','second-bag','third-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(started,['test-bag','second-bag'])
+                self.assertEqual(self.server.uploads['third-bag']['state'],'queued')
+                self.assertFalse((await self.server.bag_upload('third-bag','duplicate'))[0])
+                self.assertFalse((await self.server.bag_upload('test-bag','duplicate'))[0])
+                self.assertFalse((await self.server.bag_delete('third-bag','local-test'))[0])
+                self.assertTrue((self.root/'bags/third-bag').is_dir())
+            finally:
+                release.set()
+            for name in ['test-bag','second-bag','third-bag']:
+                await self.wait_upload_state(name,'done')
+                self.assertEqual((self.remote/name/f'{name}_0.mcap').read_bytes(),name.encode())
+            self.assertEqual(started,['test-bag','second-bag','third-bag'])
+
+    async def test_failed_queued_bundle_does_not_block_following_uploads(self):
+        self.prepare_queue(['test-bag','second-bag','broken-bag','last-bag'])
+        (self.root/'bags/broken-bag/metadata.yaml').write_text(
+            'rosbag2_bagfile_information:\n  relative_file_paths:\n    - missing.mcap\n')
+        release=asyncio.Event();started=[]
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            started.append(Path(args[-2]).name)
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['test-bag','second-bag','broken-bag','last-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(started,['test-bag','second-bag'])
+            finally:
+                release.set()
+            await self.wait_upload_state('broken-bag','fail')
+            await self.wait_upload_state('last-bag','done')
+            await self.wait_upload_state('test-bag','done')
+            await self.wait_upload_state('second-bag','done')
+        self.assertFalse((self.remote/'broken-bag').exists())
+        receipt=json.loads(Path(self.server.uploads_file).read_text())
+        self.assertEqual(set(receipt),{'test-bag','second-bag','last-bag'})
+
+    async def test_queued_bag_accepts_its_voice_then_uploads_the_complete_bundle(self):
+        self.prepare_queue(['first-bag','second-bag','test-bag'])
+        (self.bag/'capture.json').write_text(json.dumps({'request_id':'request-one','name':'test-bag',
+            'before_s':20,'after_s':10,'voice':{'state':'pending','requested_s':20}}))
+        release=asyncio.Event()
+        real_transfer=W.asyncio.create_subprocess_exec
+        async def hold_transfer(*args,**kwargs):
+            await release.wait()
+            return await real_transfer(*args,**kwargs)
+        with patch.object(W.asyncio,'create_subprocess_exec',side_effect=hold_transfer):
+            try:
+                for name in ['first-bag','second-bag','test-bag']:
+                    ok,msg=await self.server.bag_upload(name,'local-queue-test')
+                    self.assertTrue(ok,msg)
+                await asyncio.sleep(.05)
+                self.assertEqual(self.server.uploads['test-bag']['state'],'queued')
+                self.assertEqual((await self.upload_voice()).status,201)
+            finally:
+                release.set()
+            for name in ['first-bag','second-bag','test-bag']:
+                await self.wait_upload_state(name,'done')
+        dest=self.remote/'test-bag'
+        self.assertEqual((dest/'voice-note.audio').read_bytes(),self.audio)
+        link=json.loads((dest/'recording-link.json').read_text())
+        self.assertEqual((link['bag']['name'],link['request_id']),('test-bag','request-one'))
+        self.assertEqual(link['audio']['sha256'],hashlib.sha256(self.audio).hexdigest())
 
 
 if __name__=='__main__':unittest.main()

@@ -7,7 +7,8 @@ import { storeTaughtDocument } from '../taught_geometry.js';
 const T_MAP = 1, T_SCAN = 2, T_GCOST = 3, T_LCOST = 4, T_CLOUD = 5, T_PART = 6, T_CAM = 7;
 // 已接入真机的操作；其余操作给出说明，不发任何指令
 const OPS = new Set(['initialPose', 'autoLocalize', 'autolocMove', 'cancel', 'arm', 'estop', 'releaseEstop', 'setParam', 'simulateDrop',
-  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
+  'setMode', 'toggle', 'standUp', 'lieDown', 'standHold', 'setPolicy', 'climb', 'prepHold', 'saveRoute', 'startRoute', 'checkRoute', 'deleteRoute', 'terminateRoute', 'saveMap', 'alignMap', 'editMap', 'loadMap', 'deleteMaps', 'setMapLabel', 'saveKeepout', 'teleop', 'setMapView', 'deleteBag', 'uploadBag', 'setRollback', 'saveRollback', 'setTaughtNav',
+  'audioPlay', 'audioStop', 'audioVolume', 'audioRename', 'audioDelete', 'audioRefresh', 'audioUpload',
   'contPreflight', 'contStart', 'contCheck', 'contFinish', 'contAbort', 'contParking', 'mapResume',
   'rtabStart', 'rtabContinue', 'rtabPause', 'rtabResume', 'rtabStop', 'rtabAuto',
   'taughtGet', 'taughtSave', 'taughtPrepare', 'taughtCheck', 'taughtStart', 'taughtPause', 'taughtResume', 'taughtFinish', 'taughtAbandon', 'taughtStatus']);
@@ -30,8 +31,27 @@ export function createRosSource(store, bus){
   const query = robotId ? `?robot_id=${encodeURIComponent(robotId)}` : '';
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${basePath}/ws${query}`;
   let ws = null, lastMsg = 0, mapGrid = null, rateWarned = -Infinity, seq = 0, pingPausedUntil = 0, lastTask = null;
+  let healthRx = 0, ctrlRx = 0;
+  function clearHealth(){
+    store.sys = { cpu:null, mem:null, memTotal:null };
+    store.battery = store.motorTemp = store.motorInfo = null;
+    store.robotFeedback = { fresh:false, posture:'unknown' };
+    if (store.ctrl){ store.ctrl.ready = false; store.ctrl.feedback = store.robotFeedback; }
+  }
+  function readHealth(m){
+    healthRx = performance.now();
+    store.sys = m.sys || { cpu:null, mem:null, memTotal:null };
+    store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.motorInfo = m.motorInfo ?? null;
+    store.robotFeedback = m.robotFeedback || { fresh:false, posture:'unknown' };
+    if (store.ctrl){
+      store.ctrl.feedback = store.robotFeedback;
+      if (['FixStand','Velocity'].includes(store.ctrl.state) &&
+          (!store.robotFeedback.fresh || store.robotFeedback.valid === false || store.robotFeedback.posture === 'lying' ||
+           (store.robotFeedback.posture !== 'standing' && !store.ctrl.physicalReady))) store.ctrl.ready = false;
+    }
+  }
   let camWanted = false;                            // 摄像头标签页开着：断线重连后要重新申请
-  let motorFast = false;                            // 电机表开着「力矩」视图：后端每 0.5 s 读一次 lowstate，重连后要重新申请
+  let motorFast = false;                            // 兼容旧后端的「力矩」快采样请求；新版统一raw限频采样
   let layers = [], gcost = null, rawPlan = null;   // rawPlan：后端最近一次的 /plan（任务结束后不再显示）
   let teleCmd = null, teleTimer = null;             // 键盘遥控：按住时每 0.1 s 发一次，后端 0.3 s 收不到就停
   const watchers = new Map();                       // topic 查看器：topic → Set(回调)
@@ -62,6 +82,8 @@ export function createRosSource(store, bus){
       store.link = { ok: false, ms: null };
       store.robotOnline = false;
       store.robot.valid = false; store.odomOk = false; store.armed = null;
+      clearHealth(); healthRx = ctrlRx = 0;
+      if (store.ctrl){ store.ctrl.state = null; store.ctrl.op = null; }
       // 断线后清掉浏览器保存的遥控速度，重连必须重新操作；不能让旧的续发器在新连接上继续发速度。
       teleCmd = null; if (teleTimer){ clearInterval(teleTimer); teleTimer = null; }
       for (const [, res] of pending) res({ ok: false, uncertain: true, msg: '和后端的连接断开了' });
@@ -135,6 +157,7 @@ export function createRosSource(store, bus){
       case 'taught': storeTaughtDocument(store, m); break;
       case 'map_views': store.mapViews = m.items || {}; break;
       case 'map_labels': store.mapLabels = m.items || {}; break;
+      case 'audio': store.audio = { ...m, rx: performance.now() }; break;
       case 'keepout': store.keepouts = m.items || {}; break;
       case 'task': onTask(m.task); break;
       case 'pose': {
@@ -154,6 +177,7 @@ export function createRosSource(store, bus){
         if (!last || Math.hypot(last[0]-R.x, last[1]-R.y) > .08){ tr.push([R.x, R.y]); if (tr.length > 900) tr.shift(); }
         break;
       }
+      case 'system': readHealth(m); break;
       case 'state': {
         store.mapBusy = !!m.mapBusy;
         if (store.mapCurrent && m.mapCurrent && store.mapCurrent !== m.mapCurrent){
@@ -161,7 +185,8 @@ export function createRosSource(store, bus){
           store.routeDraft = { id: null, map: null, points: [], confirmed: false };
           store.routeCheck = null;
         }
-        store.odomOk = m.odomOk; store.armed = m.armed; store.battery = m.battery ?? null; store.motorTemp = m.motorTemp ?? null; store.motorInfo = m.motorInfo ?? null; store.sys = m.sys; store.nodes = m.nodes; store.estop = !!m.estop;
+        store.odomOk = m.odomOk; store.armed = m.armed; store.nodes = m.nodes; store.estop = !!m.estop;
+        readHealth(m);
         Object.assign(store.params, m.params || {});
         for (const [k, st] of Object.entries(m.profiles)){   // stop / starting / run / stopping
           if (st === 'run' && store.profiles[k] !== 'run') store.since[k] = now();
@@ -192,6 +217,11 @@ export function createRosSource(store, bus){
         store.taughtNav = m.taughtNav || null;   // 「启用示教导航」开关：{ on, forced: '0'/'1'/null, installed }
         // 运控：{ on, state: Passive/FixStand/Velocity/null(收不到), ready, seq, op: up/down, msg, stood, auto, hold, lieIn }
         store.ctrl = m.ctrl || { on: false };   // 自动定位：{ state: idle/run/ok/fail, seq, map, msg, x, y, th, score, ratio }
+        ctrlRx = performance.now();
+        if (['FixStand','Velocity'].includes(store.ctrl.state))
+          store.ctrl.ready = !!store.ctrl.ready && !store.ctrl.op && store.robotFeedback.fresh &&
+            store.robotFeedback.valid !== false && store.robotFeedback.posture !== 'lying' &&
+            (store.robotFeedback.posture === 'standing' || !!store.ctrl.physicalReady);
         store.topics = m.topics.map(t => ({ name: t.name, type: t.type, d0: false, alive: t.pubs > 0, hz: t.hz }));
         break;
       }
@@ -258,11 +288,12 @@ export function createRosSource(store, bus){
     taughtAbandon: session_id => send('taught_abandon', { session_id }),
     taughtStatus: map => send('taught_status', map ? { map } : {}),
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
-    autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
+    // opts：{ area: {x, y, r} }（只在圈里找）/ { hints: [{x, y, label}] }（先在这几处附近找）
+    autoLocalize: (opts = {}) => send('auto_localize', opts, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
     autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）
-    cancel: () => send('cancel'),
-    arm: on => send('arm', { on }),
-    estop: () => send('estop'),
+    cancel: why => send('cancel', why ? { why } : {}),
+    arm: (on, why) => send('arm', why ? { on, why } : { on }),
+    estop: why => send('estop', why ? { why } : {}),
     releaseEstop: () => send('release_estop'),
     setParam: (key, value) => send('set_param', { key, value }),
     // P3：运行档位、巡逻、录包、地图
@@ -280,12 +311,23 @@ export function createRosSource(store, bus){
     setPolicy: name => send('set_policy', { name }, 60000),   // 停运控 + 重启 + 等状态，失败还要退回
     climb: on => send('climb', { on }),
     prepHold: () => send('prep_hold'),
+    // 播报：音频走 HTTP 上传（WebSocket 单条上限 1 MB），其余走指令
+    audioPlay: clip => send('audio_play', { clip }, 10000),
+    audioStop: () => send('audio_stop'),
+    audioVolume: v => send('audio_volume', { v }, 8000),
+    audioRename: (clip, name) => send('audio_rename', { clip, name }),
+    audioDelete: clip => send('audio_delete', { clip }),
+    audioRefresh: () => (store.audio ? send('audio_refresh', {}, 5000) : undefined),
+    audioUpload: (name, wav) => fetch(`/api/audio?name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'X-Go2w': '1' }, body: wav })
+      .then(r => r.json().catch(() => ({ ok: false, msg: `上传失败（HTTP ${r.status}）` })))
+      .catch(() => ({ ok: false, msg: '上传失败：连不上后端' })),
     deleteRoute: route_id => send('route_delete', { route_id }),
+    terminateRoute: route_id => send('route_terminate', { route_id }),
     deleteBag: name => send('bag_delete', { name }, 30000),
     deleteMaps: names => send('map_delete', { names }, 60000),
     setMapLabel: (name, label) => send('map_label', { name, label }),
     saveKeepout: (map, shapes) => send('keepout_save', { map, shapes }, 20000),
-    uploadBag: name => send('bag_upload', { name }),
+    uploadBag: (name, verify = false) => send('bag_upload', { name, verify }),
     setRollback: on => send('rollback_set', { on }),
     setTaughtNav: on => send('set_taught_nav', { on }),
     saveRollback: (request_id, voice_seconds) => send('rollback_save', { request_id, voice_seconds }, 40000),
@@ -335,6 +377,15 @@ export function createRosSource(store, bus){
   connect();
   return {
     name: 'ros', cmd, now,
+    async cpuStats(signal){
+      const response = await fetch('/api/system/cpu', { cache:'no-store', signal });
+      if (response.status === 404) throw new Error('当前后端尚不支持 CPU 明细，请更新后端');
+      let data;
+      try { data = await response.json(); }
+      catch { throw new Error(`无法读取 CPU 统计（HTTP ${response.status}），请检查后端服务`); }
+      if (!response.ok || !data.ok) throw new Error(data.message || `读取失败（HTTP ${response.status}）`);
+      return data;
+    },
     can: op => OPS.has(op),
     // 任务卡片的步骤（真机上从 Nav2 行为树日志看得到的阶段）
     steps: [['plan', '规划路径', 'Theta*'], ['follow', '跟随路径', 'RotationShim · MPPI'], ['recover', '恢复行为', '需要时'], ['arrive', '到达', 'goal checker']],
@@ -358,6 +409,11 @@ export function createRosSource(store, bus){
       if (!ids.includes('particles')) store.particles = new Float32Array(0); },
     get paused(){ return false; },
     tick(){
+      if (healthRx && performance.now()-healthRx > 2500){ clearHealth(); healthRx = 0; }
+      if (ctrlRx && performance.now()-ctrlRx > 2500){
+        if (store.ctrl){ store.ctrl.state = null; store.ctrl.ready = false; store.ctrl.op = null; }
+        ctrlRx = 0;
+      }
       if (store.link.ok && performance.now() - lastMsg > 2000){ store.link.ms = null; }
       const R = store.robot, T = store.task;
       // 导航栈停了之后不再有新数据：清掉最后一帧，别让旧的 scan、点云、代价地图留在画面上

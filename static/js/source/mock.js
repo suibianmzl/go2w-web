@@ -146,11 +146,14 @@ export function createMockSource(store, bus){
     return loops != null ? [0, loop, true] : null;
   }
   const routePose = (points, i) => points[i];
-  function routeLeg(route, [index, loop, back], started, opt){
+  function routeLeg(route, [index, loop, back], started, opt, source = null){
+    store.params.vmax = Math.min(opt.vmax, route.points[index].vmax ?? opt.vmax,
+      source == null ? opt.vmax : route.points[source].vmax ?? opt.vmax);
     task = { type:'route', route, index, loop, back, opt, started, goal:routePose(route.points, index, back), phase:'plan',
       planAt:S.t+.35, t0:S.t, recov:0 };
   }
   function finishRoute(status, message){
+    store.params.vmax = task.opt.vmax;
     task = { ...task, phase:status === 'succeeded' ? 'arrived' : status, status, message, doneAt:S.t };
     log(status === 'aborted' ? 'ERROR' : 'INFO', 'routes', message);
     toast(message, status === 'aborted' ? 'err' : status === 'canceled' ? 'warn' : 'ok');
@@ -170,7 +173,7 @@ export function createMockSource(store, bus){
       const { opt } = task, next = routeNext(task.route.points.length, opt.loops, [task.index, task.loop, task.back]);
       opt.done++;
       if (!next) finishRoute('succeeded', opt.loops == null ? '已到达全部导航点' : `已完成循环 ${opt.loops} 圈`);
-      else routeLeg(task.route, next, task.started, opt);
+      else routeLeg(task.route, next, task.started, opt, task.index);
     }
     else { const g = task.goal; toast(`已到达目标 (${g.x.toFixed(2)}, ${g.y.toFixed(2)})`); task.phase = 'arrived'; task.doneAt = S.t; }
   }
@@ -338,6 +341,21 @@ export function createMockSource(store, bus){
     store.bagLive = []; store.bagSegment = run('bag') ? 30 : null;
   }
 
+  const bagUploadQueue = [];
+  function pumpBagUploads(){
+    while (bagUploadQueue.length && Object.values(store.uploads).filter(u => u.state === 'run').length < 2){
+      const name = bagUploadQueue.shift();
+      store.uploads = { ...store.uploads, [name]: { state:'run', phase:'sending', pct:0, msg:'连接中' } };
+      const tick = setInterval(() => {
+        const u = store.uploads[name];
+        if (!u || u.state !== 'run'){ clearInterval(tick);pumpBagUploads();return; }
+        const pct = Math.min(100, u.pct + 20);
+        store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', phase:'sending', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } };
+        if (pct === 100){ clearInterval(tick);pumpBagUploads(); }
+      }, 600);
+    }
+  }
+
   /* ---------- 指令（界面已经做过前置检查和确认） ---------- */
   const cmd = {
     ...teaching.cmd,
@@ -362,6 +380,8 @@ export function createMockSource(store, bus){
       return { ok:true };
     },
     saveRoute({ route_id, name, map, points, opts }){
+      if (points.some(p => 'forceCrossing' in p && typeof p.forceCrossing !== 'boolean')) return { ok:false, msg:'强制跨越开关需要是布尔值' };
+      if (points.filter(p => p.forceCrossing).length === 1) return { ok:false, msg:'强制跨越需要至少选择两个点，或者全部不选' };
       const id = route_id || globalThis.crypto?.randomUUID?.() || `mock-${Date.now()}-${Math.random()}`;
       const record = { id, name:name.trim(), map, points:points.map(p => ({ ...p, name:(p.name || '').trim(), note:(p.note || '').trim() })),
         opts:{ loop:false, loops:1, vmax:0.45, wmax:1.2, ...(opts || {}) } };
@@ -392,14 +412,31 @@ export function createMockSource(store, bus){
       store.rollback.saving = false;
       return { ok:true, msg:`已保存回溯 ${name}（模拟）`, data:{name} };
     },
-    uploadBag(name){
-      if (Object.values(store.uploads).some(u => u.state === 'run')) return { ok:false, msg:'正在上传别的包，等它传完' };
-      store.uploads = { ...store.uploads, [name]: { state:'run', pct:0, msg:'连接中' } };
-      const tick = setInterval(() => { const u = store.uploads[name]; if (!u || u.state !== 'run') return clearInterval(tick);
-        const pct = Math.min(100, u.pct + 20);
-        store.uploads = { ...store.uploads, [name]: pct < 100 ? { state:'run', pct, msg:'11.2MB/s' } : { state:'done', pct:100, msg:'刚刚' } }; }, 600);
-      return { ok:true, msg:`开始上传 ${name} → 166:~/go2w_bags（模拟）` };
+    uploadBag(name, verify = false){
+      if (!store.bags.some(b => b.name === name)) return { ok:false, msg:`data/bags 里没有 ${name}` };
+      if (['queued','run'].includes(store.uploads[name]?.state)) return { ok:false, msg:`${name} 已排队或正在上传，请勿重复提交` };
+      if (!verify && store.uploads[name]?.state === 'done') return { ok:true, msg:`${name} 已上传，无需重复上传（模拟）` };
+      store.uploads = { ...store.uploads, [name]: { state:'queued', pct:0, msg:'等待上传空位' } };
+      bagUploadQueue.push(name);pumpBagUploads();
+      return { ok:true, msg:`已提交上传 ${name} → 166:~/go2w_bags（模拟）` };
     },
+    audioUpload(name, wav, dur){
+      const A = store.audio ||= { avail:true, why:'', items:[], cur:null, vol:5, last:null, limit:60, rx:performance.now() };
+      store.audio = { ...A, items:[...A.items, { id:String(Date.now()), name, dur, size:wav.size, ts:Date.now() }] };
+      return { ok:true, msg:`已上传「${name}」（模拟）` };
+    },
+    audioRefresh(){ store.audio ||= { avail:true, why:'', items:[{ id:'demo', name:'请注意避让', dur:4.2, size:134444, ts:Date.now() }], cur:null, vol:5, last:null, limit:60, rx:performance.now() }; },
+    audioPlay(id){
+      const x = store.audio.items.find(i => i.id === id);
+      clearTimeout(this._audioT);
+      store.audio = { ...store.audio, rx:performance.now(), cur:{ clip:id, name:x.name, dur:x.dur, phase:'play', elapsed:0, who:'模拟' } };
+      this._audioT = setTimeout(() => { store.audio = { ...store.audio, cur:null, last:{ clip:id, name:x.name, ok:true, msg:'播完' } }; }, x.dur * 1000);
+      return { ok:true, msg:`开始播报「${x.name}」（模拟，不出声）` };
+    },
+    audioStop(){ clearTimeout(this._audioT); store.audio = { ...store.audio, cur:null }; return { ok:true, msg:'已停止播报（模拟）' }; },
+    audioVolume(v){ store.audio = { ...store.audio, vol:v }; return { ok:true, msg:`音量 ${v}（模拟）` }; },
+    audioRename(id, name){ store.audio = { ...store.audio, items:store.audio.items.map(i => i.id === id ? { ...i, name } : i) }; return { ok:true, msg:`已改名为「${name}」（模拟）` }; },
+    audioDelete(id){ store.audio = { ...store.audio, items:store.audio.items.filter(i => i.id !== id) }; return { ok:true, msg:'已删除（模拟）' }; },
     setMapLabel(name, label){
       label = String(label || '').split(/\s+/).filter(Boolean).join(' ');
       if (label === name) label = '';
@@ -428,10 +465,21 @@ export function createMockSource(store, bus){
       return { ok:true, msg:`已删除 ${before - store.maps.length} 张地图${nr ? '和 ' + nr + ' 个任务' : ''}（模拟）` };
     },
     deleteBag(name){
+      if (['queued','run'].includes(store.uploads[name]?.state)) return { ok:false, msg:`${name} 已排队或正在上传，等传完再删` };
       const bags = store.bags.filter(b => b.name !== name);
       if (bags.length === store.bags.length) return { ok:false, msg:`data/bags 里没有 ${name}` };
       store.bags = bags;
       return { ok:true, msg:`已删除录包 ${name}（模拟）` };
+    },
+    terminateRoute(id){
+      if (routeActive() && task.route.id === id) return { ok:false, msg:'请先结束正在执行的任务' };
+      const route = store.routes.find(r => r.id === id);
+      if (!route) return { ok:false, msg:'找不到任务' };
+      const routes = store.routes.map(r => r.id === id ? { ...r, resume:null } : r);
+      try { localStorage.setItem(routesKey, JSON.stringify(routes)); }
+      catch { return { ok:false, msg:'浏览器无法终止模拟任务' }; }
+      store.routes = routes;
+      return { ok:true };
     },
     deleteRoute(id){
       if (routeActive() && task.route.id === id) return { ok:false, msg:'请先结束正在执行的任务' };
@@ -447,18 +495,18 @@ export function createMockSource(store, bus){
     },
     startRoute(id, o = {}){
       const route = store.routes.find(r => r.id === id);
-      if (o.vmax != null) store.params.vmax = o.vmax;
-      if (o.wmax != null) store.params.wmax = o.wmax;
       if (o.arm && !store.estop && run('navigation')){ store.armed = true; log('INFO','go2w_cmd_bridge','ARMED (启动任务前自动解锁)'); }
       if (!route || route.map !== store.mapCurrent || !canMove() || S.keys || run('patrol') ||
           (task.type !== 'idle' && task.doneAt == null)){
         return { ok:false, msg:'请确认地图、导航及底盘状态，并结束其他任务' };
       }
+      const vmax = o.vmax ?? route.opts?.vmax ?? .45;
+      store.params.wmax = o.wmax ?? route.opts?.wmax ?? 1.2;
       const loops = o.roundTrip ? Math.min(1000, Math.max(0, Math.round(+o.loops || 0))) : null;
       // 和后端一样：离第 1 站不到 0.5 m 就直接去第 2 站
       const p0 = route.points[0], near = Math.hypot(R.x - p0.x, R.y - p0.y) < 0.5;
       if (near) log('INFO', 'routes', '已在第 1 站附近，直接前往第 2 站');
-      routeLeg(route, near ? routeNext(route.points.length, loops, [0, 1, false]) : [0, 1, false], S.t, { loops, done:near ? 1 : 0 });
+      routeLeg(route, near ? routeNext(route.points.length, loops, [0, 1, false]) : [0, 1, false], S.t, { loops, done:near ? 1 : 0, vmax }, near ? 0 : null);
       return { ok:true };
     },
     cancel(){ cancelTask(); },
@@ -472,7 +520,11 @@ export function createMockSource(store, bus){
     },
     estop(){ if (routeActive()) cancelTask('急停，已取消路线任务'); store.estop = true; store.armed = false; S.paused = true; R.v = R.w = R.vy = 0; S.keys = null; log('ERROR','go2w_cmd_bridge','E-STOP from web console: StopMove sent, LOCKED'); },
     releaseEstop(){ store.estop = false; log('INFO','go2w_cmd_bridge','E-STOP released (still LOCKED)'); },
-    setParam(k, v){ store.params[k] = v; log('INFO','param',`ros2 param set /go2w_cmd_bridge ${{ vmax:'max_vx', wmax:'max_wz', tmo:'cmd_timeout' }[k]} ${v.toFixed(2)}`); },
+    setParam(k, v){
+      if (k === 'vmax' && routeActive()) return { ok:false, msg:'任务执行中，最大 vx 由任务和站点限速共同约束，请先取消任务再调整' };
+      store.params[k] = v;
+      log('INFO','param',`ros2 param set /go2w_cmd_bridge ${{ vmax:'max_vx', wmax:'max_wz', tmo:'cmd_timeout' }[k]} ${v.toFixed(2)}`);
+    },
     // mode = mapping | localization | navigation | null（全部停止）
     setMode(mode, map){
       teaching.interrupt();
@@ -534,11 +586,12 @@ export function createMockSource(store, bus){
     },
     contAbort(){ store.cont = null; store.contPaused = true; return { ok: true, msg: '已放弃（模拟）' }; },
     simulateDrop(){ if (!S.link) return; S.link = false; teaching.interrupt(); log('WARN','go2w_web','client heartbeat lost (> 5.0 s)');
+      const keep = routeActive();   // v1.5.1：自动任务中断网不停车
       setTimeout(() => {
-        if (routeActive()) cancelTask('网页断开，已取消路线任务');
-        lock('web heartbeat lost');
+        if (keep) log('WARN','go2w_web','控制方网页心跳丢失：自动导航继续，不停车');
+        else lock('web heartbeat lost');
       }, 1000);
-      setTimeout(() => { S.link = true; log('INFO','go2w_web','client reconnected, chassis stays LOCKED'); toast('已重连，底盘保持锁定，需要手动解锁','warn'); }, 3000); },
+      setTimeout(() => { S.link = true; log('INFO','go2w_web', keep ? 'client reconnected, task still running' : 'client reconnected, chassis stays LOCKED'); toast(keep ? '已重连，任务一直在跑' : '已重连，底盘保持锁定，需要手动解锁','warn'); }, 3000); },
   };
 
   /* ---------- topic 消息内容（检查器） ---------- */
@@ -570,6 +623,12 @@ export function createMockSource(store, bus){
   let a10 = 0, a5 = 0, a1 = 0, aLog = 0;
   return {
     name: 'mock', cmd, inspect,
+    async cpuStats(){
+      const cpu = Math.max(0, store.sys.cpu ?? 8);
+      return { ok:true, mock:true, cpu, sampledAt:Date.now()/1000, scope:'visible_processes',
+        items:['controller_server', 'fast_lio', 'go2w_ctrl', 'amcl', 'go2w_web.py'].map((name, i) =>
+          ({ name, pid:1000+i, cpu:Math.round(cpu*[.35,.24,.16,.1,.05][i]*10)/10 })) };
+    },
     can: () => true,
     now: () => S.t,
     steps: [['plan', '规划路径', 'Theta*'], ['align', '原地对准', 'RotationShim'], ['follow', '跟随路径', 'MPPI'], ['final', '终点朝向对准', 'goal yaw'], ['arrive', '到达', '停留 1 s']],

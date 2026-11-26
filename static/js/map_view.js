@@ -51,6 +51,11 @@ export function createMapView(store, actions){
         : '点击添加一站 · 按住拖拽指定到站朝向';
       return;
     }
+    if (V.tool === 'area'){
+      hint.hidden = false;
+      hint.innerHTML = '<b>指定大概位置</b> · 点一下狗大概在哪（半径 5 m）· 按住拖动把圈画大 · Esc 取消';
+      return;
+    }
     const name = POSE_TOOLS[V.tool];
     hint.hidden = !name;
     if (name) hint.innerHTML = V.aim ? `<b>${name}</b> · 移动鼠标选择朝向，再点一下确定 · Esc 取消` : `<b>${name}</b> · 点一下选位置，再点一下定朝向（也可以按住拖动）`;
@@ -340,7 +345,7 @@ export function createMapView(store, actions){
         store.routeReplace === i && V.tool === 'route' ? '#6fb6ff'
           : p.dwell > 0 ? DWELL_COL
           : draft.confirmed && i === draft.points.length - 1 ? '#94e8a8' : '#ffe08a', draft.confirmed || p.manualHeading !== false,
-        p.dwell > 0 ? `停${p.dwell}s` : ''));
+        [p.dwell > 0 ? `停${p.dwell}s` : '', p.audio || p.audioLeave ? '♪' : ''].filter(Boolean).join(' ')));   // ♪ = 到站播报
     }
     if (store.goal) drawGoal(store.goal);
     if (store.reloc?.on) drawRelocGhost();
@@ -363,6 +368,19 @@ export function createMapView(store, actions){
         ctx.fillStyle = 'rgba(6,11,18,.9)'; ctx.beginPath(); ctx.roundRect(mx-tw/2, my-24, tw, 20, 5); ctx.fill();
         ctx.fillStyle = '#ffe08a'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(txt, mx, my-14); }
       ctx.restore(); }
+    // 指定大概位置：拖动中的圈 / 正在圈里找的圈
+    const A = V.drag?.tool === 'area' ? areaOf(V.drag) : store.locArea;
+    if (A){
+      ctx.save();
+      ctx.beginPath(); ctx.arc(sx(A.x), sy(A.y), A.r * view.s, 0, 7);
+      ctx.fillStyle = 'rgba(111,182,255,.10)'; ctx.fill();
+      ctx.setLineDash([6, 5]); ctx.lineWidth = 2; ctx.strokeStyle = '#6fb6ff'; ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#6fb6ff'; ctx.beginPath(); ctx.arc(sx(A.x), sy(A.y), 3.5, 0, 7); ctx.fill();
+      ctx.font = '500 11px "JetBrains Mono",monospace'; const txt = `r ${A.r.toFixed(1)} m`, tw = ctx.measureText(txt).width + 12;
+      ctx.fillStyle = 'rgba(6,11,18,.9)'; ctx.beginPath(); ctx.roundRect(sx(A.x)+10, sy(A.y)+10, tw, 18, 4); ctx.fill();
+      ctx.fillStyle = '#6fb6ff'; ctx.textBaseline = 'middle'; ctx.fillText(txt, sx(A.x)+16, sy(A.y)+19);
+      ctx.restore();
+    }
     const d = V.drag && V.drag.moved && (V.drag.tool === 'route' || POSE_TOOLS[V.drag.tool]) ? V.drag : V.aim;
     if (d){
       const col = d.tool==='init' ? '#6fb6ff' : '#ffe08a';
@@ -399,6 +417,9 @@ export function createMapView(store, actions){
     V.aim = null; showHint();
     cv.style.cursor = tool==='pan' ? 'grab' : tool==='teleop' ? 'default' : 'crosshair';
   }
+  // 指定大概位置：点一下 = 半径 5 m；拖动 = 拖到哪半径就多大（1–30 m，和后端一致）
+  const AREA_R = 5, AREA_MIN = 1, AREA_MAX = 30;
+  const areaOf = d => ({ x: d.x0, y: d.y0, r: d.moved ? clamp(Math.hypot(d.x1 - d.x0, d.y1 - d.y0), AREA_MIN, AREA_MAX) : AREA_R });
   // 拖动 / 瞄准的锚点都用世界坐标（米）记：视角在跟随机器人移动时，箭头仍钉在点下的位置
   function commit(tool, x, y, x1, y1){
     const th = Math.atan2(y1-y, x1-x);
@@ -496,6 +517,14 @@ export function createMapView(store, actions){
       const r = actions.routePoint({ x:d.x0, y:d.y0, th, manualHeading:d.moved });
       if (r === true) setTool('pan');   // 改完一站就退出，免得下一下误加新站
       else showHint();                  // 插入后提示条跟着换成下一段
+      return;
+    }
+    if (d.tool === 'area'){
+      if (!inMap(d.x0, d.y0)) return toast('位置在地图范围之外', 'err');
+      const area = areaOf(d);
+      setTool('pan');
+      store.locArea = area;
+      Promise.resolve(actions.autoLocalize({ area })).finally(() => { if (store.locArea === area) store.locArea = null; });
       return;
     }
     if (d.moved) return commit(d.tool, d.x0, d.y0, d.x1, d.y1);           // 按住拖动

@@ -15,9 +15,29 @@ import os
 import threading
 import time
 
-from rollback_recorder_py import BAGS, KEEP_DISTINCT, SAFE_PREFIX, SAFE_TOPIC, chown_tree, msg_class, wanted
+from rollback_recorder_py import BAGS, KEEP_DISTINCT, MCAP_CONFIG, SAFE_PREFIX, SAFE_TOPIC, chown_tree, msg_class, wanted
 
 SAFE_PREFIX_LEN = 30   # 前缀 + _MMDD_HHMMSS 不能超过 SAFE_NAME 的 48
+
+
+class McapWriter:
+    def __init__(self, path):
+        from rosbag2_py import ConverterOptions, SequentialWriter, StorageOptions
+        self.w = SequentialWriter()
+        self.w.open(StorageOptions(uri=path, storage_id='mcap', storage_config_uri=MCAP_CONFIG),
+                    ConverterOptions('cdr', 'cdr'))
+
+    def create_topic(self, topic, type_str):
+        from rosbag2_py import TopicMetadata
+        self.w.create_topic(TopicMetadata(topic, type_str, 'cdr'))
+
+    def write(self, topic, data, t):
+        self.w.write(topic, data, t)
+
+    def close(self):
+        if hasattr(self.w, 'close'):
+            self.w.close()
+        del self.w   # 老版本 rosbag2_py 没有 close，析构时写 metadata.yaml
 
 
 class Segments:
@@ -161,23 +181,6 @@ def main():
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-    from rosbag2_py import ConverterOptions, SequentialWriter, StorageOptions, TopicMetadata
-
-    class Writer:
-        def __init__(self, path):
-            self.w = SequentialWriter()
-            self.w.open(StorageOptions(uri=path, storage_id='mcap'), ConverterOptions('cdr', 'cdr'))
-
-        def create_topic(self, topic, type_str):
-            self.w.create_topic(TopicMetadata(topic, type_str, 'cdr'))
-
-        def write(self, topic, data, t):
-            self.w.write(topic, data, t)
-
-        def close(self):
-            if hasattr(self.w, 'close'):
-                self.w.close()
-            del self.w   # 老版本 rosbag2_py 没有 close，析构时写 metadata.yaml
 
     rclpy.init()
     node = Node('go2w_segment_recorder')
@@ -186,7 +189,7 @@ def main():
         (node.get_logger().error if error else node.get_logger().info)(msg)
 
     recover_leftovers(args.bags, log)
-    seg = Segments(args.bags, args.prefix, args.seconds, Writer, log)
+    seg = Segments(args.bags, args.prefix, args.seconds, McapWriter, log)
     subs, failed = {}, set()
 
     def discover():

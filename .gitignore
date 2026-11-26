@@ -1,8 +1,6 @@
 .DS_Store
 __pycache__/
 *.pyc
-<<<<<<< HEAD
 docs/
-=======
 tools/rollback_recorder_cpp/*.arm64
->>>>>>> upstream/main
+build/

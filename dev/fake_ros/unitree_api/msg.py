@@ -7,3 +7,9 @@ class Request:
         self.header = N(identity=N(id=0, api_id=0), lease=N(id=0), policy=N(priority=0, noreply=False))
         self.parameter = ''
         self.binary = []
+
+
+class Response:   # audiohub / vui 的回复
+    def __init__(self):
+        self.header = N(identity=N(id=0, api_id=0), status=N(code=0))
+        self.data = ''

@@ -30,36 +30,39 @@ try {
   ok('ctrl.climb 有开启时间', C().climb?.since >= 0, JSON.stringify(C().climb));
   await sleep(3000);
   ok('3 s 后仍是 climb（后端在续约）', D().policy === 'climb' && D().req, JSON.stringify(D()));
-  r = await A.cmd('goal', { x: 1, y: 0, th: 0 }); ok('开着时拒绝导航目标', !r.ok && /爬台/.test(r.msg), r.msg);
+  r = await A.cmd('goal', { x: 1, y: 0, th: 0 }); ok('爬台模式照常接受导航目标', r.ok, r.msg);
   r = await A.cmd('climb', { on: false }); ok('关爬台模式', r.ok, r.msg);
   ms = await until(() => D().policy === 'rough' && !D().switching, 2000, '回 rough');
   ok('关掉后回 rough', !C().climb, `${ms} ms`);
 
-  // 开的网页断开：自动关
+  // 模式不绑定开启的页面。
   const B = client(); await B.open; await until(() => B.state?.ctrl, 5000, 'B 收到状态');
   r = await B.cmd('climb', { on: true }); ok('另一个网页开爬台模式', r.ok, r.msg);
   await until(() => D().policy === 'climb', 2000, 'B 开后 climb');
   B.close();
-  ms = await until(() => D().policy === 'rough' && !C().climb, 3000, '网页断开后回 rough');
-  ok('开的网页断开 → 自动关、回 rough', true, `${ms} ms`);
+  await sleep(3000);
+  ok('开启页面断开后仍保持 climb', D().policy === 'climb' && !!C().climb);
 
-  // 急停：自动关
+  // 急停照常停车，不改模式选择。
   r = await A.cmd('climb', { on: true }); await until(() => D().policy === 'climb', 2000, 'climb');
   r = await A.cmd('estop'); ok('急停', true, r.msg);
-  ms = await until(() => D().policy === 'rough' && !C().climb, 2000, '急停后回 rough');
-  ok('急停 → 自动关', true, `${ms} ms`);
+  await sleep(500);
+  ok('急停不改变已选择的爬台模式', D().policy === 'climb' && !!C().climb);
   r = await A.cmd('climb', { on: true }); ok('急停中拒绝开', !r.ok && /急停/.test(r.msg), r.msg);
   await A.cmd('release_estop');
 
-  // 趴下：自动关；趴着时拒绝开
+  // 姿态操作照常可用，模式选择保留到明确关闭。
   r = await A.cmd('climb', { on: true }); await until(() => D().policy === 'climb', 2000, 'climb');
   r = await A.cmd('lie_down'); ok('趴下', r.ok, r.msg);
-  ms = await until(() => !C().climb, 1500, '趴下后爬台模式关'); ok('趴下 → 爬台模式关', true, `${ms} ms`);
   await until(() => C().state === 'Passive', 3000, '趴下');
-  r = await A.cmd('climb', { on: true }); ok('趴着时拒绝开', !r.ok && /站着/.test(r.msg), r.msg);
+  ok('趴下保留爬台模式选择', !!C().climb);
+  r = await A.cmd('climb', { on: true }); ok('趴着时也能选择模式', r.ok, r.msg);
   r = await A.cmd('stand_up'); ok('站起', r.ok, r.msg);
-  await until(() => D()?.policy === 'rough', 2000, '站起后 rough');
-  ok('站起后是 rough', D().policy === 'rough');
+  await until(() => D()?.policy === 'climb', 2000, '站起后 climb');
+  ok('站起后保持原模式', D().policy === 'climb');
+  await A.cmd('climb', { on: false });
+  await until(() => D()?.policy === 'rough' && !C().climb, 2000, '主动关闭');
+  ok('主动关闭后回 rough', true);
 } catch (e) { ok('异常', false, e.message); }
 A.close();
 console.log(res.join('\n'));

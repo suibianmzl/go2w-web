@@ -57,7 +57,8 @@ START_DELAY = 3.0     # 档位启动到节点出现的时间（真机上 FAST-LI
 MODES = ('mapping', 'localization', 'navigation')
 
 ACCEPTED, EXECUTING, SUCCEEDED, CANCELED, ABORTED = 1, 2, 4, 5, 6
-THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '0.5'))   # 多点导航：离途经点这么近就算经过
+THROUGH_RADIUS = float(os.environ.get('GO2W_FAKE_THROUGH_RADIUS', '1.0'))   # 多点导航：离途经点这么近就算经过
+GOAL_XY = float(os.environ.get('GO2W_FAKE_GOAL_XY', '0.25'))   # nav2.yaml goal checker xy_goal_tolerance
 
 
 def load_map(yaml_path):
@@ -113,13 +114,14 @@ FAKE_MOTOR_TAU = [5.9, -1.8, 7.2, -6.8, 0.2, 8.1, 3.8, 0.6, 6.8, -3.8, 0.8, 7.1,
 _fake_lost = [120, 3400, 0, 7, 0, 0, 15, 0, 0, 2, 0, 0, 0, 980, 0, 0]
 
 
-def fake_lowstate():
+def fake_lowstate(state='Passive'):
     b = bytearray(1180)
     b[1] = 1                       # 小端 CDR 头 00 01 00 00
     b[4 + 1039] = 76               # bms_state.soc
     for i, t in enumerate(FAKE_MOTOR_TEMP[:16]):
         b[4 + 108 + 48*i] = t & 0xFF   # motor_state[i].temperature（int8）
-        struct.pack_into('<f', b, 4 + 80 + 48*i, FAKE_MOTOR_Q[i % 3] if i < 12 else 700.0 + i)   # q（rad）
+        q = FAKE_MOTOR_Q if state == 'Passive' or os.environ.get('GO2W_FAKE_STUCK_POSTURE') == '1' else [0., .8, -1.5]
+        struct.pack_into('<f', b, 4 + 80 + 48*i, q[i % 3] if i < 12 else 700.0 + i)   # q（rad）
         struct.pack_into('<f', b, 4 + 92 + 48*i, FAKE_MOTOR_TAU[i] + random.uniform(-0.5, 0.5))   # tau_est（N·m）
         struct.pack_into('<I', b, 4 + 112 + 48*i, _fake_lost[i])   # lost（累计丢包）
         struct.pack_into('<I', b, 4 + 116 + 48*i, FAKE_MOTOR_ERR[i])   # reserve[0]（错误标志）
@@ -147,6 +149,8 @@ class Sim:
         # 进程：开机时导航已经在跑（和平时 nav.sh start 之后一样）
         self.procs = {'mapping': False, 'localization': False, 'navigation': True, 'patrol': False, 'bag': False, 'bridge': False, 'bag_seg': False}
         self.ready_at = {'navigation': 0.0}
+        if os.environ.get('GO2W_FAKE_NAV_OFF') == '1':
+            self.procs['navigation'] = False
         # 假 cmd_bridge
         self.armed = False
         self.params = {'max_vx': 1.0, 'max_wz': 1.2, 'cmd_timeout': 0.3}
@@ -291,7 +295,46 @@ class Sim:
     def subscribers(self, topic):
         if topic == '/patrol_pose':
             return 1 if self.pat and time.monotonic() >= self.pat['ready_at'] else 0
+        if topic in ('/api/audiohub/request', '/api/vui/request'):
+            return 0 if os.path.exists('/tmp/go2w_fake_audio_off') else 1
         return 0
+
+    def audio_req(self, service, msg):
+        """假喇叭：喊话 4001 / 4003 / 4002 和音量。每次退出喊话把拼回来的 WAV 写到 /tmp/go2w_fake_audio.wav，api 顺序写到 .log。
+        /tmp/go2w_fake_audio_fail 存在：里面写的 api_id 回错误码 7。"""
+        import base64
+        import json
+        from unitree_api.msg import Response
+        if not hasattr(self, 'hub'):
+            self.hub = {'vol': 5, 'blocks': [], 'log': []}
+            if os.path.exists('/tmp/go2w_fake_audio.log'):   # 上一个进程留下的
+                os.unlink('/tmp/go2w_fake_audio.log')
+        h = self.hub
+        api, r = msg.header.identity.api_id, Response()
+        r.header.identity.id, r.header.identity.api_id = msg.header.identity.id, api
+        try:
+            with open('/tmp/go2w_fake_audio_fail') as f:
+                fail = int(f.read())
+        except (OSError, ValueError):
+            fail = None
+        if api == fail:
+            r.header.status.code = 7
+        elif service == 'vui' and api == 1003:
+            h['vol'] = json.loads(msg.parameter)['volume']
+        elif service == 'vui' and api == 1004:
+            r.data = json.dumps({'volume': h['vol']})
+        elif service == 'audiohub' and api == 4001:
+            h['blocks'] = []
+        elif service == 'audiohub' and api == 4003:
+            h['blocks'].append(json.loads(msg.parameter)['block_content'])
+        if service == 'audiohub':
+            h['log'].append(api)
+            with open('/tmp/go2w_fake_audio.log', 'w') as f:
+                json.dump(h['log'], f)
+            if api == 4002:
+                with open('/tmp/go2w_fake_audio.wav', 'wb') as f:
+                    f.write(base64.b64decode(''.join(h['blocks'])))
+        self.node.deliver(f'/api/{service}/response', r)
 
     def start_mode(self, mode, map_yaml=None, *, taught_route=False):
         self.mode_environment = {'GO2W_NAVIGATION_MODE': mode}
@@ -601,6 +644,8 @@ class Sim:
             yaw = 2 * math.atan2(p.orientation.z, p.orientation.w)
             self.pat['points'].append((p.position.x, p.position.y, yaw))
             self.plog(20, '%s 点：(%.2f, %.2f)，朝向 %.0f°' % ('AB'[len(self.pat['points']) - 1], p.position.x, p.position.y, math.degrees(yaw)))
+        elif topic in ('/api/audiohub/request', '/api/vui/request'):
+            self.audio_req(topic.split('/')[2], msg)
         elif topic == '/api/sport/request':
             if msg.header.identity.api_id == 2101:
                 if self.dual is not None:
@@ -808,7 +853,14 @@ class Sim:
                 return 0.0, 0.0
             if g['through']:
                 path, start = [], (self.x, self.y)
-                for vx, vy in g['via']:
+                vias = g['via']
+                # 11-25 擦过站点：有 GO2W_FAKE_THROUGH_SKIP 文件（默认 /tmp/go2w_fake_through_skip）时，这次规划直接跳过
+                # 第一个途经点（真机上切内道从站旁 0.6–1.2 m 擦过去）。Nav2 不会划掉它，跑到头再掉头回去找（见下面）。用一次删掉
+                skip = os.environ.get('GO2W_FAKE_THROUGH_SKIP', '/tmp/go2w_fake_through_skip')
+                if len(vias) > 2 and os.path.exists(skip):
+                    os.remove(skip)
+                    vias = vias[1:]
+                for vx, vy in vias:
                     seg = self.plan(vx, vy, start)
                     if seg is None:
                         path = None
@@ -829,6 +881,12 @@ class Sim:
             self.node.deliver('/plan', self.path_msg())
             self.rosout(20, 'controller_server', 'Received a goal, begin computing control effort.')
             g['mark'] = (now, self.x, self.y)
+            # 11-25 真机：控制器的 goal checker 只看整条路径的终点（xy 0.25 m）。多点目标的终点就在狗旁边时
+            # （环线回到起点），一开始就满足 → 同一拍 "Reached the goal!"，中间站一个都没走（bag go2w-01_1125_114120）
+            if g['through'] and math.hypot(g['x'] - self.x, g['y'] - self.y) <= GOAL_XY:
+                self.rosout(20, 'controller_server', 'Reached the goal!')
+                self.finish(SUCCEEDED)
+                return 0.0, 0.0
         if g['through']:
             while len(g['via']) > 1 and math.hypot(g['via'][0][0] - self.x, g['via'][0][1] - self.y) <= THROUGH_RADIUS:
                 g['via'].pop(0)
@@ -865,6 +923,18 @@ class Sim:
             if abs(err) > 0.5:
                 return 0.0, math.copysign(min(wmax*.7, abs(err)*1.5 + .1), err)   # RotationShim：先原地转向
             return min(vmax, 0.12 + (d if last else 1.0)*0.6), max(-wmax, min(wmax, 2.0*err))
+        if g['through'] and len(g['via']) > 1:   # 路径走完了、途经点还没划掉（擦过去了）：重新规划，掉头回去找
+            self.rosout(20, 'bt_navigator', 'fake nav: 途经点没经过，掉头回去')
+            path, start = [], (self.x, self.y)
+            for vx, vy in g['via']:
+                part = self.plan(vx, vy, start)
+                if part is None:
+                    self.finish(ABORTED)
+                    return 0.0, 0.0
+                path += part
+                start = (vx, vy)
+            g['path'], g['i'] = path, 0
+            return 0.0, 0.0
         err = wrap(g['th'] - self.th)        # 到点后对准目标朝向
         if abs(err) < 0.05:
             self.finish(SUCCEEDED)
@@ -1167,7 +1237,10 @@ def run(node):
         if nav and k % 20 == 0:   # 全局代价地图 1 Hz（内容不变，后端会去重）
             node.deliver('/global_costmap/costmap', sim.costmap_msg(local=False))
         if k % 4 == 2:   # /go2w/robot_lowstate（真机约 230 Hz，这里 5 Hz 够测力矩 2 Hz 刷新）：后端只按 CDR 偏移读 soc 和电机温度，这里只拼这几个字节
-            node.deliver('/go2w/robot_lowstate', fake_lowstate())
+            raw = fake_lowstate(sim.ctrl['state'])
+            node.deliver('/go2w/robot_lowstate', raw)
+            if not os.path.exists(os.environ.get('GO2W_FAKE_LOWSTATE_OFF', '/tmp/go2w_fake_lowstate_off')):
+                node.deliver('/lowstate', raw)
         if sim.loc_ready() and k % 20 == 0:  # /amcl_pose：假定位误差很小，走起来略大
             a = PoseWithCovarianceStamped()
             a.header.stamp.sec, a.header.stamp.nanosec = sim.stamp()

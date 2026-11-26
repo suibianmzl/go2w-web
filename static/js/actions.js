@@ -76,17 +76,10 @@ export function createActions(store, src){
         onOk: () => exec(src.cmd.setPolicy(name), null).finally(() => onDone?.()),
         onCancel: () => onDone?.() });
     },
-    // 爬台模式（融合策略）：开着时后端一直续约 2101；关掉、网页断开、急停、趴下、超时都会切回 rough
+    // 爬台是普通模式选择，不与导航、示教或姿态操作互斥。
     climb(on){
-      const C = store.ctrl;
       if (!ready('climb')) return;
-      if (!on) return exec(src.cmd.climb(false), null);
-      if (store.estop) return toast('急停中：先解除急停', 'err');
-      if (!(C?.state === 'Velocity' && C.ready) || C.op) return toast('只能站着（策略运行中）开爬台模式', 'err');
-      const max = Math.round((C.dual && C.climb?.max) || 300);
-      confirmBox({ title: '开爬台模式', ok: '开启',
-        body: `运控切到 climb 策略（约 0.5 s 过渡）。速度要在 vx ≤ 0.5、vy ≤ 0.15、wz ≤ 0.15 以内才会切，超了先挂起、降下来自动切；建议先停稳再开。上台用遥控器或网页摇杆慢慢走。关掉、网页断开、急停、趴下或开满 ${Math.round(max / 60)} 分钟都会自动切回 rough。开着时不能发导航任务。`,
-        onOk: () => exec(src.cmd.climb(true), null) });
+      return exec(src.cmd.climb(!!on), null);
     },
     // fine = 重定位的微调：后端用小协方差，AMCL 不会把粒子撒开
     initialPose(p, fine = false){
@@ -97,12 +90,13 @@ export function createActions(store, src){
       return exec(src.cmd.initialPose(p, fine), fine ? null : '初始位姿已发布，粒子收敛中').then(r => { if (r?.ok !== false) store.onInitialPose?.(); return r; });
     },
     // 自动定位：后端用当前 scan 在整张地图上找机器人，可信才发给 AMCL（不可信只报告，不改位姿）
-    autoLocalize(){
+    // opts.area = {x, y, r}：只在地图上画的圈里找；opts.hints：先在这几处（任务站点）附近找，找不到再搜整张图
+    autoLocalize(opts = {}){
       if (!ready('autoLocalize')) return Promise.resolve({ ok: false });
       if (!run('localization') && !run('navigation')) return Promise.resolve((toast('定位没有运行', 'err'), { ok: false }));
       if (store.task.type !== 'idle' && store.task.status === 'active') return Promise.resolve((toast('任务进行中：先取消再自动定位', 'err'), { ok: false }));
-      toast('自动定位中：机器人保持静止，约需 5–10 秒', 'warn');
-      return exec(src.cmd.autoLocalize(), null);
+      toast(opts.area ? `在指定的半径 ${+opts.area.r.toFixed(1)} m 范围里自动定位：机器人保持静止，约需 2–5 秒` : '自动定位中：机器人保持静止，约需 2–15 秒', 'warn');
+      return exec(src.cmd.autoLocalize(opts), null);
     },
     // 自动定位失败后：机器狗自己小范围挪一次再定位（后端检查空间、按里程计控制距离，没解锁会临时解锁、结束后恢复上锁）
     autolocMove(){
@@ -170,6 +164,13 @@ export function createActions(store, src){
           if (reply?.ok) onDeleted();
         } });
     },
+    terminateRoute(route_id){
+      if (!ready('terminateRoute')) return Promise.resolve({ ok:false });
+      if (!store.link.ok) return Promise.resolve({ ok:false, msg:'等待连接后端' });
+      if (store.task.status === 'active' && store.task.routeId === route_id)
+        return Promise.resolve((toast('请先结束正在执行的任务', 'err'), { ok:false }));
+      return exec(src.cmd.terminateRoute(route_id), '未完成任务已终止，已保存的路线仍保留');
+    },
     // 下发任务：出发流程（flow.js）站好、导航和定位都就绪后调用，自动解锁出发（后端 route_start 带 arm）。
     // opts.vmax / wmax：任务里保存的速度上限，后端出发前设给 cmd_bridge。
     // 只有激光和地图对不太上（匹配率 < 60%）时才多问一句
@@ -184,20 +185,25 @@ export function createActions(store, src){
         warn: `激光和地图的匹配率只有 ${m.toFixed(0)}%，建议先重新定位。`,
         onCancel: () => resolve(null), onOk: () => resolve(go()) }));
     },
-    cancel(){ if (ready('cancel')) exec(src.cmd.cancel(), '任务已取消'); },
+    cancel(){
+      if (!ready('cancel')) return;
+      const go = () => exec(src.cmd.cancel('取消按钮'), '任务已取消');
+      if (store.task.type === 'idle') return go();   // 没有任务在跑：不用确认
+      confirmBox({ title: '取消任务', body: '机器狗会停下，当前任务结束（多点任务之后可以「继续」从断点接着跑）。', ok: '确认取消', danger: true, onOk: go });
+    },
     pause(){ if (ready('pause')) src.cmd.pause(!src.paused); },
     arm(){
       if (!ready('arm') || store.estop) return;
-      if (store.armed) return exec(src.cmd.arm(false), '底盘已锁定');
+      if (store.armed) return exec(src.cmd.arm(false, '上锁按钮'), '底盘已锁定');
       if (!run('navigation') && !run('bridge')) return toast('速度桥不在线（刚开机或刚切换档位时要等几秒）', 'err');
       if (run('navigation') && !store.odomOk) return toast('里程计不健康，不能解锁', 'err');
       confirmBox({ title: '解锁底盘', body: '解锁后机器人会执行导航和遥控的速度指令。确认机器人周围没有人和障碍物。', ok: '解锁',
         onOk: () => exec(src.cmd.arm(true), '底盘已解锁') });
     },
-    estop(){
+    estop(why){
       if (!ready('estop') || store.estop) return;
       store.estop = true; // 先在界面上锁存，后端的状态随后确认
-      Promise.resolve(src.cmd.estop()).then(r => {
+      Promise.resolve(src.cmd.estop(why)).then(r => {
         if (r && r.ok === false) toast(store.link.ok ? `急停没有完全生效：${r.msg}` : '急停没有发出去：网页和后端断开了，请用遥控器停车', 'err');
       });
     },
@@ -458,10 +464,17 @@ export function createActions(store, src){
     },
     uploadBag(bag){
       if (!ready('uploadBag')) return;
-      const u = store.uploads[bag.name];
-      if (u?.state === 'done') return confirmBox({ title:'重新上传', body:`${bag.name} 已在 ${u.msg} 上传过。再传一次会补齐 166 上缺的部分，已有的文件不重复传。`, ok:'上传',
-        onOk: () => exec(src.cmd.uploadBag(bag.name), null) });
-      exec(src.cmd.uploadBag(bag.name), null);
+      if (store.uploads[bag.name]?.state === 'done') return confirmBox({ title:'核对已上传录包',
+        body:`${bag.name} 已上传，无需重复上传。核对服务器时只补齐缺失或变化的文件，仍使用同一个目录。`, ok:'核对并补齐',
+        onOk:() => exec(src.cmd.uploadBag(bag.name, true), null) });
+      return A.uploadBags([bag]);
+    },
+    uploadBags(bags){
+      if (!ready('uploadBag')) return;
+      const names = [...new Set(bags.map(b => b.name))].filter(name => !['queued', 'run', 'done'].includes(store.uploads[name]?.state));
+      if (!names.length) return;
+      const send = () => Promise.all(names.map(name => exec(src.cmd.uploadBag(name), null)));
+      return send();
     },
     simulateDrop(){ if (ready('simulateDrop')) exec(src.cmd.simulateDrop(), null); },
   };

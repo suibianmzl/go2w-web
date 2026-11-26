@@ -9,6 +9,7 @@ from types import MethodType
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from teaching_bridge import TaughtWeb
 
 
@@ -49,6 +50,13 @@ class PrepareTests(unittest.IsolatedAsyncioTestCase):
             amcl=(0.03, 1.0, time.monotonic()),
             event=lambda level, message: events.append(('event', message)),
         )
+        from robot_feedback import RobotFeedback
+        from dev.test_robot_feedback import lowstate,STAND,LIE
+        host.node.robot_feedback=RobotFeedback()
+        host.node.robot_feedback.set_targets(STAND,LIE)
+        host.node.robot_feedback.update(lowstate(LIE if state=='Passive' else STAND))
+        host.refresh_stand_targets=lambda:None
+        host.climb=None
 
         async def stand(who, valid=None):
             events.append(('stand', host.ctrl.state))
