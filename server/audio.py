@@ -30,6 +30,7 @@ RATE = 16000
 BLOCK = 16384        # base64 字符数 / 块（约 0.38 s 音频）
 GAP = 0.05           # 块间隔 s
 TAIL = 1.5           # 播完再等多久才退出喊话
+GAP_CLIPS = 0.3     # 几段连着播（11-25 站点多段播报）：上一段退出喊话后隔多久进下一段
 DUR_MIN, DUR_MAX = 0.2, 60.0
 CLIPS_MAX = 100
 BODY_MAX = int(DUR_MAX * RATE * 2) + 65536
@@ -147,7 +148,8 @@ class Audio:
 
     def message(self):
         c = self.cur
-        cur = c and {**{k: c[k] for k in ('clip', 'name', 'dur', 'phase', 'who')}, 'elapsed': round(time.monotonic() - c['t'], 2)}
+        cur = c and {**{k: c[k] for k in ('clip', 'name', 'dur', 'phase', 'who')}, 'elapsed': round(time.monotonic() - c['t'], 2),
+                     **({'wait': c['wait']} if 'wait' in c else {})}
         return json.dumps({'t': 'audio', 'avail': self.avail, 'why': '' if self.avail else self.why, 'items': list(self.items.values()),
                            'cur': cur, 'vol': self.vol, 'last': self.last, 'limit': DUR_MAX}, ensure_ascii=False)
 
@@ -203,10 +205,21 @@ class Audio:
         await asyncio.gather(j, return_exceptions=True)
         return True
 
+    def busy(self, tag):
+        """tag 发起的播报（可能是好几段）还在播。"""
+        j = self.job
+        return self.tag is tag and j is not None and not j.done()
+
     async def play(self, clip, who, tag=None, valid=None):
-        """valid：拿到锁之后再问一次还要不要播（任务可能刚好被取消了）。"""
-        x = self.items.get(clip) if isinstance(clip, str) else None
-        if x is None:
+        """clip：一段音频 id，或几段的列表（11-25，按顺序一段接一段播，找不到的跳过）；
+        列表元素是 id 或 (id, 播前等几秒)。valid：拿到锁之后再问一次还要不要播（任务可能刚好被取消了）。"""
+        xs = []
+        for c in clip if isinstance(clip, list) else [clip]:
+            cid, wait = c if isinstance(c, tuple) else (c, 0)
+            x = self.items.get(cid) if isinstance(cid, str) else None
+            if x is not None:
+                xs.append({**x, 'wait': float(wait or 0)})
+        if not xs:
             return False, '没有这段音频'
         if not self.avail:
             return False, self.why
@@ -218,8 +231,27 @@ class Audio:
             if self.closed or (valid is not None and not valid()):
                 return True, '任务已停，不播'
             self.tag = tag
-            self.job = asyncio.create_task(self.run_clip(dict(x), who))
-        return True, f'开始播报「{x["name"]}」'
+            self.job = asyncio.create_task(self.run_clip(xs[0], who) if len(xs) == 1 and not xs[0]['wait'] else self.run_list(xs, who))
+        return True, '开始播报' + ''.join(f'「{x["name"]}」' for x in xs)
+
+    async def run_list(self, xs, who):
+        """几段按顺序播：每段照常进入 / 退出喊话，中间隔一下让狗退出上一段；哪段没播成就不往下播了。"""
+        for k, x in enumerate(xs):
+            if x['wait'] > 0:   # 播这段前先等几秒（站点里手填）：等的时候网页显示「等 N s 后播」
+                self.cur = {'clip': x['id'], 'name': x['name'], 'dur': x['dur'], 'phase': 'wait', 'who': who,
+                            't': time.monotonic(), 'wait': x['wait']}
+                await self.notify()
+                try:
+                    await asyncio.sleep(x['wait'])
+                except asyncio.CancelledError:   # 等的时候被停了：网页上的「等 N s 后播」要撤掉
+                    self.cur = None
+                    await self.notify()
+                    raise
+                self.cur = None
+            elif k:
+                await asyncio.sleep(GAP_CLIPS)
+            if not await self.run_clip(x, who):
+                return
 
     async def stop(self, who):
         async with self.lock:
@@ -261,6 +293,7 @@ class Audio:
             if bad:
                 raise AudioError(f'狗拒收音频（code={bad[0]}）')
             ok, msg = True, '播完'
+            return True
         except asyncio.CancelledError:
             msg = '被停止'
             raise
@@ -279,6 +312,7 @@ class Audio:
             if not ok and msg != '被停止':
                 self.event('WARN', f'播报「{x["name"]}」失败：{msg}')
             await self.notify()
+        return False
 
     async def set_volume(self, v, who):
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10:

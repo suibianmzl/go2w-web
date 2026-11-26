@@ -87,7 +87,7 @@ export function setupAudio(store, src){
     list(A);
     const c = A.cur, el = c ? (performance.now() - A.rx) / 1000 + c.elapsed : 0;
     const L = A.last;
-    set($('#auNow'), !linked ? '没有连上后端' : c ? (c.phase === 'send' ? `正在传给狗：${c.name}` : `正在播：${c.name}（${Math.min(el, c.dur).toFixed(0)} / ${c.dur.toFixed(0)} s）`)
+    set($('#auNow'), !linked ? '没有连上后端' : c ? (c.phase === 'send' ? `正在传给狗：${c.name}` : c.phase === 'wait' ? `等 ${Math.max(0, Math.ceil((c.wait || 0) - el))} s 后播：${c.name}` : `正在播：${c.name}（${Math.min(el, c.dur).toFixed(0)} / ${c.dur.toFixed(0)} s）`)
       : !A.avail ? `喇叭不可用：${A.why}` : L ? `空闲 · 上次「${L.name}」${L.ok ? '播完' : L.msg}` : '空闲');
     $('#auNow').dataset.s = c ? 'run' : !linked || !A.avail || (L && !L.ok && L.msg !== '被停止') ? 'warn' : '';
     $('#auUp').disabled = !linked || busy; $('#auStop').disabled = !linked || !c;

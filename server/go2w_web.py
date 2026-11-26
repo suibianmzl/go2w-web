@@ -230,6 +230,9 @@ ROUTE_PASS_DIST = 0.6   # 实际取 min(0.6, 这段路长度的一半)
 ROUTE_FAKE_ARRIVE = 0.5
 ROUTE_FAKE_RETRY = 2
 ROUTE_DWELL_MAX = 3600   # s：站点停留最长 1 小时
+ROUTE_AUDIO_MAX = 5      # 站点到站 / 离开前播报各最多几段（11-25）
+ROUTE_AUDIO_WAIT_EACH = 600   # s：每段播报前最多等多久（站点里手填，11-25）
+ROUTE_AUDIO_WAIT = 400.0 + ROUTE_AUDIO_MAX * ROUTE_AUDIO_WAIT_EACH   # s：离开前等播报播完最多等多久（5 段 × (60 s + 等待) + 传输，留余量）
 # 11-24 v1.1.11「连续通过」（任务运行参数 opts.through，默认开）：以停留站为界把路线切成几段，每段一个
 # NavigateThroughPoses；中间分段末点也按经过推进，停留点取消旧目标后计时，整条任务终点等待 Nav2 成功。
 # 行为树用网页发布包里的 server/bt/navigate_through_go2w.xml（恢复动作同 navigate_go2w.xml，RemovePassedGoals 每轮都跑）。
@@ -2593,12 +2596,32 @@ class Server(TaughtWeb, RT.RtabWeb):
                 raise ValueError('强制跨越开关需要是布尔值')
             if crossing:
                 item['forceCrossing'] = True
-            clip = point.get('audio')       # 11-25：到这一站播哪段音频（audio.py 的 id），没有 = 不播
-            if clip not in (None, ''):
-                if isinstance(clip, str) and re.fullmatch('[0-9a-f]{12}', clip):
-                    item['audio'] = clip
-                elif strict:
-                    raise ValueError('站点播报音频无效')
+            # 11-25：audio = 到站播的音频（audio.py 的 id），audioLeave = 离开前播的（播完再走）。
+            # 一段存字符串（和 v1.1.15 一样），多段（按顺序播，最多 ROUTE_AUDIO_MAX 段）存列表；没有 = 不播
+            for key, what in (('audio', '到站播报'), ('audioLeave', '离开前播报')):
+                raw = point.get(key)
+                if raw in (None, '', []):
+                    continue
+                got = raw if isinstance(raw, list) else [raw]
+                ok = []   # 每段：音频 id 字符串，或 {id, wait}（wait = 播这段前先等几秒，11-25）
+                for c in got:
+                    cid, wait = (c.get('id'), c.get('wait', 0)) if isinstance(c, dict) else (c, 0)
+                    if not isinstance(cid, str) or not re.fullmatch('[0-9a-f]{12}', cid):
+                        if strict:
+                            raise ValueError(f'站点{what}音频无效')
+                        continue
+                    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) \
+                            or not 0 <= wait <= ROUTE_AUDIO_WAIT_EACH:
+                        if strict:
+                            raise ValueError(f'站点{what}每段前的等待需要 0–{ROUTE_AUDIO_WAIT_EACH} 秒')
+                        wait = 0
+                    wait = int(round(wait))
+                    ok.append({'id': cid, 'wait': wait} if wait > 0 else cid)
+                if strict and len(ok) > ROUTE_AUDIO_MAX:
+                    raise ValueError(f'站点{what}最多 {ROUTE_AUDIO_MAX} 段')
+                ok = ok[:ROUTE_AUDIO_MAX]
+                if ok:
+                    item[key] = ok[0] if len(ok) == 1 and isinstance(ok[0], str) else ok
             clean.append(item)
         if sum(p.get('forceCrossing', False) for p in clean) == 1:
             raise ValueError('强制跨越需要至少选择两个点，或者全部不选')
@@ -2644,7 +2667,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         route_id = route_id or uuid.uuid4().hex
         record = self.route_record(d, route_id)
         for i, p in enumerate(record['points'], 1):
-            if p.get('audio') and p['audio'] not in self.audio.items:
+            if any(c not in self.audio.items for key in ('audio', 'audioLeave') for c in self.point_clips(p, key)):
                 return False, f'第 {i} 站选的播报音频已经不在了，重新选一段或改成不播报'
         self.write_routes({**self.routes, route_id: record})
         return True, f"已保存任务：{record['name']}", record
@@ -3681,31 +3704,102 @@ class Server(TaughtWeb, RT.RtabWeb):
         n.event('INFO', '出发前已清除代价地图里的旧障碍标记')
 
     # ---------- 站点播报（11-25） ----------
+    @staticmethod
+    def point_seq(p, key='audio'):
+        """站点 key（audio = 到站 / audioLeave = 离开前）要播的 [(音频 id, 播前等几秒)]：
+        存的是一段（字符串）或几段（列表，元素是 id 字符串或 {id, wait}）。"""
+        v = p.get(key)
+        v = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+        out = []
+        for c in v:
+            cid, wait = (c.get('id'), c.get('wait', 0)) if isinstance(c, dict) else (c, 0)
+            if isinstance(cid, str) and cid:
+                out.append((cid, wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) and wait > 0 else 0))
+        return out
+
+    @staticmethod
+    def point_clips(p, key='audio'):
+        return [c for c, _ in Server.point_seq(p, key)]
+
     def audio_used(self, clip):
         return [f"任务「{r['name']}」第 {i} 站" for r in self.routes.values()
-                for i, p in enumerate(r['points'], 1) if p.get('audio') == clip]
+                for i, p in enumerate(r['points'], 1)
+                if clip in self.point_clips(p, 'audio') + self.point_clips(p, 'audioLeave')]
 
-    def route_audio(self, route, i):
-        """到 / 经过第 i 站：这站选了音频就播。后台播，播不出来只记日志，不影响任务。
-        一口气补记好几站（Nav2 一次划掉几站）时只播最后一个配了音频的站。"""
-        if not route['record']['points'][i].get('audio'):
+    def route_audio(self, route, i, key='audio'):
+        """到 / 经过第 i 站（key = audio）或离开第 i 站前（key = audioLeave）：这站选了音频就按顺序播。
+        后台播，播不出来只记日志，不影响任务。一口气补记好几站（Nav2 一次划掉几站）时只播最后一个配了音频的站。"""
+        clips = self.point_seq(route['record']['points'][i], key)
+        if not clips:
             return
-        route['audio'] = i
+        mark = route['audio'] = (i, key, object())
 
         async def go():
             await asyncio.sleep(0)
-            if route['audio'] != i:
+            if route['audio'] is not mark:
                 return
             name = route['record']['points'][i].get('name') or f'第 {i + 1} 站'
             try:
                 ok, msg = await self.audio.play(
-                    route['record']['points'][i]['audio'], f'任务 {name}', tag=route,
-                    valid=lambda: route['status'] in ('active', 'succeeded') and route['audio'] == i)
+                    clips, f"任务 {name}{'（离开前）' if key == 'audioLeave' else ''}", tag=route,
+                    valid=lambda: route['status'] in ('active', 'succeeded') and route['audio'] is mark)
             except Exception as e:
                 ok, msg = False, repr(e)
             if not ok:
                 self.node.event('WARN', f'{name}播报没播：{msg}')
-        self.background(go())
+        t = asyncio.create_task(go())
+        self.pending.add(t)
+        t.add_done_callback(self.pending.discard)
+        route['audio_go'] = t
+
+    async def route_audio_wait(self, ws, route):
+        """等这趟任务自己发起的播报播完。被取消 / 急停返回 False；阻断条件照常生效；最多等 ROUTE_AUDIO_WAIT s。"""
+        end = time.monotonic() + ROUTE_AUDIO_WAIT
+        while True:
+            if route['stop'].is_set():
+                return False
+            t = route.get('audio_go')
+            if (t is None or t.done()) and not self.audio.busy(route):
+                return True
+            if time.monotonic() > end:
+                self.node.event('WARN', f'播报 {ROUTE_AUDIO_WAIT:.0f} s 还没播完，不等了，继续任务')
+                return True
+            reason = self.route_blocker(ws, route['record'])
+            if reason:
+                raise RuntimeError(f'播报中：{reason}')
+            try:
+                await asyncio.wait_for(route['stop'].wait(), 0.2)
+                return False
+            except asyncio.TimeoutError:
+                pass
+
+    async def route_leave(self, ws, route, i):
+        """离开第 i 站前：配了「离开前播报」就先等到站那几段播完，再播离开前的，播完再走。被取消返回 False。
+        11-26：设了停留的站，停留结束时到站播报（含每段前的延时）还没播完，也等播完再走，不边走边播。"""
+        p = route['record']['points'][i]
+        leave = bool(self.point_clips(p, 'audioLeave'))
+        if not leave:
+            if not (p.get('dwell') and self.point_clips(p, 'audio')):
+                return True
+            go = route.get('audio_go')
+            if not (self.audio.busy(route) or (go is not None and not go.done())):
+                return True
+        if not leave:
+            self.node.event('INFO', f"{p.get('name') or f'第 {i + 1} 站'}停留结束，到站播报还没播完，播完再走")
+        route['speaking'] = True
+        try:
+            if not await self.route_audio_wait(ws, route):
+                return False
+            if not leave:
+                return True
+            self.route_audio(route, i, 'audioLeave')
+            return await self.route_audio_wait(ws, route)
+        finally:
+            route['speaking'] = False
+
+    def clip_names(self, p, key):
+        names = [(self.audio.items.get(c) or {}).get('name') for c in self.point_clips(p, key)]
+        return '、'.join(x for x in names if x) or None
 
     async def route_climb_set(self, route, on):
         if not on and not route.get('climb_touched'):
@@ -3836,7 +3930,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                 nxt = self.route_next(total, loops, s)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0
                 seg.append((s, self.route_pose(points, i, back), dwell, nxt))
-                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX or i in (route.get('crossing') or ()):
+                if dwell or nxt is None or len(seg) >= ROUTE_SEG_MAX or i in (route.get('crossing') or ()) or points[i].get('audioLeave'):
                     break
                 s = nxt
             # 这段的终点就在狗旁边（环线回到出发位置）：控制器的 goal checker 只看路径终点，一开始就满足，
@@ -3854,7 +3948,7 @@ class Server(TaughtWeb, RT.RtabWeb):
             poses = []
             for k, (_, pt, dwell, nxt) in enumerate(seg):
                 last = k == len(seg) - 1
-                if last and (dwell or nxt is None or seg[k][0][0] in (route.get('crossing') or ())):
+                if last and (dwell or nxt is None or seg[k][0][0] in (route.get('crossing') or ()) or points[seg[k][0][0]].get('audioLeave')):
                     th = pt['th']                       # 要停下来的站：站点自己的朝向
                 else:                                   # 途经点 / 分段处：面向下一站
                     q = seg[k + 1][1] if not last else self.route_pose(points, nxt[0], nxt[2])
@@ -4008,9 +4102,11 @@ class Server(TaughtWeb, RT.RtabWeb):
             if route['stop'].is_set():
                 return 'stop'
             self.route_audio(route, last_state[0])
-            if passed_end and dwell:
+            if passed_end and (dwell or points[last_state[0]].get('audioLeave')):
                 await self.cancel_route_goal(route)
             if dwell and not await self.route_dwell(ws, route, last_state[0], dwell):
+                return 'stop'
+            if not await self.route_leave(ws, route, last_state[0]):
                 return 'stop'
             route['done'] += 1
             state = nxt
@@ -4078,9 +4174,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if route['stop'].is_set():
                     return
                 self.route_audio(route, 0)
-                if points[0].get('dwell'):   # 第 1 站要停留：人已经在这了，原地停够再走
+                if points[0].get('dwell') or points[0].get('audioLeave'):   # 第 1 站要停留 / 离开前播报：人已经在这了，原地停够、播完再走
                     route.update(index=0, target=points[0])
-                    if not await self.route_dwell(ws, route, 0, points[0]['dwell']):
+                    if points[0].get('dwell') and not await self.route_dwell(ws, route, 0, points[0]['dwell']):
+                        return
+                    if not await self.route_leave(ws, route, 0):
                         return
                 first = self.route_next(len(points), loops, first)
                 route['done'] = 1
@@ -4125,10 +4223,11 @@ class Server(TaughtWeb, RT.RtabWeb):
                     raise RuntimeError(reason)
                 nxt = self.route_next(len(points), loops, state)
                 dwell = points[i].get('dwell', 0) if nxt is not None else 0   # 终点停不停留都一样
+                leave = bool(points[i].get('audioLeave'))   # 离开前要播报：像停留站一样停下，播完再走（终点 / 回到起点也播）
                 passing = nxt is not None
                 if passing:
                     q = self.route_pose(points, nxt[0], nxt[2])
-                if (passing and not dwell and i not in (route['crossing'] or ()) and
+                if (passing and not dwell and not leave and i not in (route['crossing'] or ()) and
                         abs(self.route_leg_vmax(route, state) - self.route_leg_vmax(route, nxt)) < 1e-6):
                     pose = (point['x'], point['y'], math.atan2(q['y'] - point['y'], q['x'] - point['x']))
                 else:
@@ -4182,7 +4281,7 @@ class Server(TaughtWeb, RT.RtabWeb):
                             else:
                                 t_leg = 0.0
                         n.event('INFO', f"经过第 {i + 1} 站 ({pose[0]:.2f}, {pose[1]:.2f})，用时 {t_leg:.1f} s，"
-                                        f"{'准备停留' if dwell else '继续下一站'}")
+                                        f"{'准备停留' if dwell else '准备播报' if leave else '继续下一站'}")
                         status = GoalStatus.STATUS_SUCCEEDED
                         prev = handle
                     else:
@@ -4220,10 +4319,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if route['stop'].is_set():
                     return
                 self.route_audio(route, i)
-                if passed and dwell:
+                if passed and (dwell or leave):
                     await self.cancel_route_goal(route)
                     prev = None
                 if dwell and not await self.route_dwell(ws, route, i, dwell):
+                    return
+                if not await self.route_leave(ws, route, i):
                     return
                 route['done'] += 1
                 state = self.route_next(len(points), loops, state)
@@ -4274,6 +4375,8 @@ class Server(TaughtWeb, RT.RtabWeb):
             phase = 'checking' if route['checking'] else leg['phase'] if leg.get('status') == 'active' else 'plan'
             if route.get('dwell_until'):
                 phase = 'dwell'
+            elif route.get('speaking'):
+                phase = 'speak'   # 11-25 离开前播报中，播完再走
         n, loops = len(record['points']), route['loops']
         if status == 'succeeded':
             progress = 1.0
@@ -4294,7 +4397,9 @@ class Server(TaughtWeb, RT.RtabWeb):
                 # 停留中：还剩几秒（11-24）；不在停留就是 null
                 'dwellLeft': max(0.0, route['dwell_until'] - time.monotonic()) if route.get('dwell_until') else None,
                 'pointDwell': record['points'][i].get('dwell', 0),
-                'pointAudio': (self.audio.items.get(record['points'][i].get('audio')) or {}).get('name'),   # 这站的播报音频名，没有 = null
+                # 这站的播报音频名（几段用「、」连起来），没有 = null；pointAudioLeave = 离开前播的
+                'pointAudio': self.clip_names(record['points'][i], 'audio'),
+                'pointAudioLeave': self.clip_names(record['points'][i], 'audioLeave'),
                 'resumable': status in ('aborted', 'canceled') and self.resume_view(record) is not None}
 
     # ---------- P3：运行档位、巡逻、录包、地图 ----------

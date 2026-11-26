@@ -159,11 +159,12 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
       const lap = !T.roundTrip ? '' : `${T.loops ? `第 ${T.loop} / ${T.loops} 圈` : `第 ${T.loop} 圈（一直循环）`}${T.back ? ' · 回到起点' : ''} · `;
       $('#taskSub').textContent = T.message || (T.phase === 'checking' ? '出发前清除旧障碍标记'
         : T.phase === 'dwell' && T.dwellLeft != null ? `${lap}第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''} 停留中 · 还剩 ${Math.ceil(T.dwellLeft)} s`
+        : T.phase === 'speak' ? `${lap}第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''} 播报中 · 播完再走`
         : `${lap}正在前往第 ${T.point} / ${T.count} 站${T.pointName ? ' · ' + T.pointName : ''}`);
     }
     else if (T.type==='external'){ $('#taskTitle').textContent = '外部导航目标'; $('#taskSub').textContent = 'RViz 或命令行发出的目标 ·「取消」同样有效'; }
     else { const g = T.goal; $('#taskTitle').textContent = '单点导航'; $('#taskSub').textContent = `目标 (${g.x.toFixed(2)}, ${g.y.toFixed(2)}) · ${deg(g.th).toFixed(0)}°`; }
-    const ph = ['dwell','arrived'].includes(T.phase) || T.status==='succeeded' ? 'arrive' : T.phase, rem = T.remaining;
+    const ph = ['dwell','speak','arrived'].includes(T.phase) || T.status==='succeeded' ? 'arrive' : T.phase, rem = T.remaining;
     $('#progBar').style.width = T.type === 'route'
       ? `${(T.status === 'succeeded' ? 1 : T.progress ?? (T.point - 1) / T.count) * 100}%`
       : rem!=null && T.total ? (100*clamp(1 - rem/T.total, 0, 1)).toFixed(1)+'%' : '0%';
