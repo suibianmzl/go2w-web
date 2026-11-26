@@ -90,12 +90,13 @@ export function createActions(store, src){
       return exec(src.cmd.initialPose(p, fine), fine ? null : '初始位姿已发布，粒子收敛中').then(r => { if (r?.ok !== false) store.onInitialPose?.(); return r; });
     },
     // 自动定位：后端用当前 scan 在整张地图上找机器人，可信才发给 AMCL（不可信只报告，不改位姿）
-    autoLocalize(){
+    // opts.area = {x, y, r}：只在地图上画的圈里找；opts.hints：先在这几处（任务站点）附近找，找不到再搜整张图
+    autoLocalize(opts = {}){
       if (!ready('autoLocalize')) return Promise.resolve({ ok: false });
       if (!run('localization') && !run('navigation')) return Promise.resolve((toast('定位没有运行', 'err'), { ok: false }));
       if (store.task.type !== 'idle' && store.task.status === 'active') return Promise.resolve((toast('任务进行中：先取消再自动定位', 'err'), { ok: false }));
-      toast('自动定位中：机器人保持静止，约需 5–10 秒', 'warn');
-      return exec(src.cmd.autoLocalize(), null);
+      toast(opts.area ? `在指定的半径 ${+opts.area.r.toFixed(1)} m 范围里自动定位：机器人保持静止，约需 2–5 秒` : '自动定位中：机器人保持静止，约需 2–15 秒', 'warn');
+      return exec(src.cmd.autoLocalize(opts), null);
     },
     // 自动定位失败后：机器狗自己小范围挪一次再定位（后端检查空间、按里程计控制距离，没解锁会临时解锁、结束后恢复上锁）
     autolocMove(){

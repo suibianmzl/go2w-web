@@ -266,6 +266,16 @@ FINE_COV_XY, FINE_COV_YAW = 0.05 ** 2, math.radians(2) ** 2
 AUTOLOC_SCANS = 5
 AUTOLOC_STILL = (0.03, 0.05)   # 静止判定：|v| < 0.03 m/s 且 |wz| < 0.05 rad/s
 AUTOLOC_TIMEOUT = 60.0
+# 11-26 先在附近找：大图（lab_20261125，120×93 m）整图搜 11–18 s，低分时 55–60 s 甚至超时；
+# 只搜几个圆（上次位置 / 停车点 / 任务站点，或者人在地图上画的圈）约 1.3 s，圆内结果和整图搜完全一样。
+AUTOLOC_HINT_R = 4.0          # m：自动猜的位置各搜这么大的圆
+# 自动猜的范围里找到的要更可信才用（整图是 0.75）；不够就退回整图搜。测试用的 GO2W_AUTOLOC_MIN_SCORE 更高时以它为准
+AUTOLOC_HINT_SCORE = max(0.80, float(os.environ.get('GO2W_AUTOLOC_MIN_SCORE', '0.75')))
+AUTOLOC_HINT_MAX = 4          # 最多猜几处
+AUTOLOC_HINT_TIMEOUT = 20.0
+AUTOLOC_AREA_R = (1.0, 30.0)  # m：人画的圈半径范围
+LAST_POSE_MOVE, LAST_POSE_EVERY = 0.5, 10.0   # 定位正常时，挪了 0.5 m 以上、且离上次写 ≥ 10 s 才写 data/last_pose.json
+LAST_POSE_MATCH = 60.0        # 匹配率 % 低于这个不记（可能定位错了）
 AUTOLOC_ON_START = os.environ.get('GO2W_AUTO_LOCALIZE', '1') != '0'
 # 刚站起来（策略刚接管）机身还在晃，雷达高度也和趴着时不一样：策略 ready 后再稳这么久，只用这之后的 scan
 AUTOLOC_SETTLE = 2.0
@@ -1732,7 +1742,12 @@ class Server(TaughtWeb, RT.RtabWeb):
                 asyncio.ensure_future(self.clear_after_pose())
                 return True, '位置已修正' if fine else '初始位姿已发布'
             if op == 'auto_localize':
-                return await self.auto_localize(self.remote(ws))
+                area, hints = d.get('area'), d.get('hints')
+                if area is not None:
+                    area = self.autoloc_area(area)
+                    if isinstance(area, str):
+                        return False, area
+                return await self.auto_localize(self.remote(ws), area=area, hints=self.autoloc_hint_list(hints))
             if op == 'autoloc_move':
                 return await self.autoloc_move(ws)
             if op == 'stand_up':
@@ -3189,8 +3204,12 @@ class Server(TaughtWeb, RT.RtabWeb):
             n.event('WARN', f'设置位姿后清除代价地图没有完成：{e!r}')
 
     # ---------- 自动定位 ----------
-    async def auto_localize(self, who, on_start=False):
+    async def auto_localize(self, who, on_start=False, area=None, hints=None):
         """用最近几帧 scan 在整张地图上找机器人（globloc.py 子进程），可信就发给 AMCL。
+
+        area = (x, y, r)：人在地图上画的圈，只在圈里找（找不到不搜整图，让人画大点或点「自动定位」）。
+        没有 area 时先在「上次位置 / 停车点 / hints（网页带来的任务站点）」附近各找 AUTOLOC_HINT_R，
+        分数 ≥ AUTOLOC_HINT_SCORE 就用；不够再搜整张图（和以前一样）。
 
         返回 (ok, 提示, 结果)。不可信（分数低 / 有歧义）时不发位姿，只报告，让人手动给。
         机器人必须静止；导航目标执行中拒绝（定位跳变会让正在跑的规划失效）。
@@ -3206,7 +3225,6 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, '还没有收到地图（或地图原点带旋转，暂不支持）'
         self.autoloc_busy = True
         self.autoloc = {'state': 'run', 'seq': self.autoloc['seq'], 'map': n.map_current}
-        path = None
         try:
             # 先等站稳、静止（11-12：站起来后立刻定位总报「机器人在动」，自检卡住）
             scans, why, w0 = None, '', time.monotonic()
@@ -3224,24 +3242,30 @@ class Server(TaughtWeb, RT.RtabWeb):
             map_name, map_ver = n.map_current, n.map_ver
             self.autoloc['map'] = map_name
             t0 = time.monotonic()
-            fd, path = tempfile.mkstemp(prefix='go2w_autoloc_', suffix='.npz')
-            os.close(fd)
-            np.savez(path, grid=grid, res=res, origin=np.array([ox, oy]), pts=np.concatenate(scans).astype(np.float32))
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
-            # nice：别和 FAST-LIO / AMCL 抢 CPU
-            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', sys.executable, script, path,
-                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), AUTOLOC_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise RuntimeError(f'{AUTOLOC_TIMEOUT:.0f} s 内没有算完')
-            if proc.returncode != 0:
-                lines = err.decode(errors='replace').strip().splitlines()
-                raise RuntimeError(lines[-1] if lines else f'退出码 {proc.returncode}')
-            r = json.loads(out.decode().strip().splitlines()[-1])
-            if 'error' in r:
-                raise RuntimeError(r['error'])
+            pts = np.concatenate(scans).astype(np.float32)
+            how, near = 'map', ''
+            if area is not None:
+                how = 'area'
+                r = await self.globloc_run(grid, res, ox, oy, pts, circles=[area])
+            else:
+                guesses = self.autoloc_guesses(map_name, hints)
+                r = None
+                if guesses:
+                    try:
+                        rh = await self.globloc_run(grid, res, ox, oy, pts, circles=[g[:3] for g in guesses],
+                                                    min_score=AUTOLOC_HINT_SCORE, timeout=AUTOLOC_HINT_TIMEOUT)
+                    except Exception as e:
+                        rh = {'error': str(e)}
+                    names = '、'.join(dict.fromkeys(g[3] for g in guesses))
+                    if rh.get('ok'):
+                        r, how = rh, 'hint'
+                        g = min(guesses, key=lambda g: math.hypot(g[0] - rh['x'], g[1] - rh['y']))
+                        near = g[3]
+                    else:
+                        why = rh.get('error') or f"分数 {rh.get('score', 0):.2f}，次优/最优 {rh.get('ratio', 1):.2f}"
+                        n.event('INFO', f'自动定位：{names}附近没有可信结果（{why}，{time.monotonic() - t0:.1f} s），改搜整张地图')
+                if r is None:
+                    r = await self.globloc_run(grid, res, ox, oy, pts)
         except Exception as e:
             msg = f'自动定位失败：{e}'
             self.autoloc = {'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'map': n.map_current, 'msg': msg}
@@ -3249,16 +3273,13 @@ class Server(TaughtWeb, RT.RtabWeb):
             return False, msg
         finally:
             self.autoloc_busy = False
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
         took = time.monotonic() - t0
         map_name = n.map_current or map_name
         where = f"({r['x']:.2f}, {r['y']:.2f}, {math.degrees(r['th']):.0f}°)"
-        quality = f"分数 {r['score']:.2f}，次优/最优 {r['ratio']:.2f}，{took:.1f} s"
+        scope = f"，在{near}附近找到" if how == 'hint' else f"，只搜了指定的半径 {area[2]:.1f} m 范围".replace('.0 m', ' m') if how == 'area' else ''
+        quality = f"分数 {r['score']:.2f}，次优/最优 {r['ratio']:.2f}，{took:.1f} s{scope}"
         res_ = {k: r[k] for k in ('x', 'y', 'th', 'score', 'ratio', 'second_pose')}
+        res_['how'] = how
         # 只看栅格本身：启动时地图名（map_current）比栅格晚几秒才拿到，map_server 也可能重发同一张图
         now_raw = n.map_raw
         if n.map_ver != map_ver and (now_raw is None or now_raw[1:] != (res, ox, oy) or not np.array_equal(now_raw[0], grid)):
@@ -3277,6 +3298,9 @@ class Server(TaughtWeb, RT.RtabWeb):
             why = '有多个相似位置，分不清' if ambiguous else '匹配分数太低（不在这张地图上，或环境变化太大）'
             left = AUTOLOC_MOVE_MAX - self.autoloc_moves
             hint = '可以点「移动后重试」，或手动给初始位置' if left > 0 else '请手动给初始位置'
+            if how == 'area':
+                why = f'在指定范围里{why}'
+                hint = '狗可能不在圈里：把圈画大一点重新指定，或点「自动定位」搜整张地图'
             msg = f'自动定位不可信，没有使用：{why}。最佳 {where}，{quality}。{hint}'
             self.autoloc = {'state': 'fail', 'seq': self.autoloc['seq'] + 1, 'map': map_name, 'msg': msg, **res_}
             n.event('WARN', msg)
@@ -3284,6 +3308,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         n.publish_initial_pose(r['x'], r['y'], r['th'], fine=True)
         self.pose_set_t = time.monotonic()
         self.autoloc_reset()
+        self.remember_last_pose(map_name, (r['x'], r['y'], r['th']), force=True)
         if pair is not None:
             prev, sep, turn, dd, dth = pair
             quality += (f"；和前一次（分数 {prev['score']:.2f}，次优/最优 {prev['ratio']:.2f}）相隔 {sep:.2f} m / "
@@ -3294,6 +3319,132 @@ class Server(TaughtWeb, RT.RtabWeb):
         n.event('INFO', f'{msg}（{who}）')
         asyncio.ensure_future(self.clear_after_pose())
         return True, msg, res_
+
+    async def globloc_run(self, grid, res, ox, oy, pts, circles=None, min_score=None, timeout=AUTOLOC_TIMEOUT):
+        """跑一次 globloc.py 子进程，返回它的结果 dict；出错 / 超时抛 RuntimeError。"""
+        fd, path = tempfile.mkstemp(prefix='go2w_autoloc_', suffix='.npz')
+        os.close(fd)
+        try:
+            extra = {}
+            if circles:
+                extra['circles'] = np.array(circles, np.float64).reshape(-1, 3)
+            if min_score is not None:
+                extra['min_score'] = np.float64(min_score)
+            np.savez(path, grid=grid, res=res, origin=np.array([ox, oy]), pts=pts, **extra)
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'globloc.py')
+            # nice：别和 FAST-LIO / AMCL 抢 CPU
+            proc = await asyncio.create_subprocess_exec('nice', '-n', '10', sys.executable, script, path,
+                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError(f'{timeout:.0f} s 内没有算完')
+            if proc.returncode != 0:
+                lines = err.decode(errors='replace').strip().splitlines()
+                raise RuntimeError(lines[-1] if lines else f'退出码 {proc.returncode}')
+            r = json.loads(out.decode().strip().splitlines()[-1])
+            if 'error' in r:
+                raise RuntimeError(r['error'])
+            return r
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+    def autoloc_area(self, a):
+        """网页 / 云端传来的 area {x, y, r} → (x, y, r)；不合法返回错误提示。"""
+        if not isinstance(a, dict) or not all(self._num(a.get(k)) for k in ('x', 'y', 'r')):
+            return '指定范围的格式不对（要 {x, y, r}，单位 m）'
+        r = min(max(float(a['r']), AUTOLOC_AREA_R[0]), AUTOLOC_AREA_R[1])
+        return float(a['x']), float(a['y']), r
+
+    def autoloc_hint_list(self, hints):
+        """网页带来的「狗可能在这儿」：[{x, y, label}]，最多 AUTOLOC_HINT_MAX 个，不合法的丢掉。"""
+        out = []
+        for h in (hints if isinstance(hints, list) else [])[:AUTOLOC_HINT_MAX]:
+            if isinstance(h, dict) and self._num(h.get('x')) and self._num(h.get('y')):
+                label = h.get('label') if isinstance(h.get('label'), str) else '任务站点'
+                out.append((float(h['x']), float(h['y']), label.strip()[:12] or '任务站点'))
+        return out
+
+    def autoloc_guesses(self, map_name, hints):
+        """先找哪几处：上次位置、停车点、任务站点。离得近（< 2 m）的合并。返回 [(x, y, r, 说明)]。"""
+        cands = []
+        last = self.last_poses().get(map_name) if map_name else None
+        if last:
+            cands.append((last['pose'][0], last['pose'][1], '上次位置'))
+        park = self.parkings().get(map_name) if map_name else None
+        if park:
+            cands.append((park['pose'][0], park['pose'][1], '停车点'))
+        cands += list(hints or [])
+        out = []
+        for x, y, label in cands:
+            if all(math.hypot(x - g[0], y - g[1]) >= 2.0 for g in out):
+                out.append((x, y, AUTOLOC_HINT_R, label))
+            if len(out) >= AUTOLOC_HINT_MAX:
+                break
+        return out
+
+    LAST_POSE_FILE = 'last_pose.json'
+
+    def last_poses(self):
+        """data/last_pose.json：每张图上最后一次定位正常时的位置 {'<map>': {'pose': [x, y, yaw], 't': unix}}。"""
+        if getattr(self, '_last_poses', None) is None:
+            try:
+                with open(os.path.join(DATA, self.LAST_POSE_FILE), encoding='utf-8') as f:
+                    raw = json.load(f)
+            except (OSError, ValueError):
+                raw = {}
+            self._last_poses = {}
+            for name, rec in (raw if isinstance(raw, dict) else {}).items():
+                pose = (rec or {}).get('pose') if isinstance(rec, dict) else None
+                if (isinstance(name, str) and isinstance(pose, list) and len(pose) == 3 and all(self._num(v) for v in pose)):
+                    self._last_poses[name] = {'pose': [float(v) for v in pose], 't': rec.get('t', 0)}
+            self._last_pose_w = {}
+        return self._last_poses
+
+    def remember_last_pose(self, map_name, pose, force=False):
+        """记下这张图上的最新位置（内存里随时更新，文件按 LAST_POSE_MOVE / LAST_POSE_EVERY 节流写）。"""
+        if not map_name or pose is None:
+            return
+        poses, now = self.last_poses(), time.monotonic()
+        old = poses.get(map_name)
+        moved = old is None or math.hypot(pose[0] - old['pose'][0], pose[1] - old['pose'][1]) >= LAST_POSE_MOVE
+        if not force and (not moved or now - self._last_pose_w.get(map_name, -1e9) < LAST_POSE_EVERY):
+            return
+        poses[map_name] = {'pose': [round(float(v), 3) for v in pose], 't': round(time.time())}
+        self._last_pose_w[map_name] = now
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            path = os.path.join(DATA, self.LAST_POSE_FILE)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(poses, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.node.get_logger().warn(f'记不住上次位置：{e!r}')
+
+    def track_last_pose(self):
+        """定位 / 导航在跑、匹配率正常时，把狗的位置记成这张图的「上次位置」（下次自动定位先在这附近找）。"""
+        n = self.node
+        m = n.map_current
+        if not m or n.match is None or n.match < LAST_POSE_MATCH or self.autoloc_busy:
+            return
+        # 刚启动、还没定过位时 AMCL 的位置是猜的（默认在原点），不能记：这次启动后自动定位成功或手动给过位置才算
+        if self.pose_set_t <= getattr(self, 'loc_started_t', 0.0):
+            return
+        if self.prof('navigation') != 'run' and self.prof('localization') != 'run':
+            return
+        p = n.lookup(BASE_FRAME)
+        if p is None or n.fixed != 'map':
+            return
+        self.remember_last_pose(m, p)
 
     def autoloc_scans(self):
         """能用来自动定位的 scan：站稳 AUTOLOC_SETTLE 秒之后收到的、静止的、最近 2 s 内的，至少 3 帧。
@@ -5941,6 +6092,7 @@ class Server(TaughtWeb, RT.RtabWeb):
         finally:
             self.map_loading = False
         await self.keepout_apply(name, '切换地图')
+        self.loc_started_t = time.monotonic()   # 换图后要重新定过位才记「上次位置」
         n.event('WARN', f'已切换到地图 {name}：请重新设置初始位姿')
         return True, f'已切换到 {name}，请重新设置初始位姿'
 
@@ -6031,6 +6183,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                 if all(x in names for x in MODE_NODES[m]):
                     self.starting.pop(m); self.transitions.pop(m, None)
                     n.event('INFO', f'{self.MODE_NAME[m]}已启动')
+                    if m in ('localization', 'navigation'):
+                        self.loc_started_t = time.monotonic()   # 这之后定过位（pose_set_t 更新）才记「上次位置」
                     if AUTOLOC_ON_START and m in ('localization', 'navigation'):
                         self.background(self.auto_localize_on_start(m))
                 elif self.procs_status is not None and not self.procs_status.get(m) and age > 4:
@@ -6307,6 +6461,8 @@ class Server(TaughtWeb, RT.RtabWeb):
                     self.incident('safety_stop', '急停期间底盘被别处解锁，已重新上锁')
                 if k % 50 == 0:
                     n.fetch_params()
+                if k % 20 == 7:
+                    self.track_last_pose()
             except Exception as e:  # 安全检查不能因为一次异常停掉
                 n.get_logger().error(f'safety: {e!r}')
 

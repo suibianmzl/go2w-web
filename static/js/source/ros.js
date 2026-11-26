@@ -255,7 +255,8 @@ export function createRosSource(store, bus){
     taughtAbandon: session_id => send('taught_abandon', { session_id }),
     taughtStatus: map => send('taught_status', map ? { map } : {}),
     initialPose: (p, fine) => send('initial_pose', fine ? { ...p, cov: 'fine' } : p),
-    autoLocalize: () => send('auto_localize', {}, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
+    // opts：{ area: {x, y, r} }（只在圈里找）/ { hints: [{x, y, label}] }（先在这几处附近找）
+    autoLocalize: (opts = {}) => send('auto_localize', opts, 95000),   // 后端先等站稳最多 15 s，子进程再最多算 60 s
     autolocMove: () => send('autoloc_move', {}, 120000),    // 移动最多 8 s + 停稳 + 再自动定位（最多 75 s）
     cancel: why => send('cancel', why ? { why } : {}),
     arm: (on, why) => send('arm', why ? { on, why } : { on }),

@@ -116,7 +116,9 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
   // 重定位 / 建图
   $('#relocInit').onclick = () => setTool('init');
   // 自动定位：按钮手动触发；导航 / 定位启动后后端也会自动跑一次。成功（state.autoLoc.seq 变了且 ok）就算定位完成
-  $('#navAutoBtn').onclick = $('#relocAuto').onclick = () => actions.autoLocalize();
+  $('#navAutoBtn').onclick = $('#relocAuto').onclick = () => actions.autoLocalize(prepHints());
+  // 11-26 指定大概位置：在地图上点一下 / 拖出一个圈，只在圈里找（大图上整图搜要 10 s 以上）
+  $('#navAreaBtn').onclick = $('#relocArea').onclick = () => setTool('area');
   // 自动定位失败后：机器狗小范围挪一次再定位（要确认）
   $('#navMoveBtn').onclick = $('#relocMove').onclick = () => actions.autolocMove();
   let autoSeq = null;
@@ -159,6 +161,15 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
     if (src.can('prepHold')) src.cmd.prepHold();
   }
   function prepFail(k, msg, soft = false){ prep.fail = { k, msg, soft }; }
+  // 出发流程里自动定位：先在任务第 1 站 / 断点站附近找（后端还会加上次位置、停车点），找不到后端再搜整张图
+  function prepHints(){
+    if (!prep.on) return {};
+    const route = store.routes.find(r => r.id === prep.route), pts = route?.points || [];
+    const out = [], add = (i, label) => { const p = pts[i]; if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) out.push({ x: p.x, y: p.y, label }); };
+    if (prep.resume && route?.resume){ const k = (prep.resume === 'skip' ? route.resume.skipPoint : route.resume.point) - 1; add(k, `第 ${k + 1} 站`); }
+    add(0, '第 1 站');
+    return out.length ? { hints: out } : {};
+  }
 
   // routes.js 的「出发」按钮调这个（参数没保存的已经先保存好了）。
   // resume（11-24 任务接续）：'continue' / 'skip'，流程一样（站立 → 导航 → 定位），最后下发时带上，后端从断点接着跑
@@ -244,7 +255,7 @@ export function setupFlow(store, src, actions, setTool, reloc, taught, mapView){
         prep.autoT = now;
         const t0 = prep.t0, seq = a?.seq ?? -1;
         // 后端没开始就拒绝了（不会更新 autoLoc.seq）：直接显示原因，别干等
-        actions.autoLocalize().then(r => {
+        actions.autoLocalize(prepHints()).then(r => {
           if (prep.on && prep.t0 === t0 && r?.ok === false && (store.autoLoc?.seq ?? -1) <= seq && !store.initPose){
             prepFail('loc', r.msg || '自动定位失败', true); render();
           }

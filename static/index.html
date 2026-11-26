@@ -364,7 +364,7 @@
                     <li data-k="go"><i></i><span>下发任务</span><small></small></li>
                   </ul>
                   <div class="note" id="navAutoNote" hidden></div>
-                  <div class="inrow" id="prepLocRow" hidden><button class="btn sm pri" id="navAutoBtn">自动定位</button><button class="btn sm" id="navMoveBtn" hidden title="机器狗小范围移动一次（前进 / 后退 0.3 m 或原地转 45°）后再自动定位，两处结果一致就采用">移动后重试</button><button class="btn sm" id="navInitBtn">在地图上选择</button><button class="btn sm" id="navInitOk" title="AMCL 现在的位姿是对的，不用重新设置">当前位置正确</button></div>
+                  <div class="inrow" id="prepLocRow" style="flex-wrap:wrap" hidden><button class="btn sm pri" id="navAutoBtn">自动定位</button><button class="btn sm" id="navAreaBtn" title="在地图上点一下狗的大概位置（按住拖动可以把圈画大），只在圈里找，大地图上快很多">指定大概位置</button><button class="btn sm" id="navMoveBtn" hidden title="机器狗小范围移动一次（前进 / 后退 0.3 m 或原地转 45°）后再自动定位，两处结果一致就采用">移动后重试</button><button class="btn sm" id="navInitBtn">在地图上选择</button><button class="btn sm" id="navInitOk" title="AMCL 现在的位姿是对的，不用重新设置">当前位置正确</button></div>
                   <div class="btn-row" id="prepBtns" hidden><button class="btn danger" id="prepStop">取消出发</button><button class="btn" id="prepRetry" hidden>重试</button></div>
                   <p class="hint">点「出发」后自动：站立 → 启动导航 → 定位 → 解锁底盘并出发。随时可以按急停（Space）或「取消出发」。</p>
                 </div>
@@ -465,7 +465,8 @@
           <div class="inrow"><button class="btn sm ghost" id="relocUndo" disabled>撤销改动</button><button class="btn sm pri" id="relocApply" disabled style="flex:1">应用到 AMCL</button></div>
         </div>
         <div class="note" id="relocAutoNote" hidden style="margin-top:10px"></div>
-        <div class="inrow" style="margin-top:10px"><button class="btn sm" id="relocAuto" title="用当前激光在整张地图上自动找机器人位置（机器人要静止）。结果可信才发给 AMCL">自动定位</button><button class="btn sm" id="relocMove" hidden title="机器狗小范围移动一次（前进 / 后退 0.3 m 或原地转 45°）后再自动定位，两处结果一致就采用">移动后重试</button><button class="btn sm" id="relocInit" title="偏得太远、微调不过来时，用「初始位姿」工具重新点一个位置">重新给位置</button><button class="btn sm" id="relocBack" style="flex:1">完成，返回导航</button></div>
+        <div class="inrow" style="margin-top:10px"><button class="btn sm" id="relocAuto" title="用当前激光在整张地图上自动找机器人位置（机器人要静止）。结果可信才发给 AMCL">自动定位</button><button class="btn sm" id="relocArea" title="在地图上点一下狗的大概位置（按住拖动可以把圈画大），只在圈里找，大地图上快很多">指定大概位置</button><button class="btn sm" id="relocMove" hidden title="机器狗小范围移动一次（前进 / 后退 0.3 m 或原地转 45°）后再自动定位，两处结果一致就采用">移动后重试</button><button class="btn sm" id="relocInit" title="偏得太远、微调不过来时，用「初始位姿」工具重新点一个位置">重新给位置</button></div>
+        <div class="inrow"><button class="btn sm" id="relocBack" style="flex:1">完成，返回导航</button></div>
       </section>
 
       <section class="panel card" id="flowMap" hidden>

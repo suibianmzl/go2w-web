@@ -18,6 +18,9 @@
 go2w_web.py 把 scan / 地图存成 npz，用子进程跑本文件（numpy 的大计算会占住 GIL，放在网页后端进程里会卡住心跳 / 安全检查）：
   python3 globloc.py in.npz      → stdout 一行 JSON
 npz 字段：grid（h×w int8，OccupancyGrid 原始值，行 0 在 origin 一侧）、res、origin（x, y）、pts（N×2，base_footprint 下的点）
+可选：circles（K×3，地图坐标 x, y, 半径 m）= 只在这几个圆里找机器人（11-26「指定大概位置」/ 先在上次位置附近找）；
+      min_score = 这次的分数下限（附近找用更严的门槛）。
+有 circles 时先把地图裁到「圆的外接框 + 激光最远距离 + 余量」再算：圆内每个位置的分数和整图算出来的完全一样，只是快。
 """
 import json
 import math
@@ -86,7 +89,7 @@ def thin(p, max_pts=180, voxel=0.10):
 
 
 class GlobalLocalizer:
-    def __init__(self, grid, res, origin_xy, sigma=0.10, coarse_sigma=0.20, coarse_cells=4, robot_clearance=0.20):
+    def __init__(self, grid, res, origin_xy, sigma=0.10, coarse_sigma=0.20, coarse_cells=4, robot_clearance=0.20, region=None, min_score=None):
         t0 = time.time()
         self.res = float(res)
         self.ox, self.oy = float(origin_xy[0]), float(origin_xy[1])
@@ -101,7 +104,10 @@ class GlobalLocalizer:
         self.coarse = sliding_max(coarse, coarse_cells)
         # 候选位置：空闲且离障碍有一定距离（狗不可能贴着墙 / 在墙里）
         ok = free & (dm > robot_clearance)
+        if region is not None:      # 只在指定范围（圆）里找
+            ok &= region
         self.walkable = ok
+        self.min_score = MIN_SCORE if min_score is None else float(min_score)
         ys, xs = np.nonzero(ok[::coarse_cells, ::coarse_cells])
         self.cand = np.stack([ys * coarse_cells, xs * coarse_cells], 1)
         self.prep_s = time.time() - t0
@@ -294,7 +300,7 @@ class GlobalLocalizer:
         ratio = min(second / s0, 1.0) if s0 > 0 else 1.0
         return {'x': round(bx, 4), 'y': round(by, 4), 'th': round((a0 + math.pi) % (2 * math.pi) - math.pi, 4),
                 'score': round(s0, 4), 'second': round(second, 4), 'ratio': round(ratio, 4), 'second_pose': second_pose,
-                'ratio_exact': exact, 'ok': bool(s0 >= MIN_SCORE and ratio <= MAX_RATIO),
+                'ratio_exact': exact, 'ok': bool(s0 >= self.min_score and ratio <= MAX_RATIO), 'min_score': self.min_score,
                 'n_pts': int(len(pts)), 'impl': 'bbs', 'evals': int(evals), 'dive_best': round(dive_best, 4), 'alive': alive, 'leaves': int(len(B)),
                 'prep_s': round(self.prep_s + prep, 2), 'coarse_s': round(search_s, 2),
                 'total_s': round(self.prep_s + time.time() - t0, 2)}
@@ -351,19 +357,60 @@ class GlobalLocalizer:
         ratio = second / s0 if s0 > 0 else 1.0
         return {'x': round(bx, 4), 'y': round(by, 4), 'th': round((a0 + math.pi) % (2 * math.pi) - math.pi, 4),
                 'score': round(s0, 4), 'second': round(second, 4), 'ratio': round(ratio, 4), 'second_pose': second_pose,
-                'ok': bool(s0 >= MIN_SCORE and ratio <= MAX_RATIO),
+                'ok': bool(s0 >= self.min_score and ratio <= MAX_RATIO),
                 'n_pts': int(len(pts)), 'n_cand': int(len(cand)),
                 'prep_s': round(self.prep_s, 2), 'coarse_s': round(coarse_s, 2), 'total_s': round(self.prep_s + time.time() - t0, 2)}
 
 
+def crop_to_circles(grid, res, origin, circles, reach):
+    """裁出圆附近那块地图 + 圆内为 True 的掩码。margin = 激光最远距离 + 1.5 m（似然场截断 1 m + 取整余量），
+    这样圆内候选位置打到的每个激光点、以及决定这些格子似然值的障碍，都还在裁出来的图里。"""
+    h, w = grid.shape
+    ox, oy = float(origin[0]), float(origin[1])
+    c = np.asarray(circles, np.float64).reshape(-1, 3)
+    m = reach + 1.5
+    x0, x1 = (c[:, 0] - c[:, 2]).min() - m, (c[:, 0] + c[:, 2]).max() + m
+    y0, y1 = (c[:, 1] - c[:, 2]).min() - m, (c[:, 1] + c[:, 2]).max() + m
+    i0, i1 = max(0, int(math.floor((y0 - oy) / res))), min(h, int(math.ceil((y1 - oy) / res)) + 1)
+    j0, j1 = max(0, int(math.floor((x0 - ox) / res))), min(w, int(math.ceil((x1 - ox) / res)) + 1)
+    if i0 >= i1 or j0 >= j1:
+        return None
+    sub = grid[i0:i1, j0:j1]
+    cy = oy + (np.arange(i0, i1) + 0.5) * res
+    cx = ox + (np.arange(j0, j1) + 0.5) * res
+    region = np.zeros(sub.shape, bool)
+    for x, y, r in c:
+        region |= ((cy[:, None] - y) ** 2 + (cx[None, :] - x) ** 2) <= r * r
+    return sub, (ox + j0 * res, oy + i0 * res), region
+
+
 def main(path):
     d = np.load(path)
-    L = GlobalLocalizer(d['grid'], float(d['res']), d['origin'])
     pts = thin(np.asarray(d['pts'], np.float64))
     if len(pts) < 30:
         print(json.dumps({'error': f'有效激光点太少（{len(pts)}）'}))
         return
-    print(json.dumps(L.localize_bbs(pts) if IMPL == 'bbs' else L.localize(pts)))
+    min_score = float(d['min_score']) if 'min_score' in d.files else None
+    grid, res, origin, region = d['grid'], float(d['res']), d['origin'], None
+    if 'circles' in d.files and len(d['circles']):
+        reach = float(np.hypot(pts[:, 0], pts[:, 1]).max())
+        c = crop_to_circles(grid, res, origin, d['circles'], reach)
+        if c is None:
+            print(json.dumps({'error': '指定的范围在地图外面'}))
+            return
+        grid, origin, region = c
+        if not region.any():
+            print(json.dumps({'error': '指定的范围在地图外面'}))
+            return
+    L = GlobalLocalizer(grid, res, origin, region=region, min_score=min_score)
+    if region is not None and not L.walkable.any():
+        print(json.dumps({'error': '指定范围里没有能站的空地'}))
+        return
+    r = L.localize_bbs(pts) if IMPL == 'bbs' or region is not None else L.localize(pts)
+    if region is not None and 'error' not in r:
+        r['region'] = True
+        r['crop'] = list(grid.shape)
+    print(json.dumps(r))
 
 
 if __name__ == '__main__':
