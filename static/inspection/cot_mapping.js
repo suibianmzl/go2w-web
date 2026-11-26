@@ -38,7 +38,17 @@ export const COT_NOTE_DEFINITIONS = [
     nodeIndex:1,
     lines:[
       '已到达巡逻点位【电动车存放处】',
-      { text:'定点巡逻中（30s）', delayMs:700 },
+      {
+        text:'定点巡逻中（30s）',
+        delayMs:700,
+        timer:{
+          type:'countdown',
+          from:30,
+          to:0,
+          intervalMs:1000,
+          format:seconds => `定点巡逻中（${seconds}s）`,
+        },
+      },
       { text:'巡逻结束，出发前往【人行步道】', delayMs:30000 },
     ],
   },
@@ -46,11 +56,8 @@ export const COT_NOTE_DEFINITIONS = [
     note:'position_footway',
     cruiseName:'人行步道',
     nodeIndex:1,
-    lines:[
-      '检测到阻塞（> 10s），无通行空间...',
-      { text:'推理其他可通行路径...', delayMs:30000 },
-      '找到可用路径，正在翻越台阶...',
-    ],
+    // 阻塞文案由巡检页根据实时速度条件生成，避免无阻塞时固定播报。
+    lines:[],
   },
   {
     note:'position_faregate',
@@ -65,7 +72,17 @@ export const COT_NOTE_DEFINITIONS = [
     nodeIndex:2,
     lines:[
       '已到达巡逻点位【人行步道】',
-      '定点巡逻中（30s）',
+      {
+        text:'定点巡逻中（30s）',
+        delayMs:700,
+        timer:{
+          type:'countdown',
+          from:30,
+          to:0,
+          intervalMs:1000,
+          format:seconds => `定点巡逻中（${seconds}s）`,
+        },
+      },
       { text:'巡逻结束，返回待机位置', delayMs:30000 },
     ],
   },
@@ -84,3 +101,31 @@ export const COT_BY_NOTE = new Map(
 export const COT_BY_NAME = new Map(
   COT_NOTE_DEFINITIONS.map(definition => [definition.cruiseName, definition]),
 );
+
+export function inspectionNodeIndexForTask(task, points = []){
+  if (!task || (task.type && task.type !== 'route')) return -1;
+  if (task.back) return COT_BY_NOTE.get('position_end')?.nodeIndex ?? -1;
+
+  const directNote = String(task.pointNote || '').trim().toLowerCase();
+  const direct = directNote ? COT_BY_NOTE.get(directNote) : null;
+  if (direct) return direct.nodeIndex;
+
+  const current = Number(task.point) - 1;
+  if (!Number.isInteger(current) || current < 0) return -1;
+  const mappedAt = index => {
+    const note = String(points[index]?.note || '').trim().toLowerCase();
+    return note ? COT_BY_NOTE.get(note) || null : null;
+  };
+
+  // 中途接续或途经未定义 CoT 的中间点时，沿用最近一个已映射节点。
+  for (let index = Math.min(current, points.length - 1); index >= 0; index -= 1){
+    const definition = mappedAt(index);
+    if (definition) return definition.nodeIndex;
+  }
+  // 起点附近还没有经过已映射节点时，提前归入下一个已映射节点。
+  for (let index = current + 1; index < points.length; index += 1){
+    const definition = mappedAt(index);
+    if (definition) return definition.nodeIndex;
+  }
+  return -1;
+}

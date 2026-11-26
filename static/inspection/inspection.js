@@ -1,6 +1,7 @@
 import { gridToCanvas } from '../js/util.js';
 import { createRtcViewer } from '../js/rtc_viewer.js';
-import { INSPECTION_NODES, COT_BY_NOTE } from './cot_mapping.js';
+import { INSPECTION_NODES, COT_BY_NOTE, inspectionNodeIndexForTask } from './cot_mapping.js';
+import { createFootwayBlockageWatch, footwayLowSpeedActive } from './blockage_watch.js';
 
 const $ = selector => document.querySelector(selector);
 const T_MAP = 1;
@@ -114,6 +115,8 @@ const state = {
   snapshotObjectUrl: '',
 };
 
+const footwayBlockage = createFootwayBlockageWatch();
+
 const rtc = createRtcViewer(els.rtcVideo, message => {
   els.rtcMessage.textContent = message || '';
   els.rtcMessage.hidden = !message;
@@ -176,7 +179,7 @@ function cotDefinitionForTask(task){
 }
 
 function inspectionNodeForTask(task){
-  return cotDefinitionForTask(task)?.nodeIndex ?? -1;
+  return inspectionNodeIndexForTask(task, routeForTask(task)?.points || []);
 }
 
 function displayedInspectionNodeIndex(task){
@@ -217,8 +220,51 @@ function stopCotReveal(){
   }
 }
 
+function stopLineTimer(line, finalize = false){
+  const timer = line?.timer;
+  if (!timer) return;
+  if (timer.timerId){
+    clearInterval(timer.timerId);
+    delete timer.timerId;
+  }
+  timer.running = false;
+  if (finalize && timer.type === 'countdown'){
+    line.text = timer.format(timer.to ?? 0);
+  }
+}
+
+function stopAllCotLineTimers(finalize = false){
+  for (const event of state.cotEvents){
+    for (const line of event.lines || []) stopLineTimer(line, finalize);
+  }
+}
+
+function startLineTimer(event, lineIndex){
+  const line = event?.lines?.[lineIndex];
+  const timer = line?.timer;
+  if (!timer || timer.timerId) return;
+  const startedAt = performance.now();
+  const tick = () => {
+    if (!timer.running) return;
+    const elapsed = Math.max(0, Math.floor(
+      (performance.now() - startedAt) / (timer.intervalMs || 1000),
+    ));
+    const value = timer.type === 'countdown'
+      ? Math.max(timer.to ?? 0, timer.from - elapsed)
+      : timer.from + elapsed;
+    line.text = timer.format(value);
+    renderTask();
+    if (timer.type === 'countdown' && value <= (timer.to ?? 0)) stopLineTimer(line);
+  };
+  timer.running = true;
+  tick();
+  if (timer.running) timer.timerId = setInterval(tick, timer.intervalMs || 1000);
+}
+
 function resetCotOutput(){
   stopCotReveal();
+  stopAllCotLineTimers();
+  footwayBlockage.resetRun();
   state.cotEvents = [];
   state.cotEventKeys.clear();
   state.activeNodeIndex = -1;
@@ -234,22 +280,39 @@ function beginInspectionRun(task, startedAt = Date.now()){
   resetCotOutput();
   state.inspectionRunStart = startedAt;
   state.inspectionRouteId = task?.routeId || null;
+  const index = inspectionNodeForTask(task);
+  if (index >= 0){
+    state.activeNodeIndex = index;
+    state.openNodeIndex = index;
+  }
+}
+
+function syncInspectionNode(){
+  if (!state.inspectionRunStart || !taskActive()) return;
+  const index = displayedInspectionNodeIndex(state.task);
+  if (index < 0) return;
+  state.activeNodeIndex = index;
+  if (state.openNodeIndex === null) state.openNodeIndex = index;
 }
 
 function finalizeActiveCot(){
   const event = state.cotEvents.find(item => item.key === state.activeCotKey);
-  if (event) event.visible = event.lines.length;
+  if (event){
+    for (const line of event.lines || []) stopLineTimer(line, true);
+    event.visible = event.lines.length;
+  }
   stopCotReveal();
 }
 
 function normalizeCotLines(lines){
   return (Array.isArray(lines) ? lines : []).map(line => {
     if (typeof line === 'string'){
-      return { text:line, delayMs:COT_REVEAL_MS };
+      return { text:line, delayMs:COT_REVEAL_MS, timer:null };
     }
     return {
       text:String(line?.text || ''),
       delayMs:Number.isFinite(line?.delayMs) ? Math.max(0, line.delayMs) : COT_REVEAL_MS,
+      timer:line?.timer ? { ...line.timer } : null,
     };
   }).filter(line => line.text);
 }
@@ -265,7 +328,9 @@ function scheduleCotReveal(){
   state.cotTimer = setTimeout(() => {
     state.cotTimer = null;
     if (state.activeCotKey !== event.key) return;
+    const revealed = event.visible;
     event.visible = Math.min(event.lines.length, event.visible + 1);
+    startLineTimer(event, revealed);
     renderTask();
     scheduleCotReveal();
   }, delay);
@@ -320,6 +385,51 @@ function ingestTaskCot(task){
   state.activeNodeIndex = definition.nodeIndex;
   if (nodeChanged || state.openNodeIndex === null) state.openNodeIndex = definition.nodeIndex;
   scheduleCotReveal();
+}
+
+function appendFootwayBlockageCot(task, key){
+  if (!task || state.cotEventKeys.has(key)) return;
+  const definition = COT_BY_NOTE.get('position_footway');
+  if (!definition || definition.nodeIndex < 0) return;
+  const event = {
+    key,
+    routeId:task.routeId || '',
+    point:Number(task.point) || 1,
+    loop:Number(task.loop) || 1,
+    back:false,
+    note:definition.note,
+    cruiseName:taskPointName(task) || definition.cruiseName,
+    nodeIndex:definition.nodeIndex,
+    lines:normalizeCotLines(['检测到阻塞（> 10s）']),
+    blockage:true,
+    visible:1,
+    at:Date.now(),
+    fallback:false,
+  };
+  state.cotEvents.push(event);
+  state.cotEventKeys.add(key);
+  state.openNodeIndex = event.nodeIndex;
+  event.lines[0].timer = {
+    type:'countup',
+    from:10,
+    intervalMs:1000,
+    format:seconds => `检测到阻塞（> ${seconds}s）`,
+  };
+  startLineTimer(event, 0);
+  renderTask();
+}
+
+function stopBlockageTimers(){
+  for (const event of state.cotEvents){
+    if (!event.blockage) continue;
+    for (const line of event.lines || []) stopLineTimer(line);
+  }
+}
+
+function updateFootwayBlockage(task = state.task, pose = state.pose, now = performance.now()){
+  if (!footwayLowSpeedActive(task, taskNote(task), pose)) stopBlockageTimers();
+  const key = footwayBlockage.observe(task, taskNote(task), pose, now);
+  if (key) appendFootwayBlockageCot(task, `${key}:blocked`);
 }
 
 function inspectionNodeState(index, task, related){
@@ -1085,6 +1195,7 @@ function onJson(message){
       break;
     case 'routes':
       state.routes = Array.isArray(message.items) ? message.items.filter(route => route?.id) : [];
+      syncInspectionNode();
       renderRouteOptions();
       drawMap();
       break;
@@ -1106,9 +1217,12 @@ function onJson(message){
       if (next.status === 'active' && next.type === 'route'){
         ingestTaskCot(next);
       } else {
+        stopBlockageTimers();
         finalizeActiveCot();
         if (next.type === 'idle') resetCotOutput();
       }
+      if (next.status === 'active' && taskNote(next) !== 'position_footway') stopBlockageTimers();
+      syncInspectionNode();
       if (taskActive() && state.task.routeId) {
         state.selectedRouteId = state.task.routeId;
         els.routeSelect.value = state.selectedRouteId;
@@ -1121,6 +1235,7 @@ function onJson(message){
     case 'pose':
       state.pose = message;
       state.poseAt = performance.now();
+      updateFootwayBlockage(state.task, message, state.poseAt);
       renderTelemetry();
       break;
     case 'state':
