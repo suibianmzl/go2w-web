@@ -11,6 +11,8 @@ EnvironmentFile=-/opt/go2w-web/etc/rtc.env
 ExecStart=/opt/go2w-cloud-rtc-publisher/run-cloud-rtc-publisher.sh
 Restart=always
 RestartSec=5
+KillMode=mixed
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target
