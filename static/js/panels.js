@@ -148,7 +148,6 @@ export function createPanels(store, src, actions, mapView, bus, setTool){
     else if (T.phase==='arrived' || T.status==='succeeded'){ st = 'ok'; label = '已完成'; }
     else if (store.estop){ st = 'crit'; label = '急停'; }
     else if (T.paused){ st = 'warn'; label = '已暂停'; }
-    else if (T.phase==='recover'){ st = 'warn'; label = '恢复中'; }
     else if (!actions.canMove() && T.phase!=='plan'){ st = 'warn'; label = !store.armed ? '等待解锁' : '底盘不可用'; }
     const pill = $('#taskPill'); pill.dataset.s = st; pill.textContent = label;
     $('#btnPause').disabled = idle || done || !src.can('pause') || T.type === 'route'; $('#btnPause').textContent = T.paused ? '继续' : '暂停';
