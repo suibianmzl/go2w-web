@@ -2,13 +2,11 @@
 """Durable robot message spool and asynchronous TOS archive worker."""
 import argparse
 import asyncio
-import gzip
 import hashlib
 import json
 import logging
 import os
 import re
-import shutil
 import signal
 import struct
 import time
@@ -924,7 +922,7 @@ class ArchiveSpool:
         key = (session_id, direction, 'text', None)
         writer = self._writer(
             key, robot_id, session_id, direction, 'text',
-            'jsonl', 'jsonl.gz', TEXT_EXT,
+            'jsonl', 'jsonl', TEXT_EXT,
         )
         writer.append(data)
         self._rotate_if_needed(key, writer)
@@ -1106,12 +1104,8 @@ class ArchiveWorker:
         meta = json.loads(uploading_meta.read_text(encoding='utf-8'))
         upload_path = uploading
         if uploading.suffix == TEXT_EXT:
-            upload_path = uploading.with_name(f'{uploading.stem}.jsonl.gz')
-            with uploading.open('rb') as src, upload_path.open('wb') as raw:
-                with gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=6, mtime=0) as dst:
-                    shutil.copyfileobj(src, dst)
-            meta['format'] = 'jsonl.gz'
-            content_type = 'application/gzip'
+            meta['format'] = 'jsonl'
+            content_type = 'application/jsonl'
         elif uploading.suffix == '.jpg':
             meta['format'] = 'jpg'
             content_type = 'image/jpeg'
@@ -1125,7 +1119,7 @@ class ArchiveWorker:
                 digest.update(chunk)
 
         key_suffix = {
-            'jsonl.gz': '.jsonl.gz',
+            'jsonl': '.jsonl',
             'jpg': '.jpg',
         }.get(meta['format'], '.bin')
         key = self._object_key(meta, key_suffix)

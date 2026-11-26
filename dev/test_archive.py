@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for local archive spool and TOS upload worker."""
 import asyncio
-import gzip
 import json
 import struct
 import sys
@@ -99,16 +98,19 @@ async def test_spool_and_worker():
         assert all(item['tos_bucket'] == 'test-bucket' for item in store.objects)
 
         text_objects = [
-            item for item in tos.objects.items() if item[0].endswith('.jsonl.gz')
+            item for item in tos.objects.items() if item[0].endswith('.jsonl')
         ]
         assert len(text_objects) == 2
         records = []
         for _key, item in text_objects:
+            assert item['content_type'] == 'application/jsonl'
             records.extend(
                 json.loads(line)
-                for line in gzip.decompress(item['data']).decode('utf-8').splitlines()
+                for line in item['data'].decode('utf-8').splitlines()
             )
         assert {record['message_type'] for record in records} == {'pose', 'cmd'}
+        assert all(item['format'] == 'jsonl' for item in store.objects
+                   if item['stream_type'] == 'text')
         assert next(record for record in records if record['message_type'] == 'cmd')[
             'command_id'] == 'cmd-1'
 
@@ -133,7 +135,7 @@ async def test_spool_and_worker():
 
 async def main():
     await test_spool_and_worker()
-    print('PASS archive: JSONL, length-prefixed binary, TOS upload and MySQL manifest')
+    print('PASS archive: uncompressed JSONL, length-prefixed binary, TOS upload and MySQL manifest')
 
 
 if __name__ == '__main__':
