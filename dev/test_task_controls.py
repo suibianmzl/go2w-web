@@ -206,14 +206,14 @@ class SpeedExecution(unittest.IsolatedAsyncioTestCase):
     async def test_through_execution_splits_only_at_limit_changes(self):
         await self.run_limits(True)
 
-    async def test_legacy_limit_change_waits_for_arrival_instead_of_early_pass(self):
+    async def test_legacy_limit_boundary_keeps_saved_heading(self):
         server,calls,_ = self.server()
         pts=[dict(x=i,y=0,th=1.1,**extra) for i,extra in enumerate(
             ({'vmax':.7},{'vmax':.2},{'vmax':.4},{}))]
         route={'record':record(pts,through=False),'done':0,'loops':None,'resume':None,
                'status':'active','stop':asyncio.Event(),'index':0}
         await server.run_route(None,route)
-        self.assertEqual(calls[2][0][0][2],1.1,'第三站之后才能解除第二站的低速约束，须先到站')
+        self.assertEqual(calls[2][0][0][2],1.1,'限速分段沿用原站点朝向；是否经过由位置单独判断')
 
     async def test_failed_limit_update_does_not_dispatch_navigation(self):
         server,calls,_ = self.server(fail_speed=True)

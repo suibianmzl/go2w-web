@@ -36,7 +36,7 @@ class CrossingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             env = {**os.environ, 'GO2W_FAKE_PROCS':'1', 'GO2W_FAKE_DUAL':'1', 'GO2W_DATA':str(base/'data'),
                    'GO2W_FAKE_MAP':str(maps/'lab_20261021.yaml'), 'GO2W_FAKE_START':'0,0,0',
                    'GO2W_CAM_ADDR':'127.0.0.1:9', 'PATH':str(bindir)+os.pathsep+os.environ['PATH'],
-                   'PYTHONPATH':os.pathsep.join([str(ROOT/'dev/fake_ros'), str(ROOT.parent/'go2w/src/navigation/go2w_taught_route')])}
+                   'PYTHONPATH':os.pathsep.join([str(ROOT/'dev/fake_ros'), os.environ.get('GO2W_NAV_SOURCE', str(ROOT.parent/'go2w/src/navigation/go2w_taught_route'))])}
             log = (base/'server.log').open('w+')
             process = subprocess.Popen([sys.executable, str(ROOT/'server/go2w_web.py'), '--port', str(port),
                                         '--static', str(ROOT/'static')], cwd=ROOT, env=env, stdout=log, stderr=log)

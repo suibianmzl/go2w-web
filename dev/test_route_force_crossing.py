@@ -6,12 +6,13 @@ import threading
 import time
 from types import SimpleNamespace as NS
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT/'server'), str(ROOT/'dev/fake_ros'),
                str(ROOT.parent/'go2w/src/navigation/go2w_taught_route')]
 from go2w_web import Server, GoalStatus
+from obstacles_critic import ObstaclesCriticAPI
 
 
 def points(marked=()):
@@ -59,6 +60,283 @@ class CrossingDataTests(unittest.TestCase):
 
 
 class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def wait_for(self, predicate):
+        async with asyncio.timeout(2):
+            while not predicate():
+                await asyncio.sleep(.005)
+
+    def pending_navigation(self, host):
+        pending = []
+        original_aw = host.aw
+        # rclpy future 在 asyncio 等待被取消后仍会收到真实 action 结果。
+        host.aw = lambda result, timeout: original_aw(asyncio.shield(result), timeout)
+        def track(handle, pose, kind):
+            host.node.goal = dict(id=bytes(handle.goal_id.uuid), poses_left=len(handle.poses),
+                                  first_fb=time.monotonic(), status='active')
+            result = asyncio.get_running_loop().create_future()
+            def cancel():
+                if not result.done(): result.set_result(NS(status=GoalStatus.STATUS_CANCELED))
+            handle.cancel_goal_async.side_effect = cancel
+            pending.append((handle, result))
+            return result
+        host.node.track_goal = track
+        return pending
+
+    async def finish_pending(self, host, job, pending):
+        host.node.position = pending[-1][0].poses[-1]
+        pending[-1][1].set_result(NS(status=GoalStatus.STATUS_SUCCEEDED))
+        await asyncio.wait_for(job, 2)
+
+    async def test_intermediate_crossing_ends_advance_without_action_success(self):
+        for through in (False, True):
+            host, route, trace, _ = self.rig(through=through)
+            pending = self.pending_navigation(host)
+            job = asyncio.create_task(host.run_route(None, route))
+            try:
+                count = 3 if through else 5
+                for step in range(1, count):
+                    await self.wait_for(lambda: len(pending) >= step)
+                    handle, result = pending[step - 1]
+                    self.assertFalse(result.done(), '中间点不能靠模拟 action 成功推进')
+                    host.node.goal['poses_left'] = 1
+                    end = handle.poses[-1]
+                    host.node.position = (end[0] + .15, end[1], end[2])
+                await self.wait_for(lambda: len(pending) == count)
+                self.assertEqual(route['done'], 4)
+                self.assertFalse(job.done(), '最终点仍须等待 Nav2 成功')
+                self.assertFalse(pending[-1][1].done())
+                await self.finish_pending(host, job, pending)
+                self.assertEqual(route['status'], 'succeeded', route.get('message'))
+            finally:
+                job.cancel(); await asyncio.gather(job, return_exceptions=True)
+
+    async def test_speed_and_size_segment_ends_use_passage(self):
+        for split in ('speed', 'size'):
+            host, route, _, _ = self.rig(through=True, marked=())
+            if split == 'speed':
+                for point, speed in zip(route['record']['points'], (.4, .2, .3, .5, .35)):
+                    point['vmax'] = speed
+            pending = self.pending_navigation(host)
+            with patch('go2w_web.ROUTE_SEG_MAX', 2):
+                job = asyncio.create_task(host.run_route(None, route))
+                try:
+                    seen = 0
+                    while True:
+                        await self.wait_for(lambda: len(pending) > seen)
+                        handle, result = pending[seen]; seen += 1
+                        self.assertFalse(result.done())
+                        host.node.goal['poses_left'] = 1
+                        end = handle.poses[-1]
+                        host.node.position = (end[0] + .15, end[1], end[2])
+                        if end[0] == 5.: break
+                    await asyncio.sleep(.12)
+                    self.assertFalse(job.done())
+                    await self.finish_pending(host, job, pending)
+                    self.assertEqual(route['status'], 'succeeded', route.get('message'))
+                finally:
+                    job.cancel(); await asyncio.gather(job, return_exceptions=True)
+
+    async def test_dwell_cancels_intermediate_goal_before_countdown(self):
+        for through in (False, True):
+            host, route, _, _ = self.rig(through=through, marked=())
+            route['record']['points'][1]['dwell'] = .1
+            pending = self.pending_navigation(host)
+            job = asyncio.create_task(host.run_route(None, route))
+            try:
+                first_count = 1 if through else 2
+                for step in range(first_count):
+                    await self.wait_for(lambda: len(pending) > step)
+                    host.node.goal['poses_left'] = 1
+                    host.node.position = pending[step][0].poses[-1]
+                await self.wait_for(lambda: route.get('dwell_until') is not None)
+                self.assertTrue(pending[-1][0].cancel_goal_async.await_count)
+                before = len(pending)
+                await asyncio.sleep(.04)
+                self.assertEqual(len(pending), before, '停留结束前不能下发下一段')
+                await self.wait_for(lambda: len(pending) > before)
+            finally:
+                host.stop_route('test cleanup')
+                await asyncio.wait_for(job, 2)
+
+    async def test_final_aborted_action_cannot_be_accepted_by_distance(self):
+        for through in (False, True):
+            host, route, _, _ = self.rig(through=through, marked=())
+            original = host.node.track_goal
+            def track(handle, pose, kind):
+                result = original(handle, pose, kind)
+                async def fail_final():
+                    reply = await result
+                    if pose[0] == 5.: reply.status = GoalStatus.STATUS_ABORTED
+                    return reply
+                return asyncio.create_task(fail_final())
+            host.node.track_goal = track
+            await host.run_route(None, route)
+            self.assertEqual(route['status'], 'aborted', '最终点即使位置准确，也不能忽略 Nav2 失败')
+
+    async def test_sharp_intermediate_turn_does_not_wait_for_success(self):
+        host, route, _, _ = self.rig(marked=())
+        route['record']['points'] = [dict(x=3., y=0., th=0.), dict(x=3., y=3., th=0.), dict(x=0., y=3., th=0.)]
+        pending = self.pending_navigation(host)
+        job = asyncio.create_task(host.run_route(None, route))
+        try:
+            await self.wait_for(lambda: len(pending) == 1)
+            host.node.position = (2.8, 0., 0.)
+            await self.wait_for(lambda: len(pending) == 2)
+            self.assertFalse(pending[0][1].done())
+        finally:
+            host.stop_route('test cleanup'); await asyncio.wait_for(job, 2)
+
+    async def test_loop_waits_only_at_actual_final_return(self):
+        for through in (False, True):
+            host, route, _, _ = self.rig(through=through, loops=1)
+            pending = self.pending_navigation(host)
+            job = asyncio.create_task(host.run_route(None, route))
+            try:
+                count = 3 if through else 6
+                for step in range(1, count):
+                    await self.wait_for(lambda: len(pending) >= step)
+                    host.node.goal['poses_left'] = 1
+                    host.node.position = pending[step-1][0].poses[-1]
+                await self.wait_for(lambda: len(pending) == count)
+                if through:
+                    host.node.position = (5., 0., 0.)
+                    await self.wait_for(lambda: route['index'] == 0 and route['back'])
+                host.node.position = (1., 0., 0.)
+                await asyncio.sleep(.12)
+                self.assertFalse(job.done())
+                await self.finish_pending(host, job, pending)
+                self.assertEqual(route['status'], 'succeeded', route.get('message'))
+                self.assertEqual(route['done'], 6)
+            finally:
+                job.cancel(); await asyncio.gather(job, return_exceptions=True)
+
+    async def test_crossing_waits_point_two_seconds_after_all_three_changes(self):
+        for through in (False, True):
+            host, route, _, _ = self.rig(through=through)
+            writes, sends, climbs = [], [], []
+            api = ObstaclesCriticAPI()
+            async def write(node, parameter, value):
+                await asyncio.sleep(.01)
+                writes.append((value, parameter, time.monotonic()))
+                return {'node':node, 'parameter':parameter, 'enabled':value == 'true'}
+            api._set_parameter = write
+            host.obstacles_critic = api
+            original_climb = host.ctrl.climb
+            def climb(on):
+                original_climb(on); climbs.append((on, time.monotonic()))
+            host.ctrl.climb = climb
+            original_send = host.node.send_through if through else host.node.send_goal
+            def send(*args):
+                sends.append((args[0][0][0] if through else args[0], time.monotonic()))
+                return original_send(*args)
+            if through: host.node.send_through = send
+            else: host.node.send_goal = send
+            await host.run_route(None, route)
+            self.assertEqual(route['status'], 'succeeded', route.get('message'))
+            for value, next_x in (('false', 3.), ('true', 5.)):
+                selected = [row for row in writes if row[0] == value]
+                if value == 'true': selected = selected[-2:]
+                self.assertEqual({row[1] for row in selected},
+                                 {'FollowPath.ObstaclesCritic.enabled', 'voxel_layer.enabled'})
+                complete = max(row[2] for row in selected)
+                climb_complete = next(t for on, t in climbs if on == (value == 'false'))
+                sent = next(t for x, t in sends if x == next_x)
+                self.assertGreaterEqual(sent - max(complete, climb_complete), .199)
+
+    async def test_cancel_during_crossing_delay_sends_no_next_goal(self):
+        host, route, trace, _ = self.rig(through=True)
+        pending = self.pending_navigation(host)
+        changed = asyncio.Event()
+        original = host.obstacles_critic.apply.side_effect
+        async def apply(enabled):
+            await original(enabled)
+            if not enabled: changed.set()
+        host.obstacles_critic.apply.side_effect = apply
+        job = asyncio.create_task(host.run_route(None, route))
+        try:
+            await self.wait_for(lambda: len(pending) == 1)
+            host.node.goal['poses_left'] = 1
+            host.node.position = (2.15, 0., 0.)
+            await asyncio.wait_for(changed.wait(), 2)
+            await asyncio.sleep(.04)
+            host.stop_route('延时中取消')
+            await asyncio.wait_for(job, 2)
+            self.assertEqual(route['status'], 'canceled')
+            self.assertFalse(any(e[0] == 'send' and max(e[1]) > 2 for e in trace))
+            self.assertTrue(pending[0][0].cancel_goal_async.await_count)
+        finally:
+            job.cancel(); await asyncio.gather(job, return_exceptions=True)
+
+    async def test_failed_handoff_cancels_previous_pending_goal(self):
+        host, route, trace, _ = self.rig(through=True)
+        pending = self.pending_navigation(host)
+        async def fail(enabled):
+            if not enabled: raise RuntimeError('参数未生效')
+        host.obstacles_critic.apply.side_effect = fail
+        job = asyncio.create_task(host.run_route(None, route))
+        try:
+            await self.wait_for(lambda: len(pending) == 1)
+            host.node.goal['poses_left'] = 1
+            host.node.position = (2.15, 0., 0.)
+            await asyncio.wait_for(job, 1)
+            self.assertEqual(route['status'], 'aborted')
+            self.assertTrue(pending[0][0].cancel_goal_async.await_count)
+            self.assertFalse(any(e[0] == 'send' and max(e[1]) > 2 for e in trace))
+        finally:
+            job.cancel(); await asyncio.gather(job, return_exceptions=True)
+
+    async def test_fallback_to_single_cancels_pending_through_goal_first(self):
+        host, route, _, _ = self.rig(through=True)
+        pending = self.pending_navigation(host)
+        original = host.node.send_through
+        def send(poses, *args):
+            response = original(poses, *args)
+            if pending: response.result().accepted = False
+            return response
+        host.node.send_through = send
+        single = host.node.send_goal
+        canceled_before_single = []
+        def send_single(*pose):
+            canceled_before_single.append(pending[0][0].cancel_goal_async.await_count)
+            return single(*pose)
+        host.node.send_goal = send_single
+        job = asyncio.create_task(host.run_route(None, route))
+        try:
+            await self.wait_for(lambda: len(pending) == 1)
+            host.node.goal['poses_left'] = 1
+            host.node.position = (2.15, 0., 0.)
+            await self.wait_for(lambda: bool(canceled_before_single))
+            self.assertGreater(canceled_before_single[0], 0, 'ToPose 不能替换另一个 action 服务上的 Through 目标')
+        finally:
+            host.stop_route('test cleanup'); await asyncio.wait_for(job, 2)
+
+    async def test_cancel_during_parameter_write_immediately_cancels_old_goal(self):
+        for during_exit in (False, True):
+            host, route, _, _ = self.rig(through=True)
+            pending = self.pending_navigation(host)
+            entered, release = asyncio.Event(), asyncio.Event()
+            crossed = False
+            async def apply(enabled):
+                nonlocal crossed
+                if not enabled: crossed = True
+                if crossed and enabled == during_exit:
+                    entered.set(); await release.wait()
+            host.obstacles_critic.apply.side_effect = apply
+            job = asyncio.create_task(host.run_route(None, route))
+            try:
+                for step in range(2 if during_exit else 1):
+                    await self.wait_for(lambda: len(pending) > step)
+                    host.node.goal['poses_left'] = 1
+                    host.node.position = pending[step][0].poses[-1]
+                await asyncio.wait_for(entered.wait(), 2)
+                host.stop_route('参数修改时取消')
+                await asyncio.sleep(.05)
+                self.assertGreater(pending[-1][0].cancel_goal_async.await_count, 0,
+                                   '不能等 ROS 参数超时后才停车')
+            finally:
+                release.set()
+                host.stop_route('test cleanup'); await asyncio.wait_for(job, 2)
+
     def rig(self, *, through=False, marked=(1, 3), loops=None, resume=None, pos=(-1., 0., 0.)):
         host = Server.__new__(Server)
         trace, logs = [], []
@@ -266,7 +544,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(e[0] == 'send' and max(e[1]) > 4 for e in trace))
         self.assertTrue(any('恢复' in message and '失败' in message for _, message in logs))
 
-    async def test_failed_boundary_action_does_not_enable_even_if_close(self):
+    async def test_failed_boundary_without_physical_passage_does_not_enable(self):
         host, route, trace, _ = self.rig()
         original = host.node.track_goal
         def track(handle, pose, kind):
@@ -275,6 +553,7 @@ class CrossingExecutionTests(unittest.IsolatedAsyncioTestCase):
                 value = await reached
                 if pose[0] == 2.:
                     value.status = GoalStatus.STATUS_ABORTED
+                    host.node.position = (0., 0., 0.)
                 return value
             return asyncio.create_task(result())
         host.node.track_goal = track
