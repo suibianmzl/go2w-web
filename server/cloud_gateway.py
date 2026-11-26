@@ -167,6 +167,7 @@ class CloudGateway:
         self.rtc_publisher_states = {}
         self.command_seq = 0
         self.incidents = {}
+        self.inspection_cot = {}
         self.incident_tasks = set()
         self.recording_tasks = set()
         self.snapshot_requests = {}
@@ -529,6 +530,95 @@ class CloudGateway:
                     for item in incidents[:50]
                 ],
             }, ensure_ascii=False, separators=(',', ':')), key='incidents')
+
+    def replay_inspection_cot(self, client):
+        cached = self.inspection_cot.get(client.robot_id)
+        if not cached:
+            return
+        self.send_browser(client, json.dumps({
+            't': 'inspection_cot',
+            'snapshot': cached['snapshot'],
+            'updated_at': cached['updated_at'],
+        }, ensure_ascii=False, separators=(',', ':')), key='inspection_cot')
+
+    @staticmethod
+    def normalize_inspection_cot(snapshot):
+        if not isinstance(snapshot, dict):
+            return None
+        route_id = str(snapshot.get('routeId') or '')[:128]
+        raw_events = snapshot.get('events')
+        if not route_id or not isinstance(raw_events, list):
+            return None
+        try:
+            run_start = int(snapshot.get('runStart')) if snapshot.get('runStart') is not None else None
+        except (TypeError, ValueError):
+            run_start = None
+
+        def as_int(value, default=0, low=None, high=None):
+            try:
+                result = int(value)
+            except (TypeError, ValueError):
+                result = default
+            if low is not None:
+                result = max(low, result)
+            if high is not None:
+                result = min(high, result)
+            return result
+
+        events = []
+        for raw_event in raw_events[:200]:
+            if not isinstance(raw_event, dict):
+                continue
+            lines = []
+            for raw_line in (raw_event.get('lines') or [])[:50]:
+                if not isinstance(raw_line, dict):
+                    continue
+                text = str(raw_line.get('text') or '')[:2000]
+                if not text:
+                    continue
+                timer = raw_line.get('timer')
+                clean_timer = None
+                if isinstance(timer, dict) and timer.get('type') in {'countdown', 'countup'}:
+                    clean_timer = {
+                        'type': timer['type'],
+                        'from': as_int(timer.get('from'), 0, 0, 86400),
+                        'to': as_int(timer.get('to'), 0, 0, 86400),
+                        'intervalMs': as_int(timer.get('intervalMs'), 1000, 100, 60000),
+                        'startedAt': as_int(timer.get('startedAt'), 0, 0),
+                        'running': bool(timer.get('running')),
+                        'formatKey': str(timer.get('formatKey') or '')[:32],
+                    }
+                lines.append({
+                    'text': text,
+                    'delayMs': as_int(raw_line.get('delayMs'), 700, 0, 600000),
+                    'timer': clean_timer,
+                })
+            events.append({
+                'key': str(raw_event.get('key') or '')[:512],
+                'routeId': str(raw_event.get('routeId') or route_id)[:128],
+                'point': as_int(raw_event.get('point'), 1, 1, 10000),
+                'loop': as_int(raw_event.get('loop'), 1, 1, 10000),
+                'back': bool(raw_event.get('back')),
+                'note': str(raw_event.get('note') or '')[:128],
+                'cruiseName': str(raw_event.get('cruiseName') or '')[:128],
+                'nodeIndex': as_int(raw_event.get('nodeIndex'), -1, -1, 100),
+                'visible': as_int(raw_event.get('visible'), 0, 0, 50),
+                'at': as_int(raw_event.get('at'), 0, 0),
+                'fallback': bool(raw_event.get('fallback')),
+                'blockage': bool(raw_event.get('blockage')),
+                'lines': lines,
+            })
+        return {
+            'routeId': route_id,
+            'runStart': run_start,
+            'activeNodeIndex': as_int(snapshot.get('activeNodeIndex'), -1, -1, 100),
+            'openNodeIndex': (
+                None if snapshot.get('openNodeIndex') is None
+                else as_int(snapshot.get('openNodeIndex'), -1, -1, 100)
+            ),
+            'activeCotKey': str(snapshot.get('activeCotKey') or '')[:512],
+            'events': events,
+        }
 
     def archive_background(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -1087,20 +1177,35 @@ class CloudGateway:
                 command_id, 'failed', '机器人指令队列已满或连接已断开')
         return sent
 
-    async def stop_on_last_browser_loss(self, session):
-        if session is None or session.ws.closed:
-            return
-        await self.send_system_command(
-            session, 'cancel', {}, '最后一个控制页面断开，自动取消任务')
-        await self.send_system_command(
-            session, 'arm', {'on': False}, '最后一个控制页面断开，自动锁定底盘')
-
     async def on_browser_text(self, client, data):
         try:
             msg = json.loads(data)
         except ValueError:
             return
         msg_type = msg.get('t')
+        if msg_type == 'inspection_cot':
+            snapshot = self.normalize_inspection_cot(msg.get('snapshot'))
+            if snapshot is None:
+                return
+            if len(json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))) > 256 * 1024:
+                return
+            existing = self.inspection_cot.get(client.robot_id)
+            existing_start = (existing or {}).get('snapshot', {}).get('runStart')
+            if (
+                snapshot.get('runStart') is not None
+                and existing_start is not None
+                and int(snapshot['runStart']) < int(existing_start)
+            ):
+                return
+            updated_at = int(time.time() * 1000)
+            if snapshot['events']:
+                self.inspection_cot[client.robot_id] = {
+                    'snapshot': snapshot,
+                    'updated_at': updated_at,
+                }
+            else:
+                self.inspection_cot.pop(client.robot_id, None)
+            return
         if msg_type == 'ping':
             self.send_browser(client, json.dumps({'t': 'pong', 'ts': msg.get('ts')}, separators=(',', ':')))
             session = self.robots.get(client.robot_id)
@@ -1192,6 +1297,7 @@ class CloudGateway:
             self.robot_status(robot_id), ensure_ascii=False, separators=(',', ':')), key='robot_status')
         if session is not None and not session.ws.closed:
             self.replay(client)
+        self.replay_inspection_cot(client)
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -1214,7 +1320,9 @@ class CloudGateway:
                 self.sync_topics(robot_id)
                 if not remaining_clients:
                     session.owner = None
-                    await self.stop_on_last_browser_loss(session)
+                    # 最后一个控制页面关闭或刷新时不能替机器狗取消任务。自动导航任务
+                    # 由机器狗后端按心跳/任务状态继续；遥控、未执行任务的解锁等安全兜底
+                    # 仍由机器狗本地逻辑处理，页面重连后可以从状态缓存恢复。
                 elif session.owner is client:
                     session.owner = remaining_clients[0]
             if client.tx:

@@ -329,6 +329,70 @@ async def test_cloud_gateway():
                 state = await browser_reader.text(lambda m: m.get('t') == 'state')
                 assert state['booting'] is True
 
+                cot_snapshot = {
+                    'routeId': 'route-1',
+                    'runStart': 1795596936822,
+                    'activeNodeIndex': 2,
+                    'openNodeIndex': 2,
+                    'activeCotKey': 'route-1:1:forward:2:position_trail',
+                    'events': [{
+                        'key': 'route-1:1:forward:2:position_trail',
+                        'routeId': 'route-1',
+                        'point': 10,
+                        'loop': 1,
+                        'back': False,
+                        'note': 'position_trail',
+                        'cruiseName': '大厦出口',
+                        'nodeIndex': 2,
+                        'visible': 2,
+                        'at': 1795596937522,
+                        'fallback': False,
+                        'blockage': False,
+                        'lines': [{
+                            'text': '已到达巡逻点位【大厦出口】',
+                            'delayMs': 700,
+                            'timer': None,
+                        }, {
+                            'text': '定点巡逻中（17s）',
+                            'delayMs': 700,
+                            'timer': {
+                                'type': 'countdown',
+                                'from': 30,
+                                'to': 0,
+                                'intervalMs': 1000,
+                                'startedAt': 1795596937522,
+                                'running': True,
+                                'formatKey': 'dwell',
+                            },
+                        }],
+                    }],
+                }
+                await browser.send_str(json.dumps({
+                    't': 'inspection_cot',
+                    'snapshot': cot_snapshot,
+                }, ensure_ascii=False))
+                await asyncio.sleep(0.05)
+                assert not any(
+                    item[0] == 'text' and item[1].get('t') == 'inspection_cot'
+                    for item in robot_reader.items
+                )
+
+                cot_browser = await session.ws_connect(base + '/quadruped/ws')
+                cot_reader = Reader(cot_browser)
+                await cot_reader.text(lambda m: m.get('t') == 'robot_status')
+                cached_cot = await cot_reader.text(lambda m: m.get('t') == 'inspection_cot')
+                assert cached_cot['snapshot']['routeId'] == 'route-1'
+                assert cached_cot['snapshot']['events'][0]['cruiseName'] == '大厦出口'
+                assert cached_cot['snapshot']['events'][0]['lines'][1]['timer']['formatKey'] == 'dwell'
+                await cot_browser.close()
+                await cot_reader.close()
+                await browser.send_str(json.dumps({
+                    't': 'inspection_cot',
+                    'snapshot': {**cot_snapshot, 'events': []},
+                }, ensure_ascii=False))
+                await asyncio.sleep(0.05)
+                assert 'go2w-01' not in gateway.inspection_cot
+
                 exceptions = {
                     't': 'inspection_exceptions',
                     'mode': 'snapshot',
@@ -471,9 +535,14 @@ async def test_cloud_gateway():
                 await browser_reader.close()
 
                 await other.close()
-                cancel = await robot_reader.text(lambda m: m.get('t') == 'cmd' and m.get('op') == 'cancel')
-                lock = await robot_reader.text(lambda m: m.get('t') == 'cmd' and m.get('op') == 'arm')
-                assert cancel['op'] == 'cancel' and lock['on'] is False
+                try:
+                    await robot_reader.text(
+                        lambda m: m.get('t') == 'cmd' and m.get('op') in {'cancel', 'arm'},
+                        timeout=0.4,
+                    )
+                    raise AssertionError('last browser close must not cancel or lock the robot')
+                except (TimeoutError, asyncio.TimeoutError):
+                    pass
 
                 await other_reader.close()
                 browser2 = await session.ws_connect(base + '/quadruped/ws')
@@ -540,7 +609,7 @@ async def test_multi_robot_gateway():
                     await browser2_reader.text(
                         lambda m: m.get('t') == 'state' and m.get('marker') == 1, timeout=0.3)
                     raise AssertionError('go2w-01 state leaked to go2w-02 browser')
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):
                     pass
 
                 await robot2.send_str('{"t":"state","marker":2}')
@@ -554,7 +623,7 @@ async def test_multi_robot_gateway():
                 try:
                     await robot2_reader.text(lambda m: m.get('t') == 'cmd', timeout=0.3)
                     raise AssertionError('go2w-01 command leaked to go2w-02')
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):
                     pass
 
                 await robot1.close()

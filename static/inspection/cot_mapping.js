@@ -1,7 +1,7 @@
 export const INSPECTION_NODES = [
   { code:'01', name:'起点' },
   { code:'02', name:'电动车存放处' },
-  { code:'03', name:'人行步道' },
+  { code:'03', name:'大厦出口' },
   { code:'04', name:'返回起点' },
 ];
 
@@ -46,15 +46,16 @@ export const COT_NOTE_DEFINITIONS = [
           from:30,
           to:0,
           intervalMs:1000,
+          formatKey:'dwell',
           format:seconds => `定点巡逻中（${seconds}s）`,
         },
       },
-      { text:'巡逻结束，出发前往【人行步道】', delayMs:30000 },
+      { text:'巡逻结束，出发前往【大厦出口】', delayMs:30000 },
     ],
   },
   {
     note:'position_footway',
-    cruiseName:'人行步道',
+    cruiseName:'大厦出口',
     nodeIndex:1,
     // 阻塞文案由巡检页根据实时速度条件生成，避免无阻塞时固定播报。
     lines:[],
@@ -71,7 +72,7 @@ export const COT_NOTE_DEFINITIONS = [
     cruiseName:'门前步道',
     nodeIndex:2,
     lines:[
-      '已到达巡逻点位【人行步道】',
+      '已到达巡逻点位【大厦出口】',
       {
         text:'定点巡逻中（30s）',
         delayMs:700,
@@ -80,6 +81,7 @@ export const COT_NOTE_DEFINITIONS = [
           from:30,
           to:0,
           intervalMs:1000,
+          formatKey:'dwell',
           format:seconds => `定点巡逻中（${seconds}s）`,
         },
       },
@@ -128,4 +130,29 @@ export function inspectionNodeIndexForTask(task, points = []){
     if (definition) return definition.nodeIndex;
   }
   return -1;
+}
+
+export function inspectionLocalizationHints(route){
+  const point = route?.points?.[0];
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return {};
+  return { hints:[{ x:point.x, y:point.y, label:'第 1 站' }] };
+}
+
+export function cotEventFamilyKey(event){
+  return [
+    event?.routeId || '',
+    Number(event?.loop) || 1,
+    event?.back ? 'back' : 'forward',
+    event?.nodeIndex,
+    event?.note || '',
+  ].join(':');
+}
+
+export function inspectionTaskRestarted(previous, next){
+  if (next?.status !== 'active' || previous?.status !== 'active' || next.routeId !== previous.routeId){
+    return false;
+  }
+  const elapsed = Number(next.elapsed);
+  const previousElapsed = Number(previous.elapsed);
+  return Number.isFinite(elapsed) && Number.isFinite(previousElapsed) && elapsed + 2 < previousElapsed;
 }

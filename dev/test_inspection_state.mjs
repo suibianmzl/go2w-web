@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 
-import { COT_BY_NOTE, inspectionNodeIndexForTask } from '../static/inspection/cot_mapping.js';
+import {
+  COT_BY_NOTE,
+  INSPECTION_NODES,
+  cotEventFamilyKey,
+  inspectionLocalizationHints,
+  inspectionNodeIndexForTask,
+  inspectionTaskRestarted,
+} from '../static/inspection/cot_mapping.js';
 
 const points = [
   { note:'position_starting' },
@@ -45,5 +52,21 @@ const trailDwellLine = COT_BY_NOTE.get('position_trail').lines.find(line => line
 assert.equal(trailDwellLine?.timer?.type, 'countdown');
 assert.equal(trailDwellLine?.timer?.from, 30);
 assert.equal(trailDwellLine?.timer?.format(17), '定点巡逻中（17s）');
+assert.equal(INSPECTION_NODES[2].name, '大厦出口');
+assert.equal(COT_BY_NOTE.get('position_trail').lines[0], '已到达巡逻点位【大厦出口】');
+assert.deepEqual(
+  inspectionLocalizationHints({ points:[{ x:1.2, y:3.4 }] }),
+  { hints:[{ x:1.2, y:3.4, label:'第 1 站' }] },
+);
+assert.deepEqual(inspectionLocalizationHints({ points:[] }), {});
+assert.equal(
+  cotEventFamilyKey({ routeId:'route-1', loop:1, nodeIndex:2, note:'position_trail', point:9 }),
+  cotEventFamilyKey({ routeId:'route-1', loop:1, nodeIndex:2, note:'position_trail', point:10 }),
+  '同一轮同一固定节点的 CoT 归为一组，点数变化不产生第二次倒计时',
+);
+assert.equal(inspectionTaskRestarted(
+  { status:'active', routeId:'route-1', elapsed:42 },
+  { status:'active', routeId:'route-1', elapsed:1 },
+), true);
 
-console.log('PASS inspection state: resumed tasks and both dwell points keep timers');
+console.log('PASS inspection state: CoT dedupe, localization hints and both dwell timers');

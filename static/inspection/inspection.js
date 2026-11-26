@@ -1,6 +1,13 @@
 import { gridToCanvas } from '../js/util.js';
 import { createRtcViewer } from '../js/rtc_viewer.js';
-import { INSPECTION_NODES, COT_BY_NOTE, inspectionNodeIndexForTask } from './cot_mapping.js';
+import {
+  INSPECTION_NODES,
+  COT_BY_NOTE,
+  cotEventFamilyKey,
+  inspectionLocalizationHints,
+  inspectionNodeIndexForTask,
+  inspectionTaskRestarted,
+} from './cot_mapping.js';
 import { createFootwayBlockageWatch, footwayLowSpeedActive } from './blockage_watch.js';
 
 const $ = selector => document.querySelector(selector);
@@ -9,6 +16,7 @@ const POSE_RENDER_MS = 1000;
 const TRAIL_MIN_MOVE = 0.04;
 const HEARTBEAT_MS = 500;
 const COT_REVEAL_MS = 700;
+const COT_PUBLISH_MS = 300;
 const DEFAULT_ROUTE_ID = '49997f67fac041ecb7a74ab12259b3af';
 
 const els = {
@@ -116,6 +124,7 @@ const state = {
 };
 
 const footwayBlockage = createFootwayBlockageWatch();
+let cotPublishTimer = null;
 
 const rtc = createRtcViewer(els.rtcVideo, message => {
   els.rtcMessage.textContent = message || '';
@@ -231,6 +240,7 @@ function stopLineTimer(line, finalize = false){
   if (finalize && timer.type === 'countdown'){
     line.text = timer.format(timer.to ?? 0);
   }
+  scheduleCotPublish();
 }
 
 function stopAllCotLineTimers(finalize = false){
@@ -243,16 +253,19 @@ function startLineTimer(event, lineIndex){
   const line = event?.lines?.[lineIndex];
   const timer = line?.timer;
   if (!timer || timer.timerId) return;
-  const startedAt = performance.now();
+  if (!timer.format) timer.format = timerFormatter(timer, event);
+  const startedAt = Number(timer.startedAt) > 0 ? Number(timer.startedAt) : Date.now();
+  timer.startedAt = startedAt;
   const tick = () => {
     if (!timer.running) return;
     const elapsed = Math.max(0, Math.floor(
-      (performance.now() - startedAt) / (timer.intervalMs || 1000),
+      (Date.now() - startedAt) / (timer.intervalMs || 1000),
     ));
     const value = timer.type === 'countdown'
       ? Math.max(timer.to ?? 0, timer.from - elapsed)
       : timer.from + elapsed;
     line.text = timer.format(value);
+    scheduleCotPublish();
     renderTask();
     if (timer.type === 'countdown' && value <= (timer.to ?? 0)) stopLineTimer(line);
   };
@@ -261,7 +274,155 @@ function startLineTimer(event, lineIndex){
   if (timer.running) timer.timerId = setInterval(tick, timer.intervalMs || 1000);
 }
 
-function resetCotOutput(){
+function timerFormatter(timer, event = null){
+  if (timer?.formatKey === 'dwell' || event?.note === 'position_monitoring' || event?.note === 'position_trail'){
+    return seconds => `定点巡逻中（${seconds}s）`;
+  }
+  if (timer?.formatKey === 'blockage' || event?.blockage){
+    return seconds => `检测到阻塞（> ${seconds}s）`;
+  }
+  return seconds => String(seconds);
+}
+
+function cotSnapshot(routeId, runStart, events = state.cotEvents){
+  return {
+    routeId,
+    runStart:Number.isFinite(runStart) ? runStart : null,
+    activeNodeIndex:state.activeNodeIndex,
+    openNodeIndex:state.openNodeIndex,
+    activeCotKey:state.activeCotKey,
+    events:events.map(event => ({
+      key:event.key,
+      routeId:event.routeId,
+      point:event.point,
+      loop:event.loop,
+      back:!!event.back,
+      note:event.note,
+      cruiseName:event.cruiseName,
+      nodeIndex:event.nodeIndex,
+      visible:event.visible,
+      at:event.at,
+      fallback:!!event.fallback,
+      blockage:!!event.blockage,
+      lines:(event.lines || []).map(line => ({
+        text:line.text,
+        delayMs:line.delayMs,
+        timer:line.timer ? {
+          type:line.timer.type,
+          from:line.timer.from,
+          to:line.timer.to,
+          intervalMs:line.timer.intervalMs,
+          startedAt:line.timer.startedAt,
+          running:!!line.timer.running,
+          formatKey:line.timer.formatKey || '',
+        } : null,
+      })),
+    })),
+  };
+}
+
+function publishCotSnapshot(snapshot){
+  if (!state.wsOpen || state.ws?.readyState !== WebSocket.OPEN || !snapshot?.routeId) return;
+  state.ws.send(JSON.stringify({ t:'inspection_cot', snapshot }));
+}
+
+function scheduleCotPublish(delay = COT_PUBLISH_MS){
+  if (!state.wsOpen || !state.robotId) return;
+  clearTimeout(cotPublishTimer);
+  cotPublishTimer = setTimeout(() => {
+    cotPublishTimer = null;
+    const routeId = state.inspectionRouteId || state.task?.routeId || '';
+    if (!routeId) return;
+    publishCotSnapshot(cotSnapshot(routeId, state.inspectionRunStart));
+  }, delay);
+}
+
+function clearCachedCot(routeId, runStart){
+  if (!routeId) return;
+  const snapshot = cotSnapshot(routeId, runStart, []);
+  snapshot.activeNodeIndex = -1;
+  snapshot.openNodeIndex = null;
+  snapshot.activeCotKey = '';
+  publishCotSnapshot(snapshot);
+}
+
+function restoreCotSnapshot(snapshot){
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  const routeId = String(snapshot.routeId || '');
+  const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+  const currentRouteId = state.inspectionRouteId || state.task?.routeId || '';
+  const task = state.task || {};
+  if (!routeId || !task.routeId || task.type !== 'route') return false;
+  if (currentRouteId && currentRouteId !== routeId) return false;
+  const incomingStart = Number(snapshot.runStart);
+  const currentStart = Number(state.inspectionRunStart);
+  if (Number.isFinite(incomingStart) && Number.isFinite(currentStart)
+      && Math.abs(incomingStart - currentStart) > 15000) return false;
+
+  state.inspectionRouteId = routeId;
+  if (Number.isFinite(incomingStart)) state.inspectionRunStart = incomingStart;
+  state.cotEvents = events.map(raw => {
+    const rawNodeIndex = Number(raw?.nodeIndex);
+    const event = {
+      key:String(raw?.key || ''),
+      routeId:String(raw?.routeId || routeId),
+      point:Number(raw?.point) || 1,
+      loop:Number(raw?.loop) || 1,
+      back:!!raw?.back,
+      note:String(raw?.note || ''),
+      cruiseName:String(raw?.cruiseName || ''),
+      nodeIndex:Number.isFinite(rawNodeIndex) ? rawNodeIndex : -1,
+      visible:Math.max(0, Number(raw?.visible) || 0),
+      at:Number(raw?.at) || Date.now(),
+      fallback:!!raw?.fallback,
+      blockage:!!raw?.blockage,
+      lines:[],
+    };
+    event.lines = (Array.isArray(raw?.lines) ? raw.lines : []).map(rawLine => {
+      const rawDelay = Number(rawLine?.delayMs);
+      const timer = rawLine?.timer && typeof rawLine.timer === 'object' ? {
+        type:rawLine.timer.type,
+        from:Number(rawLine.timer.from) || 0,
+        to:Number(rawLine.timer.to) || 0,
+        intervalMs:Number(rawLine.timer.intervalMs) || 1000,
+        startedAt:Number(rawLine.timer.startedAt) || 0,
+        running:!!rawLine.timer.running,
+        formatKey:String(rawLine.timer.formatKey || ''),
+      } : null;
+      if (timer) timer.format = timerFormatter(timer, event);
+      return {
+        text:String(rawLine?.text || ''),
+        delayMs:Number.isFinite(rawDelay) ? rawDelay : COT_REVEAL_MS,
+        timer,
+      };
+    }).filter(line => line.text);
+    event.visible = Math.min(event.visible, event.lines.length);
+    return event;
+  }).filter(event => event.key && event.lines.length);
+  state.cotEventKeys = new Set(state.cotEvents.map(event => event.key));
+  state.activeCotKey = state.cotEventKeys.has(snapshot.activeCotKey)
+    ? snapshot.activeCotKey
+    : state.cotEvents.at(-1)?.key || '';
+  state.activeNodeIndex = Number.isFinite(Number(snapshot.activeNodeIndex))
+    ? Number(snapshot.activeNodeIndex) : -1;
+  state.openNodeIndex = snapshot.openNodeIndex == null
+    ? null : Number(snapshot.openNodeIndex);
+  state.cotLastAt = state.cotEvents.reduce((latest, event) => Math.max(latest, event.at || 0), 0) || null;
+  for (const event of state.cotEvents){
+    event.lines.forEach((line, index) => {
+      if (line.timer?.running) startLineTimer(event, index);
+    });
+  }
+  renderTask();
+  const active = state.cotEvents.find(event => event.key === state.activeCotKey);
+  if (active && active.visible < active.lines.length) scheduleCotReveal();
+  return true;
+}
+
+function resetCotOutput(publishClear = true){
+  const routeId = state.inspectionRouteId || state.task?.routeId || '';
+  const runStart = state.inspectionRunStart;
+  const hadEvents = state.cotEvents.length > 0;
   stopCotReveal();
   stopAllCotLineTimers();
   footwayBlockage.resetRun();
@@ -274,10 +435,11 @@ function resetCotOutput(){
   state.cotLastAt = null;
   state.inspectionRunStart = null;
   state.inspectionRouteId = null;
+  if (publishClear && hadEvents) clearCachedCot(routeId, runStart);
 }
 
 function beginInspectionRun(task, startedAt = Date.now()){
-  resetCotOutput();
+  resetCotOutput(false);
   state.inspectionRunStart = startedAt;
   state.inspectionRouteId = task?.routeId || null;
   const index = inspectionNodeForTask(task);
@@ -332,6 +494,7 @@ function scheduleCotReveal(){
     event.visible = Math.min(event.lines.length, event.visible + 1);
     startLineTimer(event, revealed);
     renderTask();
+    scheduleCotPublish();
     scheduleCotReveal();
   }, delay);
 }
@@ -378,6 +541,20 @@ function ingestTaskCot(task){
     at:Date.now(),
     fallback:!!definition.fallback,
   };
+  // 固定巡检节点按“路线 + 圈 + 前进/返回 + 备注”归组。页面曾漏掉上一轮
+  // task 的结束状态时，新一轮同一个节点可能再次生成 CoT；这里用最新一次
+  // 替换旧事件，避免“大厦出口”里同时出现两个倒计时。
+  const family = cotEventFamilyKey(event);
+  for (const previous of state.cotEvents){
+    if (previous.blockage) continue;
+    if (cotEventFamilyKey(previous) !== family) continue;
+    for (const line of previous.lines || []) stopLineTimer(line);
+    state.cotEventKeys.delete(previous.key);
+  }
+  state.cotEvents = state.cotEvents.filter(item => {
+    if (item.blockage) return true;
+    return cotEventFamilyKey(item) !== family;
+  });
   state.cotEvents.push(event);
   state.cotEventKeys.add(key);
   state.activeCotKey = key;
@@ -413,6 +590,7 @@ function appendFootwayBlockageCot(task, key){
     type:'countup',
     from:10,
     intervalMs:1000,
+    formatKey:'blockage',
     format:seconds => `检测到阻塞（> ${seconds}s）`,
   };
   startLineTimer(event, 0);
@@ -1202,12 +1380,13 @@ function onJson(message){
     case 'task': {
       const previous = state.task || { type:'idle' };
       const next = message.task || { type:'idle' };
+      const elapsed = Number(next.elapsed);
+      const restarted = inspectionTaskRestarted(previous, next);
       if (
         next.status === 'active'
         && next.routeId
-        && (previous.status !== 'active' || previous.routeId !== next.routeId)
+        && (previous.status !== 'active' || previous.routeId !== next.routeId || restarted)
       ){
-        const elapsed = Number(next.elapsed);
         beginInspectionRun(
           next,
           Number.isFinite(elapsed) ? Date.now() - elapsed * 1000 : Date.now(),
@@ -1249,6 +1428,9 @@ function onJson(message){
       break;
     case 'incident':
       mergeIncidents(message.item ? [message.item] : []);
+      break;
+    case 'inspection_cot':
+      restoreCotSnapshot(message.snapshot);
       break;
     case 'inspection_exceptions': {
       const items = Array.isArray(message.items) ? message.items : message.item ? [message.item] : [];
@@ -1313,11 +1495,72 @@ function showPrepare(message){
   if (state.preparing) els.taskStateText.textContent = message;
 }
 
+function localizedForMap(route){
+  const auto = state.machine?.autoLoc;
+  return auto?.state === 'ok'
+    && auto?.map === route.map
+    && state.pose?.valid
+    && state.pose?.frame === 'map';
+}
+
+async function ensureLocalized(route){
+  if (localizedForMap(route)) return;
+  const auto = () => state.machine?.autoLoc || {};
+  if (auto().state === 'run'){
+    showPrepare('正在等待导航自动定位…');
+    await waitForCondition(
+      () => localizedForMap(route) || auto().state === 'fail',
+      90000,
+      '自动定位',
+    );
+  }
+  if (localizedForMap(route)) return;
+
+  const seq = Number(auto().seq ?? -1);
+  showPrepare('正在执行自动定位…');
+  const reply = await send({
+    op:'auto_localize',
+    ...inspectionLocalizationHints(route),
+  }, 100000);
+  if (!reply.ok && !/正在进行/.test(reply.msg || '')){
+    throw new Error(reply.msg || '自动定位失败');
+  }
+  await waitForCondition(
+    () => localizedForMap(route)
+      || (auto().state === 'fail' && Number(auto().seq ?? -1) > seq),
+    70000,
+    '自动定位',
+  );
+  if (!localizedForMap(route)){
+    throw new Error(auto().msg || reply.msg || '自动定位失败');
+  }
+}
+
+async function ensureRouteReady(route){
+  showPrepare('正在确认定位、里程计和地图状态…');
+  await waitForCondition(
+    () => state.pose?.valid
+      && state.pose?.frame === 'map'
+      && state.machine?.odomOk === true
+      && state.machine?.mapCurrent === route.map,
+    15000,
+    '定位或里程计',
+  );
+  // 刚定位后 AMCL 需要约 1 秒才能算出新匹配率。和主控制台一样最多等 4 秒，
+  // 避免拿定位前的旧匹配率立刻出发，也避免匹配率暂时偏低时永远不出发。
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline){
+    const match = Number(state.machine?.loc?.match);
+    if (!Number.isFinite(match) || match >= 60) return;
+    await sleep(300);
+  }
+}
+
 async function prepareInspection(route){
   const machine = state.machine || {};
   const profiles = machine.profiles || {};
   const ctrl = machine.ctrl || {};
-  let needsLocalization = (
+  const needsLocalization = (
     profiles.navigation !== 'run'
     || machine.mapCurrent !== route.map
     || !state.pose?.valid
@@ -1360,37 +1603,8 @@ async function prepareInspection(route){
     '启动导航',
   );
 
-  if (needsLocalization){
-    showPrepare('正在等待导航自动定位…');
-    const waitLocalized = () => {
-      const auto = state.machine?.autoLoc;
-      return auto?.state === 'ok'
-        && auto?.map === route.map
-        && state.pose?.valid
-        && state.pose?.frame === 'map';
-    };
-    try {
-      await waitForCondition(waitLocalized, 12000, '自动定位');
-    } catch {
-      const auto = state.machine?.autoLoc;
-      if (auto?.state !== 'run'){
-        showPrepare('正在执行自动定位…');
-        const reply = await send({ op:'auto_localize' }, 100000);
-        if (!reply.ok && !/正在进行/.test(reply.msg || '')){
-          throw new Error(reply.msg || '自动定位失败');
-        }
-      }
-      try {
-        await waitForCondition(waitLocalized, 70000, '自动定位');
-      } catch {
-        const failed = state.machine?.autoLoc;
-        if (failed?.state === 'fail'){
-          throw new Error(failed.msg || '自动定位失败');
-        }
-        throw new Error('自动定位超时，请检查机器狗是否站稳且激光地图可匹配');
-      }
-    }
-  }
+  if (needsLocalization) await ensureLocalized(route);
+  await ensureRouteReady(route);
 
   showPrepare('导航、地图和定位已就绪，正在下发巡检任务…');
   return true;
@@ -1409,7 +1623,7 @@ async function startInspection(){
     const ready = await prepareInspection(route);
     if (!ready) return;
     const opts = route.opts || {};
-    const reply = await send({
+    const command = {
       op:'route_start',
       route_id:route.id,
       round_trip:!!opts.loop,
@@ -1417,7 +1631,14 @@ async function startInspection(){
       arm:true,
       ...(Number.isFinite(opts.vmax) ? { vmax:opts.vmax } : {}),
       ...(Number.isFinite(opts.wmax) ? { wmax:opts.wmax } : {}),
-    });
+    };
+    let reply = await send(command);
+    if (!reply.ok && /定位|里程计|地图定位/.test(reply.msg || '')){
+      showPrepare('定位状态不稳定，正在重新确认…');
+      await ensureLocalized(route);
+      await ensureRouteReady(route);
+      reply = await send(command);
+    }
     if (reply.ok){
       if (!(state.task?.status === 'active'
         && state.task?.routeId === route.id
@@ -1635,28 +1856,6 @@ function drawRoute(){
     if (completed > 0) drawPolyline(full.slice(0, completed + 1), 'rgba(53,212,138,.95)', 3.5);
   }
 
-  points.forEach((point, index) => {
-    const x = sx(point.x), y = sy(point.y);
-    const isCurrent = taskForSelectedRoute() && task.status === 'active' && task.point === index + 1;
-    ctx.save();
-    ctx.strokeStyle = isCurrent ? '#38e1dc' : '#7d8da0';
-    ctx.fillStyle = isCurrent ? 'rgba(56,225,220,.3)' : 'rgba(7,14,21,.94)';
-    ctx.lineWidth = isCurrent ? 2 : 1.2;
-    if (isCurrent){
-      ctx.shadowColor = '#38e1dc';
-      ctx.shadowBlur = 12;
-    }
-    ctx.beginPath();
-    ctx.arc(x, y, isCurrent ? 6 : 4, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = isCurrent ? '#b6fffc' : '#98aabc';
-    ctx.font = '500 10px "JetBrains Mono", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(String(index + 1), x, y - 11);
-    ctx.restore();
-  });
 }
 
 function drawRobot(){
