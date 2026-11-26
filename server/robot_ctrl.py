@@ -28,6 +28,7 @@ API_STANDUP = 1004
 API_STANDDOWN = 1005
 API_CLIMB = 2101
 STATES = ('Passive', 'FixStand', 'Velocity')
+LOWSTATE_DT = 0.2   # s：/lowstate 采样周期（电量、温度、电机表都够用）
 
 
 class CtrlLink:
@@ -70,16 +71,35 @@ class CtrlLink:
             self.ros.create_subscription(String, '/go2w_ctrl/state', self.on_state,
                                          QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.pub = self.ros.create_publisher(Request, '/api/sport/request', 10) if control else None
+        self.ls_node = None
         if on_lowstate is not None:
             from rosidl_runtime_py.utilities import get_message
-            self.lowstate_t = -float('inf')
-            def receive(raw):
-                now = time.monotonic()
-                if now-self.lowstate_t >= .2:  # raw callback: decode at most 5 Hz, including when navigation is off.
-                    self.lowstate_t = now
-                    on_lowstate(raw)
-            self.ros.create_subscription(get_message('unitree_go/msg/LowState'), '/lowstate', receive,
-                                         QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT), raw=True)
+            LowState = get_message('unitree_go/msg/LowState')
+            ls_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            if fake:
+                self.lowstate_t = -float('inf')
+
+                def receive(raw):
+                    now = time.monotonic()
+                    if now - self.lowstate_t >= LOWSTATE_DT:
+                        self.lowstate_t = now
+                        on_lowstate(raw)
+                self.ros.create_subscription(LowState, '/lowstate', receive, ls_qos, raw=True)
+            else:
+                # /lowstate 约 500 Hz，网页只要 5 Hz。挂在执行器上时每条都要进一次 Python 回调（11-26 实测约 40% CPU），
+                # 所以放到一个不进执行器的节点上：DDS 只留最新一条（depth 1），定时主动取（实测约 4%）。
+                self.ls_node = Node('go2w_web_lowstate', context=self.ctx, use_global_arguments=False)
+                ls_sub = self.ls_node.create_subscription(LowState, '/lowstate', lambda raw: None, ls_qos, raw=True)
+
+                def poll():
+                    try:
+                        with ls_sub.handle:
+                            got = ls_sub.handle.take_message(LowState, True)
+                    except Exception:
+                        return
+                    if got is not None:
+                        on_lowstate(got[0])
+                self.ros.create_timer(LOWSTATE_DT, poll)
 
     def close(self):
         """只释放网页自己的域 0 监听器；不发 Sport 请求，不停止控制进程。"""
@@ -87,6 +107,8 @@ class CtrlLink:
             return
         self.executor.shutdown()
         self.thread.join(timeout=3.0)
+        if self.ls_node is not None:
+            self.ls_node.destroy_node()
         self.ros.destroy_node()
         self.ctx.try_shutdown()
 
