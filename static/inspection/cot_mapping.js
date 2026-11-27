@@ -132,6 +132,10 @@ export function inspectionNodeIndexForTask(task, points = []){
   return -1;
 }
 
+export function inspectionProductionRoutes(routes){
+  return (Array.isArray(routes) ? routes : []).filter(route => route?.purpose === 'prod');
+}
+
 export function inspectionLocalizationHints(route){
   const point = route?.points?.[0];
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return {};

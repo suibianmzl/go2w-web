@@ -513,9 +513,12 @@ async def test_cloud_gateway():
                 other = await session.ws_connect(base + '/quadruped/ws')
                 other_reader = Reader(other)
                 await other_reader.text(lambda m: m.get('t') == 'robot_status')
+                old_owner = gateway.robots['go2w-01'].owner
                 await other.send_str('{"t":"cmd","id":8,"op":"cancel"}')
                 command = await robot_reader.text(lambda m: m.get('t') == 'cmd')
                 assert command['op'] == 'cancel'
+                assert gateway.robots['go2w-01'].owner is not None
+                assert gateway.robots['go2w-01'].owner is not old_owner
                 await robot.send_str(json.dumps({
                     't': 'ack', 'id': command['id'], 'ok': True, 'msg': 'canceled',
                 }))
@@ -523,6 +526,22 @@ async def test_cloud_gateway():
                 assert other_ack == {
                     't': 'ack', 'id': 8, 'ok': True, 'msg': 'canceled',
                 }
+
+                await browser.send_str('{"t":"ping","ts":111}')
+                try:
+                    await robot_reader.text(
+                        lambda m: m.get('t') == 'ping' and m.get('ts') == 111,
+                        timeout=0.2,
+                    )
+                    raise AssertionError('old owner ping must not be forwarded')
+                except (TimeoutError, asyncio.TimeoutError):
+                    pass
+                await other.send_str('{"t":"ping","ts":222}')
+                forwarded = await robot_reader.text(
+                    lambda m: m.get('t') == 'ping' and m.get('ts') == 222)
+                assert forwarded['ts'] == 222
+                pong = await other_reader.text(lambda m: m.get('t') == 'pong' and m.get('ts') == 222)
+                assert pong['ts'] == 222
 
                 await browser.close()
                 await asyncio.sleep(0.1)

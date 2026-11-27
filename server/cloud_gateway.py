@@ -34,6 +34,11 @@ T_MAP, T_SCAN, T_GCOST, T_LCOST, T_CLOUD, T_PART, T_CAM = range(1, 8)
 LAYER_KINDS = {T_GCOST: 'gcost', T_LCOST: 'lcost', T_CLOUD: 'cloud', T_PART: 'particles'}
 BINARY_NAMES = {T_MAP: 'map', T_SCAN: 'scan', **LAYER_KINDS}
 CACHE_TEXT = {'state', 'pose', 'task', 'routes', 'map_views', 'plan', 'inspection_exceptions'}
+CONTROL_OPS = {
+    'arm', 'auto_localize', 'autoloc_move', 'cancel', 'climb', 'estop',
+    'goal', 'initial_pose', 'lie_down', 'load_map', 'prep_hold',
+    'release_estop', 'route_start', 'set_mode', 'set_param', 'stand_up',
+}
 TEXT_QUEUE_MAX = 500
 ROBOT_QUEUE_MAX = 500
 LOG = logging.getLogger('go2w_cloud')
@@ -1238,6 +1243,14 @@ class CloudGateway:
                         't': 'ack', 'id': msg.get('id'), 'ok': False, 'msg': '机器狗未连接',
                     }, ensure_ascii=False, separators=(',', ':')))
                 return
+            if msg_type == 'teleop' or msg.get('op') in CONTROL_OPS:
+                # 最后一个主动发送控制指令的页面成为控制方。巡检中心从
+                # 导航控制台切过来时，必须先转移心跳归属，否则机器狗的
+                # route_start link=True 检查会认为发起页面已经断开。
+                session.owner = client
+                self.send_robot(client.robot_id, json.dumps({
+                    't': 'ping', 'ts': int(time.time() * 1000),
+                }, separators=(',', ':')))
             if msg_type == 'cmd':
                 original_id = msg.get('id')
                 command_id = uuid.uuid4().hex

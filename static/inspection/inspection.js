@@ -6,6 +6,7 @@ import {
   cotEventFamilyKey,
   inspectionLocalizationHints,
   inspectionNodeIndexForTask,
+  inspectionProductionRoutes,
   inspectionTaskRestarted,
 } from './cot_mapping.js';
 import { createFootwayBlockageWatch, footwayLowSpeedActive } from './blockage_watch.js';
@@ -125,6 +126,7 @@ const state = {
 
 const footwayBlockage = createFootwayBlockageWatch();
 let cotPublishTimer = null;
+let prepHoldTimer = null;
 
 const rtc = createRtcViewer(els.rtcVideo, message => {
   els.rtcMessage.textContent = message || '';
@@ -438,23 +440,26 @@ function resetCotOutput(publishClear = true){
   if (publishClear && hadEvents) clearCachedCot(routeId, runStart);
 }
 
+function activateInspectionNode(index){
+  const changed = state.activeNodeIndex !== index;
+  state.activeNodeIndex = index;
+  if (changed) state.openNodeIndex = index;
+  return changed;
+}
+
 function beginInspectionRun(task, startedAt = Date.now()){
   resetCotOutput(false);
   state.inspectionRunStart = startedAt;
   state.inspectionRouteId = task?.routeId || null;
   const index = inspectionNodeForTask(task);
-  if (index >= 0){
-    state.activeNodeIndex = index;
-    state.openNodeIndex = index;
-  }
+  if (index >= 0) activateInspectionNode(index);
 }
 
 function syncInspectionNode(){
   if (!state.inspectionRunStart || !taskActive()) return;
   const index = displayedInspectionNodeIndex(state.task);
   if (index < 0) return;
-  state.activeNodeIndex = index;
-  if (state.openNodeIndex === null) state.openNodeIndex = index;
+  activateInspectionNode(index);
 }
 
 function finalizeActiveCot(){
@@ -506,8 +511,7 @@ function ingestTaskCot(task){
   if (!definition || definition.nodeIndex < 0) return;
   if (!Array.isArray(definition.lines) || !definition.lines.length){
     finalizeActiveCot();
-    state.activeNodeIndex = definition.nodeIndex;
-    if (state.openNodeIndex === null) state.openNodeIndex = definition.nodeIndex;
+    activateInspectionNode(definition.nodeIndex);
     return;
   }
   const point = Number(task.point) || 1;
@@ -522,7 +526,7 @@ function ingestTaskCot(task){
 
   if (state.cotEventKeys.has(key)){
     state.activeCotKey = key;
-    state.activeNodeIndex = definition.nodeIndex;
+    activateInspectionNode(definition.nodeIndex);
     return;
   }
 
@@ -558,9 +562,7 @@ function ingestTaskCot(task){
   state.cotEvents.push(event);
   state.cotEventKeys.add(key);
   state.activeCotKey = key;
-  const nodeChanged = state.activeNodeIndex !== definition.nodeIndex;
-  state.activeNodeIndex = definition.nodeIndex;
-  if (nodeChanged || state.openNodeIndex === null) state.openNodeIndex = definition.nodeIndex;
+  activateInspectionNode(definition.nodeIndex);
   scheduleCotReveal();
 }
 
@@ -681,24 +683,25 @@ function renderConnection(){
 }
 
 function renderRouteOptions(){
+  const selectableRoutes = inspectionProductionRoutes(state.routes);
   const previous = state.selectedRouteId;
   const activeRouteId = taskActive() ? state.task?.routeId : null;
-  if (activeRouteId && state.routes.some(route => route.id === activeRouteId)){
+  if (activeRouteId && selectableRoutes.some(route => route.id === activeRouteId)){
     state.selectedRouteId = activeRouteId;
-  } else if (!state.routes.some(route => route.id === previous)){
-    state.selectedRouteId = state.routes.some(route => route.id === DEFAULT_ROUTE_ID)
+  } else if (!selectableRoutes.some(route => route.id === previous)){
+    state.selectedRouteId = selectableRoutes.some(route => route.id === DEFAULT_ROUTE_ID)
       ? DEFAULT_ROUTE_ID
-      : state.routes[0]?.id || '';
+      : selectableRoutes[0]?.id || '';
   }
 
-  if (!state.routes.length){
-    els.routeSelect.replaceChildren(new Option('机器狗尚未上报巡检任务', ''));
+  if (!selectableRoutes.length){
+    els.routeSelect.replaceChildren(new Option('机器狗尚未上报正式巡检任务', ''));
     els.routeSelect.disabled = true;
     renderSelectedRoute();
     return;
   }
 
-  const options = state.routes.map(route => new Option(
+  const options = selectableRoutes.map(route => new Option(
     `${route.name} · ${route.points?.length || 0} 站 · ${route.map}`,
     route.id,
   ));
@@ -1402,7 +1405,8 @@ function onJson(message){
       }
       if (next.status === 'active' && taskNote(next) !== 'position_footway') stopBlockageTimers();
       syncInspectionNode();
-      if (taskActive() && state.task.routeId) {
+      const taskRoute = state.routes.find(route => route.id === state.task?.routeId);
+      if (taskActive() && taskRoute?.purpose === 'prod') {
         state.selectedRouteId = state.task.routeId;
         els.routeSelect.value = state.selectedRouteId;
       }
@@ -1493,6 +1497,22 @@ async function waitForCondition(check, timeout, label){
 function showPrepare(message){
   state.prepareText = message;
   if (state.preparing) els.taskStateText.textContent = message;
+}
+
+function stopPrepHold(){
+  if (!prepHoldTimer) return;
+  clearInterval(prepHoldTimer);
+  prepHoldTimer = null;
+}
+
+function startPrepHold(){
+  stopPrepHold();
+  const hold = () => {
+    if (!state.preparing || !state.wsOpen) return;
+    send({ op:'prep_hold' }, 4000);
+  };
+  hold();
+  prepHoldTimer = setInterval(hold, 2000);
 }
 
 function localizedForMap(route){
@@ -1619,6 +1639,7 @@ async function startInspection(){
   }
   state.preparing = true;
   renderSelectedRoute();
+  startPrepHold();
   try {
     const ready = await prepareInspection(route);
     if (!ready) return;
@@ -1653,6 +1674,7 @@ async function startInspection(){
   } catch (error){
     toast(error?.message || String(error), 'err');
   } finally {
+    stopPrepHold();
     state.preparing = false;
     state.prepareText = '';
     renderSelectedRoute();

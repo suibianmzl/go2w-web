@@ -6,6 +6,7 @@ import {
   cotEventFamilyKey,
   inspectionLocalizationHints,
   inspectionNodeIndexForTask,
+  inspectionProductionRoutes,
   inspectionTaskRestarted,
 } from '../static/inspection/cot_mapping.js';
 
@@ -68,5 +69,13 @@ assert.equal(inspectionTaskRestarted(
   { status:'active', routeId:'route-1', elapsed:42 },
   { status:'active', routeId:'route-1', elapsed:1 },
 ), true);
-
-console.log('PASS inspection state: CoT dedupe, localization hints and both dwell timers');
+assert.deepEqual(
+  inspectionProductionRoutes([
+    { id:'prod-1', purpose:'prod' },
+    { id:'test-1', purpose:'test' },
+    { id:'legacy' },
+  ]).map(route => route.id),
+  ['prod-1'],
+  '巡检中心任务下拉框只显示正式任务',
+);
+console.log('PASS inspection state: CoT dedupe, localization hints and dwell timers');
